@@ -5,12 +5,14 @@
 mediaview
 mediaview-test
 
-# FPK 打包产物
-*.fpk
+# FPK 打包产物（根目录和 fpk 模板里的）
 fpk-x86/app/mediaview
 fpk-arm/app/mediaview
 fpk-x86/mediaview.fpk
 fpk-arm/mediaview.fpk
+
+# 但 releases/ 目录下的安装包要提交
+!releases/*.fpk
 
 # IDE / 编辑器
 .vscode/
