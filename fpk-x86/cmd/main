@@ -1,0 +1,94 @@
+#!/bin/bash
+# MediaView server lifecycle (fnOS micro_app gateway mode)
+# Listens on ${TRIM_APPDEST}/app.sock; fnOS gateway forwards /app/mediaview/ requests.
+SERVER="${TRIM_APPDEST}/mediaview"
+PID_FILE="${TRIM_PKGVAR}/mediaview.pid"
+LOG_FILE="${TRIM_PKGVAR}/mediaview.log"
+SOCK="${TRIM_APPDEST}/app.sock"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
+}
+
+check_process() {
+    local pid=$1
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+case $1 in
+start)
+    if [ -f "$PID_FILE" ]; then
+        pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+        if check_process "$pid"; then
+            exit 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+    mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
+    if [ ! -d "${TRIM_PKGVAR}" ] || [ ! -w "${TRIM_PKGVAR}" ]; then
+        echo "MediaView data dir not writable: ${TRIM_PKGVAR}" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+    if [ ! -x "$SERVER" ]; then
+        echo "MediaView binary not found or not executable: $SERVER" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+    chmod +x "${TRIM_APPDEST}/bin/ffmpeg" 2>/dev/null
+
+    [ -S "$SOCK" ] && rm -f "$SOCK"
+    log_msg "Starting mediaview, socket=$SOCK workdir=${TRIM_PKGVAR} dest=${TRIM_APPDEST}"
+    nohup "$SERVER" --socket "$SOCK" --workdir "${TRIM_PKGVAR}" --dest "${TRIM_APPDEST}" >>"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if [ -S "$SOCK" ]; then
+            log_msg "Started PID=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+            exit 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    log_msg "Process exited, dumping log tail"
+    tail -n 30 "$LOG_FILE" 2>/dev/null > "${TRIM_TEMP_LOGFILE}"
+    if [ ! -s "${TRIM_TEMP_LOGFILE}" ]; then
+        echo "MediaView server failed to start." > "${TRIM_TEMP_LOGFILE}"
+    fi
+    rm -f "$PID_FILE"
+    exit 1
+    ;;
+stop)
+    if [ -f "$PID_FILE" ]; then
+        pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+        if [ -n "$pid" ]; then
+            kill -TERM "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
+    fi
+    pkill -f "${SERVER}" 2>/dev/null
+    [ -S "$SOCK" ] && rm -f "$SOCK"
+    exit 0
+    ;;
+status)
+    if [ -f "$PID_FILE" ]; then
+        pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+        if check_process "$pid"; then
+            exit 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+    exit 3
+    ;;
+restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+*)
+    echo "Usage: $0 {start|stop|status|restart}"
+    exit 1
+    ;;
+esac

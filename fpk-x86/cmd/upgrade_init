@@ -1,0 +1,3 @@
+#!/bin/bash
+# upgrade_init - pre-upgrade (none needed)
+exit 0

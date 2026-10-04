@@ -1,0 +1,36 @@
+#!/bin/bash
+# uninstall_callback - cleanup after uninstall
+# 当用户在卸载时选择"清除数据"，同时删除：
+#   1. 软件数据目录（设置文件、日志、默认缩略图缓存）
+#   2. 用户自定义目录下的缩略图缓存（<ThumbDir>/.mediaview-thumbs）
+DATA_ACTION="${wizard_data_action:-keep}"
+if [ "$DATA_ACTION" != "delete" ]; then
+    exit 0
+fi
+
+# 1. 先解析设置文件里的自定义缩略图目录。
+#    必须在 rm -rf PKGVAR **之前**做：否则下面那个兜底分支
+#    （${TRIM_PKGVAR}/mediaview.settings.json）已经永远不成立，成了死代码，
+#    用户自定义位置的缩略图缓存（可能几个 GB）会残留下来。
+SETTINGS_FILE=""
+if [ -n "${TRIM_PKGETC}" ] && [ -f "${TRIM_PKGETC}/mediaview.settings.json" ]; then
+    SETTINGS_FILE="${TRIM_PKGETC}/mediaview.settings.json"
+elif [ -f "${TRIM_PKGVAR}/mediaview.settings.json" ]; then
+    SETTINGS_FILE="${TRIM_PKGVAR}/mediaview.settings.json"
+fi
+
+THUMB_DIR=""
+if [ -n "$SETTINGS_FILE" ]; then
+    # 从 JSON 提取 thumbDir 字段（用 grep+sed，不依赖 jq）
+    THUMB_DIR=$(grep -o '"thumbDir"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS_FILE" 2>/dev/null | sed 's/.*"thumbDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+fi
+
+# 2. 删除软件数据目录（设置文件、日志、默认缩略图缓存）
+rm -rf "${TRIM_PKGVAR}"
+
+# 3. 删除自定义目录下的缩略图缓存
+if [ -n "$THUMB_DIR" ] && [ -d "${THUMB_DIR}/.mediaview-thumbs" ]; then
+    rm -rf "${THUMB_DIR}/.mediaview-thumbs"
+fi
+
+exit 0

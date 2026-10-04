@@ -1,0 +1,14 @@
+appname               = mediaview
+version               = 1.8.43
+display_name          = 极速媒体浏览
+desc                  = 极速图片与视频浏览器，替代飞牛网页版。内置原生硬件解码，秒开图片与视频，虚拟滚动流畅不卡顿，可设为图片/视频文件的默认打开方式。支持缩略图开关、自定义缩略图目录、同目录图片左右切换，可接管系统缩略图服务让文件管理器显示本应用生成的缩略图。
+platform              = arm
+source                = thirdparty
+maintainer            = ffvz
+distributor           = ffvz
+micro_app             = true
+os_min_version        = 1.2.0401
+desktop_uidir         = ui
+desktop_applaunchname = mediaview.main
+ctl_stop              = true
+install_type          = root

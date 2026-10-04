@@ -1,0 +1,3 @@
+#!/bin/bash
+# install_init - pre-install preparation (none needed)
+exit 0

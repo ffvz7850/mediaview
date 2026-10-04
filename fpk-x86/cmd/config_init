@@ -1,0 +1,3 @@
+#!/bin/bash
+# config_init - pre-config (none needed)
+exit 0

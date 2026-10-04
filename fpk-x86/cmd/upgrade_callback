@@ -1,0 +1,5 @@
+#!/bin/bash
+# upgrade_callback - post-upgrade handling
+chmod +x "${TRIM_APPDEST}/mediaview" 2>/dev/null
+chmod +x "${TRIM_APPDEST}/bin/ffmpeg" 2>/dev/null
+exit 0

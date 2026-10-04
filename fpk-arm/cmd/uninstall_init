@@ -1,0 +1,9 @@
+#!/bin/bash
+# uninstall_init - pre-uninstall
+# 卸载前恢复系统缩略图服务：如果 mediaview 接管了 auto_thumbnailer，
+# 卸载时必须恢复，否则系统缩略图功能永久失效（文件管理器不再显示缩略图）。
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable auto_thumbnailer.service 2>/dev/null
+    systemctl start auto_thumbnailer.service 2>/dev/null
+fi
+exit 0

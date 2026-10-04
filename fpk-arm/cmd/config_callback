@@ -1,0 +1,8 @@
+#!/bin/bash
+# config_callback - restart service so new config takes effect
+LOG_FILE="${TRIM_PKGVAR}/mediaview.log"
+APP_ROOT="/var/apps/${TRIM_APPNAME}"
+if [ -x "${APP_ROOT}/cmd/main" ]; then
+    "${APP_ROOT}/cmd/main" restart >>"$LOG_FILE" 2>&1
+fi
+exit 0

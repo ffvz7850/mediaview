@@ -1,0 +1,7 @@
+#!/bin/bash
+# install_callback - initialize data directories after install
+mkdir -p "${TRIM_PKGVAR}"
+mkdir -p "${TRIM_PKGETC}"
+chmod +x "${TRIM_APPDEST}/mediaview" 2>/dev/null
+chmod +x "${TRIM_APPDEST}/bin/ffmpeg" 2>/dev/null
+exit 0

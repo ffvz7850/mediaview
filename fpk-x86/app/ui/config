@@ -1,0 +1,43 @@
+{
+  ".url": {
+    "mediaview.main": {
+      "title": "极速媒体浏览",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/mediaview",
+      "gatewaySocket": "app.sock",
+      "url": "/app/mediaview/",
+      "allUsers": true
+    },
+    "mediaview.open": {
+      "title": "用极速媒体浏览打开",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/mediaview",
+      "gatewaySocket": "app.sock",
+      "url": "/app/mediaview/open",
+      "allUsers": true,
+      "noDisplay": true,
+      "fileTypes": [
+        "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp",
+        "tif", "tiff", "heic", "heif", "avif", "svg",
+        "mp4", "mov", "mkv", "avi", "webm", "m4v", "flv", "wmv",
+        "ts", "mts", "m2ts", "mpg", "mpeg", "3gp", "3g2",
+        "rmvb", "vob", "f4v", "rm"
+      ]
+    },
+    "mediaview.viewer": {
+      "title": "极速媒体浏览 · 看图",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/mediaview",
+      "gatewaySocket": "app.sock",
+      "url": "/app/mediaview/viewer",
+      "allUsers": true,
+      "noDisplay": true
+    }
+  }
+}

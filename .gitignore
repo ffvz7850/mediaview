@@ -1,0 +1,27 @@
+# 编译产物
+*.exe
+*.test
+*.out
+mediaview
+mediaview-test
+
+# FPK 打包产物
+*.fpk
+fpk-x86/app/mediaview
+fpk-arm/app/mediaview
+fpk-x86/mediaview.fpk
+fpk-arm/mediaview.fpk
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 临时文件
+*.tmp
+*.log
