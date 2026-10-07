@@ -2,7 +2,7 @@
 
 > 极速媒体浏览 —— 飞牛 fnOS 图片/视频极速浏览 FPK 应用
 > 仓库：https://github.com/ffvz7850/mediaview
-> 版本范围：v1.8.4 → v1.8.161
+> 版本范围：v1.8.4 → v1.8.162
 
 ---
 
@@ -347,6 +347,15 @@ ffmpeg `-lowres` 动态档位（缩略图提速），增加设置开关。普通
 - 修法：把距离守卫移到前面，先判"这是不是一次点击"，再决定 ≥2 倍时归位
 - 修复 PowerShell Set-Content 引入的 BOM 问题（main.go 和 manifest），新增 manifest 无 BOM 闸门
 - 打包闸门扩展为 5 项：二进制大小、checksum、版本串、manifest 无 BOM、src.zip 内二进制过闸门
+
+### v1.8.162 — 修复视频叠加播放恶性bug（推荐更新）
+- **根因**：四条缺陷叠加导致视频资源泄漏——窗口名用 Date.now() 每次开新窗口、停机逻辑手写 3 遍无统一出口且 closeViewer 完全没停播、没有页面不可见兜底、零测试覆盖
+- **统一出口**：新增 stopMedia()（停机断源）和 pauseMedia()（暂停不断源），所有"丢弃前"改走统一出口
+- **固定窗口名**：mediaview_viewer_ + Date.now() → mediaview_viewer，浏览器复用同一窗口，旧文档卸载时视频随之销毁
+- **closeViewer 补停播**：关闭查看器前先 stopAllMediaIn(vWrap)，再清空 DOM
+- **visibilitychange 兜底**：页面隐藏时暂停所有视频（切回前台点播放能接着看，不断源）
+- 新增 5 条契约测试 + 8 个变异体全部变红
+- 升级不需要迁移、不需要清缓存；图片浏览全部不变
 
 ---
 
