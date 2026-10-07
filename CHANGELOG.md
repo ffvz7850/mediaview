@@ -2,7 +2,7 @@
 
 > 极速媒体浏览 —— 飞牛 fnOS 图片/视频极速浏览 FPK 应用
 > 仓库：https://github.com/ffvz7850/mediaview
-> 版本范围：v1.8.4 → v1.8.162
+> 版本范围：v1.8.4 → v1.8.165
 
 ---
 
@@ -356,6 +356,31 @@ ffmpeg `-lowres` 动态档位（缩略图提速），增加设置开关。普通
 - **visibilitychange 兜底**：页面隐藏时暂停所有视频（切回前台点播放能接着看，不断源）
 - 新增 5 条契约测试 + 8 个变异体全部变红
 - 升级不需要迁移、不需要清缓存；图片浏览全部不变
+
+### v1.8.163 — 采纳审查 P1：空产物校验 + 设置指纹
+- **P1-1**：/api/raw 缩放产物空文件校验（ffmpeg 退出码 0 不代表产物可用，缺校验会把 0 字节文件返回客户端且每次重跑完整解码）
+- **P1-2**：extractFrame 软件路径补产物校验（与 VAAPI 路径对齐）
+- **P1-3**：generateThumb 兜底分支（视频/HEIC）补产物校验，失败走负缓存避免反复重烧
+- **P1-4**：大图画质/lowres 进产物名 + ETag + 前端 URL 指纹（改设置后浏览器重新取，不再因 immutable 缓存导致设置不生效）
+- /api/health 新增 thumb_concurrency_effective（实际生效并发）与 socket_listening
+- 删 8 个死代码函数，修错误注释，修日志绑定地址
+- 编译/vet/测试全部通过
+
+### v1.8.164 — 中间版本
+多项内部调整与准备。
+
+### v1.8.165 — 复核整改：真修清缓存重建 + 并发安全 + 测试强化（推荐更新）
+- **真修清缓存重建**：thumb.go 清缓存后重建从 preloadBatch 改走 preloadBatchManual（1.8.163 报告写了 ✓ 但实际没落盘，本次真正修复；关闭后台预生成后清缓存仍能重建）
+- **新增 sys_thumb_serving**：/api/health 报接管 socket 的真实状态（原来的 socket_listening 只报 app.sock）
+- **Serve 错误记录**：srv.Serve(ln) 返回即 Store(false)，非正常关闭打日志（原来错误被丢弃）
+- **socketListenOK 改 atomic.Bool**：修复跨 goroutine 数据竞争（写=启动 goroutine，读=HTTP handler）
+- **测试断言强化**：P1 回归测试从弱断言（strings.Contains）改为结构判据（必须真有 os.Stat + .Size()==0 且早于 os.Rename）
+- **thumbConcurrencyEffective 简化**：去掉不可达的死分支（getThumbSem 内部 nil 时会自己 make，sem != nil 恒真）
+- **新增 errEmptyProduct 哨兵**：ffmpeg.go 与 thumb.go 兜底分支都改用独立错误值，不再复用 errNoFFmpeg
+- **错误消息闭包简化**：恒返回 0/-1 的闭包改为普通变量
+- **注释错位修复**：删孤儿注释行，全工程搜"已删函数名残留"归零
+- **性能**：比 1.8.162 略快（测试中位数 10.4s vs 11.8s），热路径零成本或正收益
+- 编译/vet/测试全部通过（9.53s），交付前 15 项最终检查全过
 
 ---
 
