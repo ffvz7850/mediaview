@@ -10,20 +10,61 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
 }
 
+# check_process —— 判断"这个 PID 是不是**本应用**在跑"。
+#
+# 为什么不能只看 kill -0（1.8.182 修）：
+#   实测踩到过 —— mediaview 被 SIGTERM 杀掉后 PID 文件残留（里面是 4464），
+#   而 4464 这个号被 **duplicati-server** 复用了。于是：
+#     · `status` 返回 0（"在运行"）→ 应用中心据此不再启动它；
+#     · `start` 直接 exit 0 → 根本没启动；
+#     · 而 socket 不存在 → 网关转发失败 → 浏览器看到 **502 Bad Gateway**。
+#   Linux 的 PID 是循环复用的，所以必须再确认一次"这个号确实指向我们的二进制"。
 check_process() {
     local pid=$1
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+
+    # 判据一：/proc/<pid>/exe 是否就是我们的服务端二进制
+    local exe want
+    exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null)
+    want=$(readlink -f "$SERVER" 2>/dev/null)
+    if [ -n "$exe" ] && [ -n "$want" ] && [ "$exe" = "$want" ]; then
         return 0
     fi
+    # 判据二（exe 不可读时的退路）：/proc/<pid>/cmdline 里带本应用标识
+    if [ -r "/proc/${pid}/cmdline" ] && grep -qa 'mediaview' "/proc/${pid}/cmdline" 2>/dev/null; then
+        return 0
+    fi
+    # 号被别的进程占用 —— 绝不能当成"我们在运行"
+    log_msg "PID ${pid} 存在但不是 mediaview（PID 复用），视为未运行"
     return 1
+}
+
+# 清理"指向别的进程"的陈旧 PID 文件
+drop_stale_pidfile() {
+    [ -f "$PID_FILE" ] || return 0
+    local pid
+    pid=$(head -n 1 "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    if check_process "$pid"; then
+        return 0
+    fi
+    rm -f "$PID_FILE"
+    return 0
 }
 
 case $1 in
 start)
+    # 先丢掉陈旧 PID 文件（含"号被复用"的情况），否则下面的检查会误判"已在运行"
     if [ -f "$PID_FILE" ]; then
         pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
         if check_process "$pid"; then
-            exit 0
+            # 真的在跑：再确认 socket 还在，否则说明它半死不活，需要重启
+            if [ -S "$SOCK" ]; then
+                exit 0
+            fi
+            log_msg "PID ${pid} 在跑但 socket 缺失，重新启动"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 1
         fi
         rm -f "$PID_FILE"
     fi
@@ -63,7 +104,8 @@ start)
 stop)
     if [ -f "$PID_FILE" ]; then
         pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
-        if [ -n "$pid" ]; then
+        # 只有确认那是本应用的进程才 kill —— 否则会误杀复用了该 PID 的无关进程
+        if check_process "$pid"; then
             kill -TERM "$pid" 2>/dev/null
         fi
         rm -f "$PID_FILE"
@@ -73,9 +115,12 @@ stop)
     exit 0
     ;;
 status)
+    # 退出码约定：0=在运行，3=未运行（应用中心据此决定要不要拉起）
     if [ -f "$PID_FILE" ]; then
         pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
-        if check_process "$pid"; then
+        # 两个条件都满足才算"健康"：进程是我们的 + socket 在。
+        # 只看进程的话，"半死"状态会被报成健康，应用中心就不会重启它 → 502。
+        if check_process "$pid" && [ -S "$SOCK" ]; then
             exit 0
         fi
         rm -f "$PID_FILE"

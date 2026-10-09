@@ -92,15 +92,15 @@ func TestFrontendAuditFixPieces(t *testing.T) {
 	bridge := fetchFrontend(t, "/bridge.js").Body.String()
 
 	must := map[string]string{
-		"var swipeSeq = 0":                        "切换序号：作废过期的延迟回调",
-		"if (mySeq !== swipeSeq)":                 "doIt / settleAfterSwipe 的过期判定",
-		"clearTimeout(timer);":                    "僵尸 handler 的兜底定时器要被清掉",
-		"var loadSeq = 0":                         "目录加载序号",
-		"if (mySeq !== loadSeq)":                  "快速连点目录时丢弃过期结果",
-		"function layout(keepScroll)":             "layout 支持保留滚动位置",
-		"layout(true)":                            "resize / 切换图标大小要保留滚动位置",
-		"btn.disabled = true;":                    "设置面板加载完成前禁止保存",
-		"if (!ok) host._ready = null;":            "桥接失败不缓存，允许重试",
+		"var swipeSeq = 0":                      "切换序号：作废过期的延迟回调",
+		"if (mySeq !== swipeSeq)":               "doIt / settleAfterSwipe 的过期判定",
+		"clearTimeout(timer);":                  "僵尸 handler 的兜底定时器要被清掉",
+		"var loadSeq = 0":                       "目录加载序号",
+		"if (mySeq !== loadSeq)":                "快速连点目录时丢弃过期结果",
+		"function layout(keepScroll)":           "layout 支持保留滚动位置",
+		"layout(true)":                          "resize / 切换图标大小要保留滚动位置",
+		"btn.disabled = true;":                  "设置面板加载完成前禁止保存",
+		"if (!ok) host._ready = null;":          "桥接失败不缓存，允许重试",
 		"case 'bridge-error': return '桥接通讯异常';": "补上缺失的失败原因文案",
 		// 1.8.40
 		"API + '/volumes'":      "首页改走 /api/volumes（不再硬编码盘位）",

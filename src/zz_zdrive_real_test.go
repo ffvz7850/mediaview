@@ -53,7 +53,7 @@ func TestZDriveRealPhotoEndToEnd(t *testing.T) {
 	sw, sh := imgDimsBytes(t, src)
 	t.Logf("真实照片 %s：%d 字节，%dx%d", filepath.Base(zRealJPEG), len(src), sw, sh)
 
-	out := scaledOutPath(zRealJPEG, 2400)
+	out := scaledArtifactPath(zRealJPEG, 2400)
 	os.Remove(out)
 	rec := rawGet(t, zRealJPEG, 2400)
 	if rec.Code != 200 {

@@ -70,29 +70,6 @@ func hwRecordSuccess() {
 	atomic.AddInt64(&hwOKCount, 1)
 }
 
-func firstExisting(paths ...string) string {
-	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		if abs, err := filepath.Abs(p); err == nil {
-			p = abs
-		}
-		if ok, _ := fileExists(p); ok {
-			return p
-		}
-	}
-	return ""
-}
-
-func fileExists(p string) (bool, error) {
-	info, err := os.Stat(p)
-	if err != nil {
-		return false, err
-	}
-	return !info.IsDir(), nil
-}
-
 func initFFmpeg() {
 	// 系统 ffmpeg 优先：飞牛系统自带 mediasrv 版 ffmpeg，完整支持 VAAPI 硬件解码
 	// （FPK 自带的 johnvansickle 静态版 VAAPI 无法加载系统驱动）
@@ -260,18 +237,90 @@ func parseFFmpegInfo(s string) (*Meta, error) {
 // extractVideoFrame produces a center-cropped square thumbnail via ffmpeg.
 // extractVideoFrame 从视频提取一帧生成缩略图。
 // 注意：对图片文件不要用 -ss（图片没有时间轴，seek 会失败），由调用方决定是否 seek。
-func extractVideoFrame(ctx context.Context, path string, size int, out string) error {
+func extractVideoFrame(ctx context.Context, path string, size int, out string) (int, int, error) {
 	return extractFrame(ctx, path, size, out, true)
 }
 
 // extractImageFrame 从图片生成缩略图（不用 -ss）。
-func extractImageFrame(ctx context.Context, path string, size int, out string) error {
+func extractImageFrame(ctx context.Context, path string, size int, out string) (int, int, error) {
 	return extractFrame(ctx, path, size, out, false)
 }
 
-func extractFrame(ctx context.Context, path string, size int, out string, seek bool) error {
+// lowresFor 按目标尺寸计算 ffmpeg 的 -lowres 档位。
+//
+// -lowres N 让解码器只取 DCT 的低频系数，直接产出 1/2^N 尺寸的图像 ——
+// 这正是 vips 的 shrink-on-load 本该做、却在**渐进式 JPEG** 上做不到的事
+// （渐进式把系数分散在多次扫描里，任何引擎都只能完整解码）。
+//
+// 档位必须**动态算**：档位过高会把源图缩到比目标还小，后面接 scale 就成了
+// 「放大糊掉」。实测（8736x11648 原图 → 1920 档）：
+//
+//	  正确档 N=2 → 输出 305479 B；过高档 N=3 → 只有 269918 B（细节已丢）。
+//
+//		档位公式：N = clamp(floor(log2(长边/目标)), 0, 3)
+//		ffmpeg 的上限实测就是 3（传 4 或 9 的输出与 3 逐字节相同）。
+//
+// lowresMinRatioNum/Den = 9/10：允许 lowres 把源缩到目标的 90%（详见 lowresFor）。
+const lowresMinRatioNum, lowresMinRatioDen = 9, 10
+
+// lowresForViewer 大图预览的 lowres 档位：优先用设置里的固定档，其次公式。
+func lowresForViewer(w, h, target int) int {
+	switch lv := getSettings().ViewerLowres; {
+	case lv == -1:
+		return 0 // 用户关闭
+	case lv > 0:
+		return lv // 用户指定
+	default:
+		return lowresFor(w, h, target) // 自动
+	}
+}
+
+// lowresForThumb 缩略图的 lowres 档位：受总开关 + 档位设置共同决定。
+func lowresForThumb(w, h, target int) int {
+	if !getSettings().ThumbLowres {
+		return 0
+	}
+	switch lv := getSettings().ThumbLowresLevel; {
+	case lv == -1:
+		return 0
+	case lv > 0:
+		return lv
+	default:
+		return lowresFor(w, h, target)
+	}
+}
+
+func lowresFor(w, h, target int) int {
+	longSide := w
+	if h > longSide {
+		longSide = h
+	}
+	if target <= 0 || longSide <= target {
+		return 0
+	}
+	// lowresMinRatio：允许 lowres 把源缩到「目标的 90%」以内，以换取更大的档位。
+	//
+	// 为什么需要它（实测，8736x11648 原图，-q:v 4，中位 3 次）：
+	//   目标 3072：N=1 → 1937ms；N=2 → 1196ms（快 39%），但输出从 3072 缩到 2912（缩 5%）
+	//   **N=1 相比"不用 lowres"只快 0.6%（1937 vs 1948ms）—— 基本是白折腾**
+	//   而 2912 仍远高于实际视口需求（2160 设备像素），观感无差别。
+	//   用 5% 的尺寸余量换 39% 的时间，值得。
+	//
+	// 保守取 0.9（最多缩 10%）：
+	//   3072 → 允许缩到 2764（2912 通过 → N=2）
+	//   3584 → 允许缩到 3226（2912 通过 → N=2，输出缩 19%，已确认可接受）
+	//   4096 → 允许缩到 3686（2912 不通过 → 仍 N=1，避免明显缩水）
+	floor := (target*lowresMinRatioNum + lowresMinRatioDen - 1) / lowresMinRatioDen
+	n := 0
+	for longSide/(1<<(n+1)) >= floor && n < 3 {
+		n++
+	}
+	return n
+}
+
+func extractFrame(ctx context.Context, path string, size int, out string, seek bool) (int, int, error) {
 	if ffmpegPath == "" {
-		return errNoFFmpeg
+		return 0, 0, errNoFFmpeg
 	}
 
 	// 视频优先走 VAAPI 硬件解码（H.264/HEVC 抽帧是 CPU 重活，A8-7680 只有 4 核）。
@@ -282,7 +331,7 @@ func extractFrame(ctx context.Context, path string, size int, out string, seek b
 			vaErr := extractFrameVAAPI(ctx, path, size, out, dev)
 			if vaErr == nil {
 				hwRecordSuccess()
-				return nil
+				return 0, 0, nil
 			}
 			// 硬解失败：删除可能残留的不完整输出，回退软件解码
 			_ = os.Remove(out)
@@ -302,12 +351,43 @@ func extractFrame(ctx context.Context, path string, size int, out string, seek b
 	if seek {
 		args = append(args, "-ss", "0.05")
 	}
+	// 图片缩略图：加动态 -lowres（只解 DCT 低频系数）。
+	// 必须是**输入选项**，所以放在 -i 之前。
+	// 视频不加：视频走 -ss + VAAPI 抽帧，语义不同。
+	// 顺便取一次原图尺寸：既用于 -lowres 档位，也随返回值给调用方写 meta，
+	// 避免调用方再读一次文件头（L1-B：原来这里和 generateThumb 各读一次）。
+	origW, origH := 0, 0
+	if !seek {
+		origW, origH = imageDimCached(path)
+		if origW > 0 && origH > 0 {
+			if lr := lowresForThumb(origW, origH, size); lr > 0 {
+				args = append(args, "-lowres", itoa(lr))
+			}
+		}
+	}
 	args = append(args, "-autorotate", "-i", path,
 		"-frames:v", "1", "-f", "image2", "-update", "1",
 		"-vf", vf, "-an", "-y", "-q:v", itoa(q), out)
 
 	cmd := exec.CommandContext(cctx, ffmpegPath, args...)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return 0, 0, err
+	}
+	// 校验产物：ffmpeg 退出码 0 **不代表**产物可用（磁盘满、被信号 kill 但 Run 未报错、
+	// 文件系统错误都会留下空文件）。缺这一步时调用方会把一个 0 字节文件 rename 进缓存，
+	// 前端拿到破图；而缓存判据要求 size>0 → 判定未命中 → 每次请求都白跑一遍完整解码。
+	// 与 extractFrameVAAPI 的「存在+非空」校验对齐（软件路径才是默认路径）。
+	if st, serr := os.Stat(out); serr != nil || st.Size() == 0 {
+		_ = os.Remove(out)
+		// 1.8.164：把内联闭包换成普通变量 —— 逻辑一样但一眼能看懂，
+		// 而且返回专用哨兵 errEmptyProduct（"产物空"不是"ffmpeg 不可用"）。
+		var sz int64 = -1
+		if st != nil {
+			sz = st.Size()
+		}
+		return 0, 0, fmt.Errorf("%w（err=%v size=%d）", errEmptyProduct, serr, sz)
+	}
+	return origW, origH, nil
 }
 
 // extractFrameVAAPI 用 VAAPI 硬件解码抽取视频帧并生成缩略图。
@@ -375,13 +455,13 @@ func qualityToQScale(quality int) int {
 	return q
 }
 
-// transcodeAvailable reports whether on-the-fly transcoding is possible.
-func transcodeAvailable() bool { return ffmpegPath != "" }
-
 var (
 	errNoProbe  = &simpleErr{"ffprobe unavailable"}
 	errNoFFmpeg = &simpleErr{"ffmpeg unavailable"}
+	// 1.8.164：单独一个哨兵。原来"产物为空/无效"也返回 errNoFFmpeg，
+	// 于是日志与错误串都说 "ffmpeg unavailable"，而 ffmpeg 明明是好的 ——
+	// 排障时会被这行字带偏（真正原因是磁盘满 / 被杀 / 文件系统错误）。
+	errEmptyProduct = &simpleErr{"ffmpeg produced an empty/invalid file"}
 )
 
-func itoa(n int) string         { return strconv.Itoa(n) }
-func floatStr(f float64) string { return strconv.FormatFloat(f, 'f', 2, 64) }
+func itoa(n int) string { return strconv.Itoa(n) }

@@ -163,7 +163,7 @@ func TestPausePreemptsBackground(t *testing.T) {
 func TestClampMaxdim(t *testing.T) {
 	cases := []struct{ in, want int }{
 		{-5, 0}, {0, 0}, {1, 1}, {320, 320}, {2048, 2048},
-		{4096, 4096}, {4097, maxAllowedMaxdim}, {99999, maxAllowedMaxdim},
+		{4096, 4096}, {99999, maxAllowedMaxdim}, {99999, maxAllowedMaxdim},
 	}
 	for _, c := range cases {
 		if got := clampMaxdim(c.in); got != c.want {

@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,25 +31,6 @@ func thumbPathFor(path string, size int) string {
 	return filepath.Join(currentThumbRoot(), strconv.Itoa(size), rel)
 }
 
-// thumbJPG / thumbMeta 旧的 hash 命名方式，保留用于兼容旧缓存清理。
-func thumbJPG(key string) string  { return filepath.Join(currentThumbRoot(), key+".jpg") }
-func thumbMeta(key string) string { return filepath.Join(currentThumbRoot(), key+".json") }
-
-// metaPathFor 在缩略图被关闭时返回 ""，表示元数据只留在内存里。
-// 这样"不生成缩略图"就真的不在磁盘上留任何东西。
-func metaPathFor(path string, size int) string {
-	if !getSettings().ThumbEnabled {
-		return ""
-	}
-	return metaPathForFile(path, size)
-}
-
-// metaPathForFile 不带开关判断的纯路径计算（供内部调用）
-func metaPathForFile(path string, size int) string {
-	rel := strings.TrimPrefix(path, "/")
-	return filepath.Join(currentThumbRoot(), strconv.Itoa(size), rel+".meta.json")
-}
-
 // ---- 元数据内存缓存 ----
 //
 // 元数据（宽高/时长）与缩略图是两件事：即使不生成缩略图，列表页也要显示分辨率。
@@ -70,13 +49,16 @@ func saveMeta(key string, path string, size int, m *Meta) {
 	metaMem[key] = m
 	metaMemMu.Unlock()
 
-	if p := metaPathFor(path, size); p != "" {
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
-			if data, err := json.Marshal(m); err == nil {
-				_ = os.WriteFile(p, data, 0o644)
-			}
-		}
-	}
+	// 1.8.148：**不再落盘 .meta.json**，元数据只留在内存。
+	//
+	// 原因：图片那份 meta 基本是纯冗余（列表阶段本来就不读图片尺寸，
+	// 只有 handleMeta 命中时能省一次 imageDimCached —— 而那是进程内只读文件头，约 1ms）；
+	// 视频那份能省一次 ffprobe（30~80ms），但只在**冷启动后第一次**要，之后 metaMem 命中。
+	// 而它让缓存目录的文件数变成实际缩略图的三倍（实测 9,664 → 28,992）。
+	//
+	// 删掉后：缓存目录是纯镜像结构（一张图一个文件，文件名与源文件同名）。
+	_ = path
+	_ = size
 }
 
 func loadMetaMem(key string) (*Meta, bool) {
@@ -94,27 +76,11 @@ func dropMetaMem() {
 }
 
 func loadMetaCache(path string, size int, info os.FileInfo) (*Meta, bool) {
-	if info == nil {
-		return nil, false
-	}
+	// 1.8.148：不再读 .meta.json（已不落盘），只查内存缓存。
+	// 冷启动后第一次遇到某个视频会走一次 ffprobe，之后 metaMem 命中 —— 可接受。
 	key := cacheKey(path, info)
 	if m, ok := loadMetaMem(key); ok {
 		return m, true
 	}
-	// 关闭缩略图时不读磁盘：目录可能已被换到别处，读它没有意义
-	if !getSettings().ThumbEnabled {
-		return nil, false
-	}
-	data, err := os.ReadFile(metaPathForFile(path, size))
-	if err != nil {
-		return nil, false
-	}
-	var m Meta
-	if err := json.Unmarshal(bytes.TrimSpace(data), &m); err != nil {
-		return nil, false
-	}
-	metaMemMu.Lock()
-	metaMem[key] = &m
-	metaMemMu.Unlock()
-	return &m, true
+	return nil, false
 }

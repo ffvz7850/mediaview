@@ -18,7 +18,7 @@ import (
 
 const (
 	appName  = "mediaview"
-	version  = "1.8.43"
+	version  = "1.8.191"
 	gwPrefix = "/app/mediaview"
 )
 
@@ -28,6 +28,31 @@ var (
 	thumbDir string // thumbnail cache (mirror of currentThumbRoot, for logs/compat)
 	appDest  string // installed target dir (for bundling ffmpeg)
 )
+
+// thumbConcurrencyEffective 返回**实际生效**的解码并发（信号量容量）。
+//
+// 1.8.191 修正：原来写 `if sem := getThumbSem(); sem != nil { ... } return 0` ——
+// **那是个死分支**：getThumbSem() 内部在 nil 时会自己 make 一个信号量再返回，
+// 所以它永远不为 nil，"返回 0" 不可达。直接取 cap 即可。
+func thumbConcurrencyEffective() int {
+	return cap(getThumbSem())
+}
+
+// socketListening 返回**我们自己的 app.sock** 是否监听成功。
+// 用 atomic：写入发生在启动 goroutine 里，读取发生在 HTTP handler（不同 goroutine）。
+func socketListening() bool { return socketListenOK.Load() }
+
+// socketListenOK 由 main 在 listen 成功后置 true；启动流程本身不改。
+// 1.8.191：改用 atomic.Bool —— 原来是个裸 bool，写(启动 goroutine)/读(handler) 跨 goroutine
+// 构成 data race（与 1.8.191 修过的 manualWorkersOnce 同类问题）。
+var socketListenOK atomic.Bool
+
+// sysThumbServeOK 返回**飞牛接管 socket**（/vol…/thumb 那个）是否真的在服务。
+//
+// 1.8.191：这才是"会失败的那个" —— 启动顺序是「先停系统 auto_thumbnailer、
+// 再 listen 接管 socket」，listen 失败只打一行 warn 就继续，会出现"两套都没了"
+// 却仍显示"已接管"。原来 health 报的是 app.sock（几乎不会失败），等于没报。
+func sysThumbServeOK() bool { return sysThumbListening.Load() }
 
 func main() {
 	socketPath := flag.String("socket", "", "unix socket path")
@@ -102,6 +127,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("listen unix %s: %v", *socketPath, err)
 			}
+			socketListenOK.Store(true) // 1.8.191：atomic，避免与 handler 的数据竞争
 			if err := os.Chmod(*socketPath, 0o666); err != nil {
 				log.Printf("chmod socket: %v", err)
 			}
@@ -110,7 +136,9 @@ func main() {
 				log.Fatalf("serve: %v", err)
 			}
 		} else {
-			log.Printf("mediaview v%s listening on http://0.0.0.0:%d", version, *port)
+			// 1.8.191：这里实际绑的是 127.0.0.1（见上面 addr 的构造），原来日志写 0.0.0.0
+			// 会误导"为什么局域网访问不了"这类排查。仅改日志文案，绑定行为不变。
+			log.Printf("mediaview v%s listening on http://127.0.0.1:%d", version, *port)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("listen: %v", err)
 			}
@@ -151,6 +179,7 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(gwPrefix+"/api/thumb/resume", handleResumeThumb)
 	mux.HandleFunc(gwPrefix+"/api/volumes", handleVolumes)
 	mux.HandleFunc(gwPrefix+"/api/browse", handleBrowse)
+	// 1.8.191 只读读飞牛「资源管理器」的目录排序偏好（读它自己的 SQLite，不碰 WS）。
 	// static frontend (embedded)
 	mux.Handle(gwPrefix+"/", &frontendHandler{})
 }
@@ -158,16 +187,20 @@ func registerRoutes(mux *http.ServeMux) {
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	s := getSettings()
 	writeJSON(w, r, map[string]any{
-		"ok":              true,
-		"app":             appName,
-		"version":         version,
-		"ffmpeg":          ffmpegPath != "",
-		"ffprobe":         ffprobePath != "",
-		"thumb_dir":       currentThumbRoot(),
-		"thumb_on":        s.ThumbEnabled,
-		"thumb_size":      s.ThumbSize,
-		"settings":        settingsFile,
-		"thumb_note":      currentThumbNote(),
+		"ok":           true,
+		"app":          appName,
+		"version":      version,
+		"ffmpeg":       ffmpegPath != "",
+		"thumb_engine": getSettings().ThumbEngine,
+		"thumb_lowres": getSettings().ThumbLowres,
+		"ffprobe":      ffprobePath != "",
+		"thumb_dir":    currentThumbRoot(),
+		"thumb_on":     s.ThumbEnabled,
+		"thumb_size":   s.ThumbSize,
+		"settings":     settingsFile,
+		"thumb_note":   currentThumbNote(),
+		// 1.8.191：「跟随文件管理器排序」的偏好来源（只读飞牛自己的 SQLite）。
+		// 报数量与来源即可 —— 这条链一旦失效，用户只能"感觉顺序不对"。
 		"vaapi_device":    detectVAAPIDevice(),
 		"gpu_decode":      s.GPUDecode,
 		"hw_ok":           atomic.LoadInt64(&hwOKCount),
@@ -175,8 +208,27 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"hw_circuit_open": hwCircuitOpen(),
 		// 缩略图解码并发与历史峰值：用于验证「后台让路」是否把峰值压在 thumb_concurrency 以内
 		"thumb_concurrency": s.ThumbConcurrency,
-		"thumb_active":      atomic.LoadInt64(&thumbGenActive),
-		"thumb_peak":        atomic.LoadInt64(&thumbGenPeak),
+		// 1.8.191：**实际生效**的解码并发。信号量只在首次取槽时创建，
+		// 改了设置必须重启才生效 —— 只报设置值会把排障结论带偏（报 2 实际 4）。
+		// 只增字段，不改任何现有字段的语义。
+		"thumb_concurrency_effective": thumbConcurrencyEffective(),
+		// 1.8.191：unix socket 是否真的监听成功。启动顺序是「先停系统 auto_thumbnailer、
+		// 再 listen 我们的 socket」，而 listen 失败只打一行 warn 就继续 ——
+		// 会出现"两套都没了"（系统服务被停、我们的也没起来）却仍显示"已接管"。
+		// 这里只**暴露真实状态**，不改启动流程（避开动到已经稳定的启动路径）。
+		"socket_listening": socketListening(),
+		// 1.8.191：**接管 socket**（飞牛 /vol…/thumb 那个）是否真的在服务。
+		// 会失败的恰恰是它：启动顺序是「先停系统 auto_thumbnailer、再 listen 接管 socket」，
+		// listen 失败只打一行 warn 就继续 → 会出现"两套都没了"却仍显示"已接管"。
+		// 上面那个 socket_listening 是我们自己的 app.sock，几乎不会失败，报它等于没报。
+		"sys_thumb_serving":   sysThumbServeOK(),
+		"preload_concurrency": s.PreloadConcurrency, // 0 = 后台预生成已关闭
+		// 进程启动以来真正投进后台队列的预生成任务数。关掉预生成后它恒不增长 ——
+		// 这是给用户的证据：翻目录时这个数不动，就说明真的一个都没预生成。
+		"preload_enqueued": preloadEnqueued(),
+		"thumb_active":     atomic.LoadInt64(&thumbGenActive),
+		"thumb_peak":       atomic.LoadInt64(&thumbGenPeak),
+		"thumb_suspended":  atomic.LoadInt32(&thumbSuspendedNow), // 当前挂起中的 list 请求数（大图浏览期间让路）
 	})
 }
 

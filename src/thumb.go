@@ -48,15 +48,36 @@ func isCancelErr(err error) bool {
 const thumbKeySuffix = ".key"
 
 func thumbCacheKeyMatches(out, key string) bool {
-	b, err := os.ReadFile(out + thumbKeySuffix)
-	if err != nil {
-		return false
+	// 1.8.148：内容标识改存在**产物文件自己的扩展属性**上，不再写 .key sidecar。
+	//    xattr 跟着文件走，所以缓存目录变成纯镜像：一张图一个文件、文件名与源文件同名。
+	if v, ok := getThumbKeyXattr(out); ok {
+		return strings.TrimSpace(v) == key
 	}
-	return strings.TrimSpace(string(b)) == key
+	// 回退 1：旧缓存里可能还有 .key sidecar（只读，不再写新的）。
+	// 这样升级后**已有缓存不会失效**，不会出现"升级一次全量重生成"。
+	if b, err := os.ReadFile(out + thumbKeySuffix); err == nil {
+		return strings.TrimSpace(string(b)) == key
+	}
+	// 回退 2：两者都没有（非 Linux / 文件系统不支持 xattr / 缓存被 cp 搬走丢了属性）。
+	// 此时退回最宽松的判据：**产物确实存在且非空**就认为可用。
+	//
+	// ⚠ 必须真的 Stat 一次 —— 否则"文件根本不存在"也会被判成命中，
+	//   那就不是"宽松"，而是错的（写这个回退时的第一版就漏了这步）。
+	//
+	// 代价要说清楚：这条路径下，若有人用 `rsync -a` / `cp -p` 覆盖同名源文件，
+	// 时间戳变新，会出现"网格仍是旧图" —— 这正是当初引入 .key 要修的 bug。
+	// 之所以可接受：只在 xattr 与旧 sidecar **都不可用**时走到，
+	// 且清一次缓存即恢复（开发期本来就会手动清缓存目录）。
+	if st, err := os.Stat(out); err == nil && st.Size() > 0 {
+		return true
+	}
+	return false
 }
 
 func writeThumbKey(out, key string) {
-	_ = os.WriteFile(out+thumbKeySuffix, []byte(key), 0o644)
+	// 1.8.148：写进产物文件的 xattr，不再落 sidecar 文件。
+	// 写失败（非 Linux、文件系统不支持）就什么都不做 —— 读取侧有回退，不会坏。
+	_ = setThumbKeyXattr(out, key)
 }
 
 // finishThumb 所有「生成成功」的出口都走它：写下内容标识并返回产物路径。
@@ -102,11 +123,32 @@ func markThumbFailed(key string) {
 // thumbGenSem 全局缩略图生成并发信号量。
 // HTTP 请求和后台 worker 共用，防止用户快速滚动时几十个请求同时解码大图导致 OOM。
 // 每个大图 Go 原生解码峰值可达 200-300MB，限制并发数避免内存叠加。
-// 并发数可在设置里调整（1~8），调整后需重启应用生效（信号量只创建一次）。
+// 并发数可在设置里调整（1~maxThumbConcurrency，即 1~6），调整后需重启应用生效（信号量只创建一次）。
 var (
 	thumbGenSem chan struct{}
 	thumbSemMu  sync.Mutex
 )
+
+// thumbImmediateSem 专供「用户正在等的那一张」的预留槽。
+// 目前只有一个调用方：飞牛文件管理器打开大图预览时发来的 size=big（见 systemthumb.go）。
+//
+// 为什么不共用 thumbGenSem：那是一个普通带缓冲 channel，取槽顺序是**严格 FIFO**。
+// 打开一个未缓存的目录时，文件管理器会往 /thumb/getIcon 灌一整页 list 请求，它们先到先得
+// 地排在 channel 上；大图请求最后到达，只能排在整页缩略图后面 —— 用户看到的现象就是
+// 「必须先跑完一页缩略图，大图浏览窗口才出图」。
+// 单张 320px 缩略图要从 6000+ 像素的原图整帧解码，本机实测约 0.6s（NAS 更慢），
+// 一页按 50 张、8 并发算就是 4s 起步的纯排队时间。预留一个独立槽后大图不必排任何队，
+// 最坏只等当前在跑的那几张解码跑完。
+// 代价：极端情况下总并发是 ThumbConcurrency+1，只多一张，而且只给用户正在等的那一张。
+var thumbImmediateSem = make(chan struct{}, 1)
+
+// acquireImmediateSlot 取得预留槽，返回释放函数。
+// 阻塞等待是安全的：能走这条路的只有「大图预览」，同时最多一两张（查看器会为相邻图
+// 预取），等待时间有界；而它换到的是不被整页网格挡住的确定性。
+func acquireImmediateSlot() func() {
+	thumbImmediateSem <- struct{}{}
+	return func() { <-thumbImmediateSem }
+}
 
 // getThumbSem 返回全局缩略图生成并发信号量。
 // 信号量只在首次调用时创建，运行时不再动态重建：
@@ -133,11 +175,13 @@ func getThumbSem() chan struct{} {
 //
 // 背景：进未缓存目录时，前台（网格滚动）最多 ThumbConcurrency 个解码任务，
 // 后台预生成再叠加 PreloadConcurrency 个 —— 两边各自计数、互不知情，
-// 峰值并发 = 6 + 3 = 9，低功耗 NAS 上直接把 CPU 与内存带宽打满，
-// 用户此时点开大图只能排队等。这里给后台立两条规矩：
-//   1. 后台只用「前台用不到的槽」（非阻塞抢槽），不再与前台叠加；
-//   2. 最近有前台请求时后台主动静默，等用户停手（静默期）再干活。
-const maxThumbConcurrency = 8
+// 峰值并发被放大，低功耗 NAS 上把 CPU 与内存带宽打满，用户此时点开大图只能排队等。
+// 这里给后台立两条规矩：
+//  1. 后台只用「前台用不到的槽」（非阻塞抢槽），不再与前台叠加；
+//  2. 最近有前台请求时后台主动静默，等用户停手（静默期）再干活。
+//
+// 1.8.66 起 PreloadConcurrency 默认 0（关闭），第 2 条只在用户主动开预生成时才走得到。
+const maxThumbConcurrency = 6
 
 // thumbGenActive / thumbGenPeak 仅用于观测：当前正在解码的缩略图数、历史峰值。
 // 「后台让路」是否真的把峰值压在 ThumbConcurrency 以内，靠它验证；
@@ -241,6 +285,151 @@ func cancelBackgroundCtx() {
 	bgCtx, bgCtxStop = nil, nil
 }
 
+// ---- 「用户正在看大图」期间，文件管理器的缩略图请求让路 ----
+//
+// 两个触发源，都指向同一套状态（thumbPaused / thumbPauseUntil）：
+//  1. mediaview 自己的前端打开查看器 → POST /api/thumb/pause；
+//  2. 飞牛文件管理器打开大图预览 → GET /thumb/getIcon?size=big（见 systemthumb.go）。
+//
+// 第 2 条曾被误删（1.8.56），理由是「文件管理器从不请求 size=big」。该结论已证伪：
+// 飞牛前端 ImagePlayer 组件与预览入口都明确请求 big
+// （ImagePlayer-*.js: `{size:B.Big,path:e[t]}`；index-*.js: `gX({size:dX.Big,path:e})`）。
+
+// foregroundPreviewActive 是否处于「用户正在看大图」的暂停窗口内。
+func foregroundPreviewActive() bool {
+	thumbPauseMu.Lock()
+	defer thumbPauseMu.Unlock()
+	return thumbPaused && time.Now().Before(thumbPauseUntil)
+}
+
+// ---- 大图浏览期间：不生成、快速返回占位 ----
+//
+// 1.8.60 曾用「把请求挂住」来让路，1.8.66 废弃 —— 它有一条内在矛盾：
+// 浏览器对同一 origin 只有 6 条 HTTP/1.1 连接，而在 handler 里挂住 = 占着连接不放，
+// 结果是**大图请求自己也发不出去**（浏览器排不到空连接）。挂得越久大图越打不开，
+// 正好挡住它要保护的那张图。把窗口从 10s 缩到 1.5s 只是减轻，不能消除。
+//
+// 正确做法：暂停期间未命中的请求「立刻返回占位图」，把连接马上还回去 ——
+// 网格请求秒回、连接释放，大图请求立刻拿得到连接；CPU 也不再跑 ffmpeg。
+// 代价是网格里没生成出来的位置暂时是灰块，所以把这些请求记进待补齐队列，
+// resume（用户关掉大图窗口）后由后台补生成，用户滚动回来就是缓存命中。
+
+// 前台按需生成兜底；设上限是避免一次长时间大图浏览攒出巨大的补生成风暴。
+
+var ()
+
+// lookupThumbCache 只查缓存、不生成。命中返回产物路径，未命中返回 ""。
+// 判据必须与 ensureThumbInternal 一致（存在 + 非空 + 内容标识匹配），
+// 否则会出现「这里判命中、生成层判要重做」的分裂。
+func lookupThumbCache(path string, size int) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	out := thumbPathFor(path, size)
+	ti, err := os.Stat(out)
+	if err != nil || ti.Size() <= 0 {
+		return ""
+	}
+	cacheID := cacheKey(path, info) + "|q" + strconv.Itoa(getSettings().ThumbQuality)
+	if !thumbCacheKeyMatches(out, cacheID) {
+		return ""
+	}
+	return out
+}
+
+// serveThumbFileWithCache 把已生成的缩略图产物发出去（支持 Range）。
+// cacheControl 由调用方给：文件管理器那条是 max-age=86400，
+// 我们自己前端那条是 immutable 一年。
+func serveThumbFileWithCache(w http.ResponseWriter, r *http.Request, path, cacheControl string) {
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "thumb unavailable", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		http.Error(w, "thumb unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Content-Type", "image/jpeg")
+	http.ServeContent(w, r, filepath.Base(path), stat.ModTime(), f)
+}
+
+// thumbSuspendMaxWait 单个 list 请求最多挂起多久。
+//
+// 为什么必须有上限（1.8.129 采纳代码审查 P1-1）：
+//
+//	飞牛关闭大图预览时**不发任何请求**，服务端收不到「关闭」事件，暂停只能等
+//	thumbPreviewPauseTTL 过期。于是挂起的 list 请求会一直等到 TTL 结束（最长 20 秒），
+//	期间**占着浏览器同源 6 条连接**：用户在网格里继续操作、或预览窗口加载相邻大图，
+//	都会拿不到连接 —— 这正是 1.8.66 判定为致命并因此删掉「挂住式让路」的那个模式。
+//	更糟的是系统缩略图 server 的 WriteTimeout=30s，挂太久会被服务端掐断连接，
+//	而飞牛的 <img> 收到错误**不会重试** → 永久破图。
+//
+// 有界之后：等待中的请求最多占连接这么久，超时就**走正常生成**（不是返回占位图，
+// 所以不会出现白格）。既保住「错峰」，又不会长时间冻结网格。
+const thumbSuspendMaxWait = 2500 * time.Millisecond
+
+var thumbSuspendedNow int32 // 当前处于挂起中的 list 请求数（供 /api/health 观测）
+
+// waitWhileForegroundPreview 在「大图浏览」期间**挂起**缩略图请求（有上限）。
+//
+// 为什么是挂起而不是返回占位图：飞牛的 <img> 一旦收到 200（哪怕是 1×1 占位图）
+// 就认为「这张加载完了」，**不会再重发请求** —— 那些格子就永久空白。用户实测反馈过
+// 「打开大图后后面的缩略图都是白图」。
+//
+// 与 1.8.66 那版的区别：那时是**无差别挂起**，连「打开大图的导航请求」本身也被挂住
+// （它与 list 抢同 6 条连接），结果把大图自己挡死。现在只在大图**已经打开之后**挂起，
+// 且加上 thumbSuspendMaxWait 上限，不再出现「关掉大图后网格冻结」。
+//
+// 返回 true = 可以继续走正常生成；false = 客户端已断开，无需再处理。
+func waitWhileForegroundPreview(ctx context.Context) bool {
+	if !foregroundPreviewActive() {
+		return true
+	}
+	atomic.AddInt32(&thumbSuspendedNow, 1)
+	defer atomic.AddInt32(&thumbSuspendedNow, -1)
+	deadline := time.Now().Add(thumbSuspendMaxWait)
+	for foregroundPreviewActive() && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	return true
+}
+
+// tryServeDeferredThumb 在「正在看大图」期间接管缩略图请求。
+//
+//   - 命中缓存 → 照常把产物发出去（省的是 CPU，命中本来就不耗 CPU，卡住只会白等）；
+//   - 未命中   → 立刻返回占位图，并把这条记进待补齐队列（resume 后补生成）。
+//
+// 两条路径都返回 true，表示请求已被接管、调用方不要再走生成。
+// 不在暂停窗口内返回 false，调用方走正常生成。
+//
+// 抽成函数而不是在两个 handler 里各写一遍：**判定顺序**（先缓存、且在生成之前）是
+// 这条改动的全部要害，散在两处很容易被改歪其中一处。
+func tryServeDeferredThumb(w http.ResponseWriter, r *http.Request, path string, size int, cacheControl string) bool {
+	if !foregroundPreviewActive() {
+		return false
+	}
+	// 已生成的直接发（不耗 CPU，也不该让用户白等）
+	if hit := lookupThumbCache(path, size); hit != "" {
+		serveThumbFileWithCache(w, r, hit, cacheControl)
+		return true
+	}
+	// 未生成：**挂起等待**，大图关闭后继续生成并返回真图。
+	// 不返回占位图 —— 那会让飞牛的 <img> 认为「已加载完成」而永不重发，留下永久白格。
+	if !waitWhileForegroundPreview(r.Context()) {
+		return true // 客户端已断开，不需要回任何东西
+	}
+	return false // 恢复 → 调用方走正常生成路径
+}
+
 // ---- background pre-generation worker pool ----
 type thumbReq struct {
 	path string
@@ -264,6 +453,33 @@ var (
 // 宿主销毁页面）不会发 resume，没有上限的话后台预生成会**永久停摆**，只能重启应用。
 const thumbPauseTTL = 2 * time.Minute
 
+// thumbPreviewPauseTTL 飞牛文件管理器「正在看大图预览」时的后台暂停时长。
+//
+// 为什么不用 thumbPauseTTL（2 分钟）：那是给「前端异常关窗、收不到 resume」兜底用的，
+// 用在预览场景会让后台预生成停摆过久。
+// 为什么不用 thumbQuietPeriod（1.5 秒）：用户逐张翻图时两张之间的间隔常常就超过 1.5 秒，
+// 用 1.5 秒会在每次翻页的间隙里让后台复活、下一张又卡。
+// 这个窗口是**滑动**的——每次 big 请求都往后推，表达的是「最后一次看大图之后再停 20 秒」。
+// 之所以只能滑动、不能精确到「关闭瞬间」：飞牛文件管理器关闭预览时**不发出任何请求**，
+// 服务端收不到「关闭」事件（见 systemthumb.go 的端点清单）。
+const thumbPreviewPauseTTL = 20 * time.Second
+
+// noteForegroundPreview 标记「用户正在看大图预览」：后台预生成整体停摆，并抢占在跑的任务。
+//
+// 与 handlePauseThumb 共用同一套状态（thumbPaused / thumbPauseUntil），不新造第二套，
+// 否则「前端点开查看器」与「文件管理器打开大图」两处暂停会互相覆盖。
+func noteForegroundPreview() {
+	thumbPauseMu.Lock()
+	thumbPaused = true
+	if until := time.Now().Add(thumbPreviewPauseTTL); until.After(thumbPauseUntil) {
+		thumbPauseUntil = until // 滑动续期
+	}
+	thumbPauseMu.Unlock()
+	// 抢占：kill 掉在跑的 ffmpeg，把资源真正让出来（只打时间戳停不了已开始的任务）。
+	// 被抢占的任务由 worker 重新入队，恢复后重试。
+	cancelBackgroundCtx()
+}
+
 // initThumbWorkers 记录 ctx，并只在缩略图开启时启动 worker。
 func initThumbWorkers(ctx context.Context) {
 	thumbCtx = ctx
@@ -284,9 +500,11 @@ func spawnThumbWorkers() {
 		thumbWorkerCancel()
 	}
 
+	// 0 = 关闭后台预生成：不启动任何 worker（队列照建，代码路径保持一致；
+	// enqueueThumb 在 0 时也直接返回，所以队列不会被投递撑满）。
 	n := getSettings().PreloadConcurrency
-	if n < 1 {
-		n = 1
+	if n < 0 {
+		n = 0
 	}
 	if n > maxThumbConcurrency {
 		n = maxThumbConcurrency
@@ -407,35 +625,224 @@ func runBackgroundThumb(wctx context.Context, req thumbReq) bool {
 func restartThumbWorkers() {
 	if getSettings().ThumbEnabled {
 		spawnThumbWorkers()
-	} else if thumbWorkerCancel != nil {
-		// 关闭时停止 worker
-		thumbWorkerCancel()
-		thumbWorkerCancel = nil
+		return
+	}
+	// 关闭时停止 worker。
+	// thumbWorkerCancel 由 spawnThumbWorkers 在 thumbWorkerMu 保护下写入，
+	// 这里必须用同一把锁读写，否则与 spawn 并发时构成 data race
+	// （原先直接读全局变量 + 赋 nil）。cancel() 放到锁外调用，
+	// 避免在持锁期间执行可能阻塞的回调。
+	thumbWorkerMu.Lock()
+	cancel := thumbWorkerCancel
+	thumbWorkerCancel = nil
+	thumbWorkerMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
-func enqueueThumb(path, kind string, size int) {
+// currentThumbQueue 在锁内取出当前的后台队列。
+//
+// thumbQueue 会被 spawnThumbWorkers 在 thumbWorkerMu 保护下**整体替换**，
+// 所以任何读取点都必须走这里。enqueueThumb / requeueThumb 原先直接读全局变量，
+// 与替换构成 data race（`go test -race` 可复现）。
+func currentThumbQueue() chan thumbReq {
+	thumbWorkerMu.Lock()
+	q := thumbQueue
+	thumbWorkerMu.Unlock()
+	return q
+}
+
+// preloadEnqueuedCount 进程启动以来**真正投进后台队列**的预生成任务数。
+//
+// 关掉预生成后这个数恒定不动。它是给用户看的证据：在 NAS 上打 /api/health
+// 看到 preload_enqueued 不再增长，比读代码可信得多。
+var preloadEnqueuedCount int64
+
+// preloadEnqueued 返回累计投递数（供 /api/health 观测）。
+func preloadEnqueued() int64 { return atomic.LoadInt64(&preloadEnqueuedCount) }
+
+// preloadBatch 投递一批后台预生成任务，最多 limit 个，返回**实际入队**的数量。
+//
+// 这是后台预生成的**唯一投递入口**：进入目录（/api/list）、递归扫描（/api/scan）、
+// 清完缓存后重建，三处都走它。开关判断收在本函数最前面 —— 关掉预生成时整批直接
+// 跳过，调用方不需要（也不允许）自己再判一次，所以不会出现「某个入口漏判、
+// 看起来关了其实还在投」这种让人反复怀疑的情况。
+// limit 按场景由调用方给（12 / 5 / 50）。
+func preloadBatch(files []FileItem, limit int) int {
+	// 缩略图功能整体关闭时同样不投。
 	if !getSettings().ThumbEnabled {
+		return 0
+	}
+	// PreloadConcurrency=0 = 关闭后台预生成：这是「进目录别预生成」的落点，必须最先拦住。
+	if getSettings().PreloadConcurrency <= 0 {
+		return 0
+	}
+	if limit <= 0 {
+		return 0
+	}
+	size := thumbRequestSize()
+	n := 0
+	for i := range files {
+		if n >= limit {
+			break
+		}
+		// 1.8.153：队列满（enqueueThumb 非阻塞失败）就**停止**继续尝试 ——
+		// 反正后面也是失败，白耗 CPU；剩下的等你滚动时前台按需生成。
+		if !enqueueThumb(files[i].Path, files[i].Kind, size) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// preloadBatchManual 是「手动生成」专用通道：**只受总开关约束，不受后台预生成开关约束**。
+//
+// 背景（1.8.152 审计发现的真失效）：
+//
+//	设置面板里「手动生成当前目录缩略图」原本复用 preloadBatch，
+//	而 preloadBatch 有两道闸门（ThumbEnabled / PreloadConcurrency<=0），
+//	于是**后台预生成关闭时，这个按钮完全无效，却仍然提示"已请求后台生成"** ——
+//	实现与 UI 承诺直接矛盾。
+//
+// 手动生成是用户明确的即时意图，与"要不要在后台常驻预生成"是两件事，所以这里：
+//
+//	· 只检查 ThumbEnabled；
+//	· 需要时**临时拉起 worker**（跑完这批由 restartThumbWorkers 收掉），
+//	  否则 PreloadConcurrency=0 时没人消费队列，投了也白投。
+func preloadBatchManual(files []FileItem, limit int) int {
+	if !getSettings().ThumbEnabled {
+		return 0
+	}
+	ensureManualWorkers()
+	size := thumbRequestSize()
+	n := 0
+	for i := range files {
+		if n >= limit {
+			break
+		}
+		if !enqueueThumbForced(files[i].Path, files[i].Kind, size) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// ensureManualWorkers 保证队列有消费者。
+// 后台预生成开着时本来就有 worker；关着时临时起 2 个，并安排一次收尾。
+//
+// 1.8.160：**改用互斥量 + 显式标志**，不再依赖可重置的 sync.Once。
+//
+// 原实现在收尾的 goroutine 里写 `= sync.Once{}` 来"允许下一次手动再拉起"。两点都不对：
+//
+//	· sync.Once **不是设计来重置的**（Do 过后复位是 hack）；
+//	· 那个赋值发生在**另一个 goroutine**，而下次调用会在主 goroutine 读它 → **data race**。
+//
+// race 的后果不是崩溃，而是**可能丢掉一次拉起**：worker 没起来，而这次的投递又会
+// 因为 `enqueueThumbForced` 不看 PreloadConcurrency 而成功 → 任务进了队列却没人消费，
+// 表现为"点了立即生成，但一直没动静"，且难以复现。
+var (
+	manualWorkerMu     sync.Mutex
+	manualWorkerActive bool
+)
+
+func ensureManualWorkers() {
+	if getSettings().PreloadConcurrency > 0 {
+		return // 已有常驻 worker
+	}
+	// 只在"当前没有手动临时 worker 期"时拉起一次
+	manualWorkerMu.Lock()
+	if manualWorkerActive {
+		manualWorkerMu.Unlock()
 		return
 	}
-	// worker 由 initThumbWorkers（启动时）和 restartThumbWorkers（设置变更时）负责启停，
-	// 这里不再调用 spawnThumbWorkers() —— 每次入队都重启 worker 会导致频繁
-	// 停止/启动 goroutine，开销大且可能丢失队列中尚未处理的请求。
-	q := thumbQueue
+	manualWorkerActive = true
+	manualWorkerMu.Unlock()
+
+	spawnThumbWorkers()
+	go func() {
+		time.Sleep(30 * time.Second) // 给手动这批留足时间
+		restartThumbWorkers()        // 按当前设置重建（PreloadConcurrency=0 → 收掉）
+		manualWorkerMu.Lock()
+		manualWorkerActive = false // 允许下一次手动再拉起
+		manualWorkerMu.Unlock()
+	}()
+}
+
+// dropQueuedThumbs 丢弃队列里**尚未被 worker 取走**的预生成任务，返回丢弃数量。
+//
+// 用途：进入新目录时，队列里可能还堆着上一个目录的低优先级任务。
+// 网格缩略图优先级本来就低，没必要为了旧目录一直生成 —— 清掉它们，把 worker 让给新目录。
+//
+// 为什么"不会残存坏图"（这是设计上必须保证的）：
+//
+//	· 只丢弃**还没被取走**的任务 —— worker 没碰过它们，磁盘上没有任何痕迹；
+//	· **正在生成的那一张不打断**：产物是「先写 <name>.tmp，成功后 os.Rename 成正式文件」，
+//	  rename 是原子的。所以即便它在半途被中断，残留的也只是一个 .tmp，
+//	  而 .tmp 永远不会被当作成品命中（缓存查找只认正式文件名），并会被清理逻辑回收。
+//	· 已经被 worker 取走并跑完的任务不受影响：那些缩略图是**有效产物**，
+//	  下次进入那个目录反而会命中缓存 —— 不算浪费。
+func dropQueuedThumbs() int {
+	q := currentThumbQueue()
 	if q == nil {
-		return
+		return 0
+	}
+	n := 0
+	for {
+		select {
+		case <-q:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// enqueueThumb 把单个预生成任务投进后台队列；返回是否真的投进去了。
+// 开关关闭、worker 未启动、队列已满都返回 false（那些情况由前台按需生成兜底）。
+func enqueueThumb(path, kind string, size int) bool {
+	if !getSettings().ThumbEnabled {
+		return false
+	}
+	// 后台预生成已关闭（PreloadConcurrency=0）：直接不投递。
+	// 没有 worker 消费，投进去只会白占队列内存，而且这正是用户要的「别进目录就预生成」。
+	// 这里与 preloadBatch 重复判断是**有意的**：preloadBatch 是正常入口，
+	// 这一层是兜底，保证以后新加的调用点也漏不掉。
+	if getSettings().PreloadConcurrency <= 0 {
+		return false
+	}
+	return enqueueThumbTo(path, kind, size)
+}
+
+// enqueueThumbForced 与 enqueueThumb 的唯一区别：**不看 PreloadConcurrency**。
+// 供「手动生成」使用 —— 用户点按钮是明确的即时意图，与"后台是否常驻预生成"是两件事。
+// （1.8.153 修：原来自动/手动共用同一道闸门，导致开关关闭时手动按钮完全无效却提示成功。）
+func enqueueThumbForced(path, kind string, size int) bool {
+	if !getSettings().ThumbEnabled {
+		return false
+	}
+	return enqueueThumbTo(path, kind, size)
+}
+
+// enqueueThumbTo 只做"投递"本身（非阻塞；队列满返回 false）。
+func enqueueThumbTo(path, kind string, size int) bool {
+	q := currentThumbQueue()
+	if q == nil {
+		return false
 	}
 	select {
 	case q <- thumbReq{path, kind, size}:
+		atomic.AddInt64(&preloadEnqueuedCount, 1)
+		return true
 	default:
+		return false
 	}
 }
 
-// requeueThumb 把任务放回后台队列（非阻塞：队列满就丢，那种情况由前台按需生成兜底）。
-// 专用于「被 pause 抢占」这类可恢复的放弃 —— 不能因为用户看了一眼大图，
-// 就让这批预生成任务永久消失。
 func requeueThumb(req thumbReq) {
-	q := thumbQueue
+	q := currentThumbQueue()
 	if q == nil {
 		return
 	}
@@ -456,7 +863,22 @@ func boolStr(b bool) string {
 // 前台请求固定用 Background：客户端断开（翻页、关窗）时若绑 r.Context()，
 // exec.CommandContext 会 kill 掉跑到一半的 ffmpeg，缓存不落盘、下次从零重跑。
 func ensureThumb(path, kind string, size int) (string, error) {
-	return ensureThumbInternal(context.Background(), path, kind, size, true)
+	return ensureThumbInternal(context.Background(), path, kind, size, true, false)
+}
+
+// ensureThumbSys 系统缩略图接管路径（飞牛文件管理器的 /thumb/getIcon）专用。
+//
+// immediate=true（大图预览 size=big）：走预留槽、不排 thumbGenSem 的 FIFO。
+// 打开未缓存目录时 FileManager 会往这个 socket 灌一整页 list 请求，它们先到先得地
+// 排在 channel 上；大图若一起排队就得等整页跑完 —— 这正是预留槽要消除的等待。
+//
+// 「正在看大图期间不生成」不在这里做，而在 handler 层做（见 handleSystemThumbGetIcon
+// 与"占位图快速返回"的思路相关）：那边能在真解码之前就提前返回、把浏览器连接立刻还回去；
+// 放在这一层只能挂住请求，反而会占满同源 6 条连接把大图自己挡住。
+//
+// ctx 同样用 Background（理由见 ensureThumb）。
+func ensureThumbSys(path, kind string, size int, immediate bool) (string, error) {
+	return ensureThumbInternal(context.Background(), path, kind, size, true, immediate)
 }
 
 // ensureThumbBG 后台预生成专用。
@@ -464,10 +886,11 @@ func ensureThumb(path, kind string, size int) (string, error) {
 // 后台不再「额外」占并发，所以前台+后台的总并发始终不超过 ThumbConcurrency。
 // ctx 可被 pause 取消：取消后正在跑的 ffmpeg 被 kill，半成品不会落进缓存。
 func ensureThumbBG(ctx context.Context, path, kind string, size int) (string, error) {
-	return ensureThumbInternal(ctx, path, kind, size, false)
+	return ensureThumbInternal(ctx, path, kind, size, false, false)
 }
 
-func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreground bool) (string, error) {
+// immediate=true 表示「用户正在等的那一张」：取槽时走预留槽、不排网格的队（见 acquireImmediateSlot）。
+func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreground, immediate bool) (string, error) {
 	if !getSettings().ThumbEnabled {
 		return "", errThumbDisabled
 	}
@@ -507,7 +930,7 @@ func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreg
 	// 后到达的大尺寸请求拿到先生成的小尺寸结果。
 	sfKey := cacheID + ":s" + strconv.Itoa(size)
 	v, err, _ := sfGroup.Do(sfKey, func() (any, error) {
-		return generateThumb(ctx, path, kind, size, info, key, cacheID, foreground)
+		return generateThumb(ctx, path, kind, size, info, key, cacheID, foreground, immediate)
 	})
 	if err != nil {
 		// 只对「确定性失败」记负缓存：被 pause 抢占（context canceled）或超时是可恢复的，
@@ -522,14 +945,29 @@ func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreg
 	return v.(string), nil
 }
 
-func generateThumb(ctx context.Context, path, kind string, size int, info os.FileInfo, key, cacheID string, foreground bool) (string, error) {
+func generateThumb(ctx context.Context, path, kind string, size int, info os.FileInfo, key, cacheID string, foreground, immediate bool) (string, error) {
 	// 前台请求在这里阻塞取槽（防止快速滚动时几十个大图同时解码导致 OOM）。
 	// 后台任务的槽已由 worker 在进入 singleflight 之前用 tryAcquireThumbSlot 拿到，
 	// 这里不再取槽 —— 否则「前台 6 + 后台 3」会重新叠加成 9 个并发解码。
-	if foreground {
+	if immediate {
+		// 用户正在等的那一张（文件管理器大图预览）：走预留槽，不排 thumbGenSem 的 FIFO。
+		// 打开未缓存目录时整页 list 请求已经先到先得地排在那条 channel 上，
+		// 大图若一起排队，用户就得等整页缩略图跑完 —— 这正是本函数要消除的等待。
+		release := acquireImmediateSlot()
+		defer release()
+	} else if foreground {
 		sem := getThumbSem()
-		sem <- struct{}{}
-		defer func() { <-sem }()
+		// // 前台取槽是**阻塞式**排队（channel 发送）。
+		// 注意：前台 ctx 恒为 context.Background()（见 ensureThumbInternal 的调用），
+		// 所以下面的 `case <-ctx.Done()` 在当前调用方式下**永远不会触发** ——
+		// 保留它是为了让签名对"可取消的调用方"仍然安全。
+		// 结论：暂停并不拦截前台取槽；让路由 tryServeDeferredThumb 在更外层完成。
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	// 计数必须在拿到槽之后：否则「排队等槽」的请求也会被算成正在解码，
 	// 峰值看起来仍然叠加（实测会被这条误导）。
@@ -544,56 +982,48 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 	_ = os.Chmod(filepath.Dir(out), 0o755)
 	tmp := out + ".tmp"
 
-	// ffmpegImageFailed 标记图片路径中是否已经尝试过 ffmpeg 软件解码且失败。
-	// 避免 fall through 到通用路径后重复调用 ffmpeg（每次超时 30 秒，大图会白等一分钟）。
-	ffmpegImageFailed := false
-
 	if kind == "image" {
-		// JPEG 优先尝试 VAAPI 硬件解码（仅对 Baseline JPEG 有效，Progressive JPEG 自动回退）
-		// 注意：VAAPI 硬件解码受 GPUImageDecode 门控（默认关闭，因 AMD Carrizo 下可能出绿图）；
-		// 但下面的「大图 ffmpeg 软件解码」不依赖 VAAPI，不应被同一个开关门控。
-		// 图片 VAAPI 分支同样要受熔断保护、并计入成败：
-		// 否则勾了实验性「图片硬解」而 GPU 不支持时，**每一张** JPEG 都要先白等一次
-		// 注定失败的 ffmpeg（超时期间还占着缩略图并发槽），比不做硬解还慢。
-		if isJPEGFile(path) && getSettings().GPUDecode && getSettings().GPUImageDecode && !hwCircuitOpen() {
-			if ok, meta := ffmpegImageThumbVAAPI(ctx, path, size, tmp); ok {
-				if err := os.Rename(tmp, out); err == nil {
-					hwRecordSuccess()
-					if meta != nil {
-						saveMeta(key, path, size, meta)
-					}
-					return finishThumb(out, cacheID)
-				}
-			}
-			_ = os.Remove(tmp)
-			atomic.AddInt64(&hwFallbackCount, 1)
-			hwRecordFailure()
-		}
 
-		// 大图走 ffmpeg 软件解码（内部 libjpeg-turbo，SIMD 优化，比 Go 原生快 2-3 倍）。
-		// 此路径不依赖 VAAPI / GPUImageDecode，默认配置下即生效。
-		// 小图（<1MB）直接走 Go 原生，避免 ffmpeg 进程启动开销。
-		if info != nil && info.Size() > 1024*1024 && ffmpegPath != "" && !ffmpegImageFailed {
-			ftmp := out + ".gen.jpg"
-			_ = os.Remove(ftmp)
-			if err := extractImageFrame(ctx, path, size, ftmp); err == nil {
-				if err := os.Rename(ftmp, out); err == nil {
-					// 只在尺寸有效时落盘：heic/avif/svg 的 imageDim 返回 0，
-					// 写进去会让 /api/meta 永远返回 0×0 且不再 probe。
-					if w, h := imageDim(path); w > 0 && h > 0 {
-						saveMeta(key, path, size, &Meta{W: w, H: h})
-					}
-					return finishThumb(out, cacheID)
-				}
-			}
-			_ = os.Remove(ftmp)
-			ffmpegImageFailed = true // 已试过 ffmpeg 且失败，fall through 时不再重复
-		}
 		// 回退 Go 原生解码（Go 解码不可中断，开始前先确认没被取消）
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		ok, meta := goImageThumb(path, size, tmp)
+		// 优先 libvips（shrink-on-load），失败自动回退 goImageThumb。
+		// 实测（320 档、正方形裁剪）：vips 246ms vs ffmpeg 371ms；goImageThumb 更慢。
+		// 引擎分流（见 thumbUseFFmpegForImage）：
+		//   auto  → 渐进式走 ffmpeg、普通 baseline 走 vips
+		//   ffmpeg→ 图片都走 ffmpeg（能吃到 -lowres）
+		//   vips  → 只用 vips
+		// 实测依据（中位 3 次，均裁剪成正方形）：
+		//   普通 baseline 6000x4000 ：320 档 vips 246ms < ffmpeg 371ms（vips 快 34%）
+		//   渐进式 102MP 8736x11648：320 档 vips 1682ms > ffmpeg 1670ms，
+		//                             1920 档 vips 2247ms > ffmpeg 1775ms（ffmpeg 快 26%）
+		// 所以按类型分流，两边各取所长。
+		if thumbUseFFmpegForImage(path) && ffmpegPath != "" && info != nil && info.Size() > 1024*1024 {
+			ftmp := out + ".gen.jpg"
+			_ = os.Remove(ftmp)
+			// L1-E：ffmpeg 返回 0 不代表产物可用（磁盘满、被信号 kill 但 Run 未报错、
+			// 文件系统错误都可能留下空文件）。补一次 stat + 非空校验，避免坏图进缓存后永久命中。
+			// 只 stat 不解码（软件解码不会出绿图，无需像素级检测）。
+			if w, h, err := extractImageFrame(ctx, path, size, ftmp); err == nil {
+				if st, serr := os.Stat(ftmp); serr == nil && st.Size() > 0 {
+					if err := os.Rename(ftmp, out); err == nil {
+						if w > 0 && h > 0 {
+							saveMeta(key, path, size, &Meta{W: w, H: h})
+						}
+						return finishThumb(out, cacheID)
+					}
+				}
+			}
+			_ = os.Remove(ftmp)
+		}
+		var ok bool
+		var meta *Meta
+		if tryVipsImageThumb(ctx, path, size, tmp) {
+			ok = true
+		} else {
+			ok, meta = goImageThumb(path, size, tmp)
+		}
 		if ok {
 			if err := os.Rename(tmp, out); err != nil {
 				return "", err
@@ -607,17 +1037,27 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 		// Go decode failed (HEIC/AVIF/...): fall through to ffmpeg
 	}
 
-	// video or exotic image: ffmpeg（图片若已在上方试过 ffmpeg 且失败则跳过，避免重复 30 秒超时）
-	if ffmpegPath != "" && !ffmpegImageFailed {
+	// video 或 Go/vips 都解不了的图片格式：交给 ffmpeg
+	if ffmpegPath != "" {
 		ftmp := out + ".gen.jpg"
 		_ = os.Remove(ftmp)
 		var ferr error
 		if kind == "image" {
-			ferr = extractImageFrame(ctx, path, size, ftmp) // 图片不用 -ss
+			_, _, ferr = extractImageFrame(ctx, path, size, ftmp) // 图片不用 -ss
 		} else {
-			ferr = extractVideoFrame(ctx, path, size, ftmp) // 视频 seek 到 0.05s
+			_, _, ferr = extractVideoFrame(ctx, path, size, ftmp) // 视频 seek 到 0.05s
 		}
 		if ferr == nil {
+			// 与图片分支（L1-E）对齐：ffmpeg 返回 0 不代表产物可用。
+			// 这里是**视频**与 HEIC/AVIF 等兜底格式的唯一出口，缺校验时一个 0 字节文件
+			// 会被 rename 进缓存并返回给网格/文件管理器 —— 用户看到一张破图，
+			// 而且因为缓存判据要求 size>0，之后每次请求都会重烧一次完整解码。
+			if st, serr := os.Stat(ftmp); serr != nil || st.Size() == 0 {
+				_ = os.Remove(ftmp)
+				// 1.8.164：用 errEmptyProduct 而不是 errNoFFmpeg —— ffmpeg 是可用的，
+				// 只是产物为空（磁盘满/被杀/文件系统错误），日志不该说成"ffmpeg 不可用"。
+				return "", errEmptyProduct
+			}
 			if err := os.Rename(ftmp, out); err != nil {
 				return "", err
 			}
@@ -670,127 +1110,31 @@ func detectVAAPIDevice() string {
 	return ""
 }
 
-// isJPEGFile 判断文件是否为 JPEG 格式（仅 VAAPI 支持 JPEG 硬件解码）
-func isJPEGFile(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".jpg" || ext == ".jpeg" || ext == ".jfif" || ext == ".jpe"
-}
-
-// isProgressiveJPEG 检测 JPEG 是否为 VAAPI 不支持的格式。
-// VAAPI 仅支持 Baseline DCT (SOF0=0xC0)，其他所有 SOF marker（Progressive、Extended、Lossless 等）
-// 都会输出绿色方块或解码失败，需提前跳过。
-func isProgressiveJPEG(path string) bool {
+// validateJPEG 验证 JPEG 文件能否正常解码，且不是 VAAPI 输出的绿色方块。
+// 绿图能正常解码、尺寸也正常，所以必须做像素级检查。
+// jpegHeaderOK 只校验 JPEG 文件头有效（不解码像素、不做绿图检测）。
+//
+// 为什么 vips 路径不需要 validateJPEG：
+//
+//	validateJPEG 会 jpeg.Decode() **完整解码整张图**，再采样 1024 个像素做**绿图检测**。
+//	而绿图是 **VAAPI 硬件解码失败**的特有症状（见 validateJPEG 的注释），
+//	vips 是纯软件处理，**不可能产出绿图**；坏文件用 DecodeConfig 也能查出来。
+//	成本：DecodeConfig <0.5ms vs 完整解码 2~5ms + 1024 次 img.At() 接口调用。
+//
+// 绿图检测保留在它该在的地方 —— extractFrameVAAPI 的输出校验。
+func jpegHeaderOK(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-
-	// 读取前 2 字节确认是 JPEG（FFD8）
-	var soi [2]byte
-	if _, err := io.ReadFull(f, soi[:]); err != nil || soi[0] != 0xFF || soi[1] != 0xD8 {
+	cfg, err := jpeg.DecodeConfig(f)
+	if err != nil {
 		return false
 	}
-
-	// 扫描 marker，找 SOF marker
-	buf := make([]byte, 2)
-	for {
-		if _, err := io.ReadFull(f, buf); err != nil {
-			return false
-		}
-		// 跳过填充字节（FF 后可能跟多个 FF）
-		if buf[0] != 0xFF {
-			continue
-		}
-		marker := buf[1]
-		// 0xC0 = Baseline DCT（VAAPI 唯一支持的）
-		if marker == 0xC0 {
-			return false
-		}
-		// 其他所有 SOF marker（0xC1~0xCF 中除 0xC4/D0~D7 外）都不支持
-		// 0xC1 Extended, 0xC2 Progressive, 0xC3 Lossless, 0xC5~0xC7 Differential,
-		// 0xC9~0xCB Arithmetic, 0xCD~0xCF Differential arithmetic
-		if marker >= 0xC1 && marker <= 0xCF && marker != 0xC4 && marker < 0xD0 {
-			return true
-		}
-		// 其他 marker：读取长度并跳过
-		if _, err := io.ReadFull(f, buf); err != nil {
-			return false
-		}
-		segLen := int(buf[0])<<8 | int(buf[1])
-		if segLen < 2 {
-			return false
-		}
-		skip := make([]byte, segLen-2)
-		if _, err := io.ReadFull(f, skip); err != nil {
-			return false
-		}
-	}
+	return cfg.Width > 0 && cfg.Height > 0
 }
 
-// ffmpegImageThumbVAAPI 用 ffmpeg VAAPI 硬件解码生成图片缩略图。
-// 返回 (成功, 元数据)。VAAPI 不可用或解码失败时返回 (false, nil)。
-// parent 被取消（例如后台预生成被 pause 抢占）时 ffmpeg 会被 kill。
-func ffmpegImageThumbVAAPI(parent context.Context, path string, size int, out string) (bool, *Meta) {
-	if ffmpegPath == "" {
-		return false, nil
-	}
-	dev := detectVAAPIDevice()
-	if dev == "" {
-		return false, nil
-	}
-
-	// VAAPI 不支持 Progressive JPEG，直接跳过（会输出绿色方块）
-	if isProgressiveJPEG(path) {
-		return false, nil
-	}
-
-	vf := "scale=" + itoa(size) + ":" + itoa(size) +
-		":force_original_aspect_ratio=increase,crop=" + itoa(size) + ":" + itoa(size)
-	q := qualityToQScale(getSettings().ThumbQuality)
-
-	// 超时与视频硬解对齐（10s）：硬解要么很快，要么就是驱动/编码不支持，
-	// 早点失败回退，别让前台的缩略图并发槽被白占 30 秒。
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, ffmpegPath,
-		"-hide_banner", "-loglevel", "error",
-		"-hwaccel", "vaapi", "-hwaccel_device", dev,
-		"-autorotate", "-i", path,
-		"-frames:v", "1", "-f", "image2", "-update", "1",
-		"-vf", vf, "-an", "-y", "-q:v", itoa(q), out)
-
-	cmd.Env = vaapiEnv()
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("VAAPI ffmpeg FAILED for %s (dev=%s): %v\n%s", path, dev, err, string(output))
-		return false, nil
-	}
-
-	// 验证输出文件存在且非空
-	if st, err := os.Stat(out); err != nil || st.Size() == 0 {
-		log.Printf("VAAPI ffmpeg output empty for %s", path)
-		return false, nil
-	}
-
-	// 验证输出 JPEG 能正常解码（防止绿色方块等颜色错误）
-	if !validateJPEG(out) {
-		log.Printf("VAAPI ffmpeg output invalid for %s, falling back to CPU", path)
-		_ = os.Remove(out)
-		return false, nil
-	}
-
-	log.Printf("VAAPI ffmpeg OK for %s (dev=%s)", path, dev)
-
-	w, h := imageDim(path)
-	meta := &Meta{W: w, H: h}
-	return true, meta
-}
-
-// validateJPEG 验证 JPEG 文件能否正常解码，且不是 VAAPI 输出的绿色方块。
-// 绿图能正常解码、尺寸也正常，所以必须做像素级检查。
 func validateJPEG(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -839,14 +1183,197 @@ func validateJPEG(path string) bool {
 	return true
 }
 
-// readJPEGOrientation 读取 JPEG 文件的 EXIF Orientation（1~8），失败或无 EXIF 返回 1。
-// 只解析文件头，不全量解码，开销极小。竖拍手机照片通常为 6（顺时针90°）或 8（逆时针90°）。
-func readJPEGOrientation(path string) int {
+// jpegIsProgressive 判断 JPEG 是否为渐进式（Progressive DCT）。
+//
+// 为什么需要它：渐进式 JPEG 把 DCT 系数分散在多次扫描里，**无法使用 DCT 分级解码** ——
+// vips 的 shrink-on-load 完全失效（实测 [shrink=8] 与不 shrink 同样耗时 1660ms），
+// 而 ffmpeg 的常规解码在渐进式上更快（大图档最多快 58%），且只有它能吃 -lowres。
+// 所以 auto 引擎按这个判据分流。
+//
+// JPEG 的 SOF 标记（0xFFC0~0xFFCF，但要排除不是 SOFn 的三个）：
+//
+//	0xC0 baseline          0xC1 extended sequential   0xC2 **progressive**
+//	0xC3 lossless          0xC4 不是 SOFn（DHT）      0xC5 differential sequential
+//	0xC6 **differential progressive**                 0xC7 differential lossless
+//	0xC8 不是 SOFn（JPG）   0xC9 extended arithmetic  0xCA **progressive arithmetic**
+//	0xCB lossless arith    0xCC 不是 SOFn（DAC）      0xCD dif. sequential arith
+//	0xCE **differential progressive arith**           0xCF differential lossless arith
+//
+// 只读文件头（遇到第一个 SOFn、SOS 或 EOI 就返回），开销极小。
+// ---- 文件头探测缓存（L1-D）----
+//
+// imageDim 与 jpegIsProgressive 都是"只读文件头"的探测，但同一张图在一次会话里会被
+// 反复问：列目录算尺寸、生成缩略图时算 -lowres 档位与写 meta、list/medium/big 三档
+// 各自问一次 progressive…… 这里按 **path+mtime+size** 缓存，把 N 次读头压成 1 次。
+// 键里带 mtime+size 是为了原图被替换/修改时缓存自然失效（与 .key sidecar 同一判据）。
+type fileProbe struct {
+	w, h        int
+	progressive bool
+	probed      bool
+}
+
+var (
+	probeMu    sync.Mutex
+	probeCache = make(map[string]fileProbe)
+)
+
+const probeCacheMax = 1024
+
+func probeKey(path string, info os.FileInfo) string {
+	return path + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(info.Size(), 10)
+}
+
+// imageDimCached 是 imageDim 的带缓存版本，供缩略图热点路径使用。
+func imageDimCached(p string) (int, int) {
+	info, err := os.Stat(p)
+	if err != nil {
+		return 0, 0
+	}
+	k := probeKey(p, info)
+	probeMu.Lock()
+	pr, ok := probeCache[k]
+	probeMu.Unlock()
+	if ok && (pr.w > 0 || pr.h > 0) {
+		return pr.w, pr.h
+	}
+	w, h := imageDim(p)
+	probeMu.Lock()
+	if len(probeCache) >= probeCacheMax {
+		// 探测很便宜，命中率比精确 LRU 更重要，满了就整体清空
+		probeCache = make(map[string]fileProbe)
+	}
+	pr.w, pr.h = w, h
+	probeCache[k] = pr
+	probeMu.Unlock()
+	return w, h
+}
+
+// jpegIsProgressiveCached 是 jpegIsProgressive 的带缓存版本。
+func jpegIsProgressiveCached(p string) bool {
+	info, err := os.Stat(p)
+	if err != nil {
+		return false
+	}
+	k := probeKey(p, info)
+	probeMu.Lock()
+	pr, ok := probeCache[k]
+	probeMu.Unlock()
+	if ok && pr.probed {
+		return pr.progressive
+	}
+	v := jpegIsProgressive(p)
+	probeMu.Lock()
+	if len(probeCache) >= probeCacheMax {
+		probeCache = make(map[string]fileProbe)
+	}
+	pr.progressive = v
+	pr.probed = true
+	probeCache[k] = pr
+	probeMu.Unlock()
+	return v
+}
+
+func jpegIsProgressive(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
-		return 1
+		return false
 	}
 	defer f.Close()
+	var soi [2]byte
+	if _, err := io.ReadFull(f, soi[:]); err != nil || soi[0] != 0xFF || soi[1] != 0xD8 {
+		return false // 不是 JPEG
+	}
+	var one [1]byte
+	for {
+		var marker [2]byte
+		if _, err := io.ReadFull(f, marker[:]); err != nil {
+			return false
+		}
+		if marker[0] != 0xFF {
+			return false
+		}
+		// 允许重复的填充字节 0xFF
+		for marker[1] == 0xFF {
+			if _, err := io.ReadFull(f, one[:]); err != nil {
+				return false
+			}
+			marker[1] = one[0]
+		}
+		m := marker[1]
+		// SOFn 家族（排除 0xC4/0xC8/0xCC 这三个非 SOFn 标记）
+		if m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC {
+			switch m {
+			case 0xC2, 0xC6, 0xCA, 0xCE:
+				return true // Progressive DCT（Huffman 或算术编码）
+			default:
+				return false // Baseline / Extended / Lossless / Differential
+			}
+		}
+		// SOS：压缩数据开始；EOI：文件结束 —— 都不可能再有 SOF 了
+		if m == 0xDA || m == 0xD9 {
+			return false
+		}
+		// 跳过本段
+		var lb [2]byte
+		if _, err := io.ReadFull(f, lb[:]); err != nil {
+			return false
+		}
+		if segLen := int(binary.BigEndian.Uint16(lb[:])) - 2; segLen > 0 {
+			if _, err := f.Seek(int64(segLen), io.SeekCurrent); err != nil {
+				return false
+			}
+		}
+	}
+}
+
+// isJPEGPath 按扩展名判断是否 JPEG。
+func isJPEGPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".jfif", ".jpe":
+		return true
+	}
+	return false
+}
+
+// thumbUseFFmpegForImage 决定这张图片是否交给 ffmpeg（受设置的「缩略图压缩引擎」控制）。
+//
+//	auto（默认）：**按 JPEG 类型自动分流**
+//	  渐进式（Progressive DCT）→ ffmpeg
+//	    渐进式无法用 DCT 分级解码：vips 的 shrink-on-load 完全失效；
+//	    ffmpeg 在渐进式上更快，且只有它能吃 -lowres 这个提速杠杆。
+//	  普通 baseline / 非 JPEG → vips
+//	    baseline 能用 shrink-on-load，vips 略快，还省一次进程开销。
+//	ffmpeg：图片一律交给 ffmpeg。
+//	vips  ：不主动交给 ffmpeg（vips 失败时仍会走下面的通用 ffmpeg 兜底）。
+func thumbUseFFmpegForImage(path string) bool {
+	switch getSettings().ThumbEngine {
+	case "ffmpeg":
+		return true
+	case "vips":
+		return false
+	default: // auto
+		// P1-1：lowres 开启时 **ffmpeg 全面更快** ——
+		// 实测（320 档，中位 3 次）：
+		//   baseline 24MP：vips 243ms  vs  ffmpeg+lowres3 109ms（快 2.2×）
+		//   渐进 102MP  ：vips 1658ms vs  ffmpeg+lowres3 1390ms（快 19%）
+		// 而且**只有 ffmpeg 能吃 -lowres**（vips 的命令行里根本没有这个参数）。
+		// 所以此时不再按类型分流 —— 否则 baseline 图被分给 vips，白丢 2.2×。
+		if getSettings().ThumbLowres {
+			return true
+		}
+		// 只有 lowres 关闭时，才回到"按类型分流"（那时 baseline 走 vips 略快）
+		return isJPEGPath(path) && jpegIsProgressiveCached(path)
+	}
+}
+
+// readJPEGOrientationFrom 从**已打开**的文件读 EXIF Orientation（不自己 open）。
+// L1-C：goImageThumb 里已经打开了同一个文件，没必要再 open 一次。
+func readJPEGOrientationFrom(f *os.File) int {
+	return readJPEGOrientationBody(f)
+}
+
+// readJPEGOrientationBody 在已定位到开头的文件上扫描 EXIF。
+func readJPEGOrientationBody(f *os.File) int {
 	// SOI marker
 	var soi [2]byte
 	if _, err := io.ReadFull(f, soi[:]); err != nil || soi[0] != 0xFF || soi[1] != 0xD8 {
@@ -955,6 +1482,82 @@ func readJPEGOrientation(path string) int {
 // EXIF 方向非 1 的图（竖拍照片）也走 ffmpeg，因为 Go image 包不处理 EXIF 旋转。
 const goImageMaxPixels = 20_000_000 // ~4500x4500，超过走 ffmpeg 避免 Go 原生解码内存峰值
 
+// vips 探测一次 vipsthumbnail 路径（libvips 未安装则为空，功能自动回退）。
+var (
+	vipsOnce sync.Once
+	vipsPath string
+)
+
+// vipsQualitySuffix 构造 vips 的输出选项后缀，画质取自设置里的 ThumbQuality。
+//
+// 为什么需要它：原来这里硬编码 `[Q=<设置值>,strip]`，于是「缩略图质量」这个设置
+// （50~95，默认 80）对 **vips 路径完全无效** —— 只有 ffmpeg（qualityToQScale）
+// 和 Go（jpeg.Options{Quality}）两条路径响应它。用户调画质时 vips 出的图纹丝不动。
+//
+// 缓存 key 里已含画质（cacheID = key + "|q" + ThumbQuality），所以改画质会
+// 正常触发重新生成，不存在"改了画质但命中旧缓存"的问题。
+func vipsQualitySuffix() string {
+	q := getSettings().ThumbQuality
+	if q < 50 || q > 95 {
+		q = 80 // 与 config.normalize 的兜底保持一致
+	}
+	return "[Q=" + itoa(q) + ",strip]"
+}
+
+func vipsBin() string {
+	vipsOnce.Do(func() {
+		if p, err := exec.LookPath("vipsthumbnail"); err == nil {
+			vipsPath = p
+		}
+	})
+	return vipsPath
+}
+
+// tryVipsImageThumb 用 libvips 生成图片缩略图。
+//
+// 为什么值得单独一条路径：libvips 读 JPEG 时默认 shrink-on-load（按目标尺寸选 DCT
+// 缩放尺度），而 goImageThumb 走 image/jpeg 是**整帧解码**再缩放。飞牛 NAS 实测
+// （6000x4000 的 7MB JPEG → 320px）：
+//
+//	vipsthumbnail   210ms
+//	ffmpeg          396ms
+//	ffmpeg(fast)    365ms
+//
+// 一屏 50 张缩略图的场景下这是 2.6s 与 7.5s 的差别 —— 用户感知的「打开目录要等两页
+// 缩略图」主要就是这段 CPU + 磁盘时间（50 x 7MB = 350MB 的读取量）。
+//
+// 工具不存在或失败时返回 false，调用方回退原有路径，不改变既有行为。
+func tryVipsImageThumb(ctx context.Context, path string, size int, out string) bool {
+	bin := vipsBin()
+	if bin == "" {
+		return false
+	}
+	tmp := out + ".tmp"
+	// -s：长边缩放到 size；--crop：裁成正方形（与 ffmpeg 路径的 increase,crop 语义对齐）；
+	// [Q=<设置值>,strip]：去掉元数据并控制体积（画质跟随设置，见 vipsQualitySuffix）。
+	cmd := exec.CommandContext(ctx, bin, path, "-s", itoa(size), "--crop",
+		"-o", tmp+vipsQualitySuffix())
+	if err := cmd.Run(); err != nil {
+		os.Remove(tmp)
+		return false
+	}
+	if st, err := os.Stat(tmp); err != nil || st.Size() == 0 {
+		os.Remove(tmp)
+		return false
+	}
+	// L1-A：只校验文件头。vips 是纯软件处理，不会产出 VAAPI 那种绿图，
+	// 没必要为此完整解码一遍（原来这里是 validateJPEG，每张白花 2~5ms）。
+	if !jpegHeaderOK(tmp) {
+		os.Remove(tmp)
+		return false
+	}
+	if err := os.Rename(tmp, out); err != nil {
+		os.Remove(tmp)
+		return false
+	}
+	return true
+}
+
 func goImageThumb(path string, size int, out string) (bool, *Meta) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -970,11 +1573,11 @@ func goImageThumb(path string, size int, out string) (bool, *Meta) {
 	if w <= 0 || h <= 0 {
 		return false, nil
 	}
-	// EXIF 方向非 1（竖拍照片等）：Go image 包不自动旋转，走 ffmpeg 分支
-	if readJPEGOrientation(path) != 1 {
+	// EXIF 方向非 1（竖拍照片等）：Go image 包不自动旋转，交给下面通用的 ffmpeg 分支
+	if _, err := f.Seek(0, 0); err == nil && readJPEGOrientationFrom(f) != 1 {
 		return false, &Meta{W: w, H: h}
 	}
-	// 超大图交给 ffmpeg（分块解码+scale，内存占用低）
+	// 超大图交给 ffmpeg（分块解码+scale，内存占用低）—— 同样 fall through 到通用分支
 	if w*h > goImageMaxPixels {
 		return false, &Meta{W: w, H: h}
 	}
@@ -1049,6 +1652,9 @@ func handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported type", http.StatusBadRequest)
 		return
 	}
+	// 大图浏览期间不生成：命中缓存的照常返回，未命中的立刻回一张占位图，
+	// 把浏览器连接马上还回去（挂住会占满同源 6 连接、反而挡住大图，见上方说明）。
+	// 1.8.100：同上，不再用占位图接管（避免白图 + 缓存）
 	file, err := ensureThumb(path, kind, size)
 	if err != nil {
 		if err == errThumbDisabled {
@@ -1060,8 +1666,8 @@ func handleThumb(w http.ResponseWriter, r *http.Request) {
 		// placeholder: return a generic 1x1 / let frontend fallback
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-MediaView-Thumb", "failed")
-		w.Header().Set("Content-Type", "image/jpeg")
-		_, _ = w.Write(placeholderJPEG)
+		w.Header().Set("Content-Type", "image/gif")
+		_, _ = w.Write(placeholderThumbGIF)
 		return
 	}
 	info, err := os.Stat(file)
@@ -1080,32 +1686,20 @@ func handleThumb(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "thumb.jpg", info.ModTime(), tf)
 }
 
-var placeholderJPEG = []byte{
-	0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-	0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43,
-	0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
-	0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b, 0x0c, 0x19, 0x12,
-	0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20,
-	0x24, 0x2e, 0x27, 0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29,
-	0x2c, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32,
-	0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01,
-	0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00,
-	0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-	0x09, 0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03,
-	0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7d,
-	0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
-	0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
-	0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72,
-	0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
-	0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
-	0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-	0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
-	0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-	0x8a, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa3, 0xa4, 0xa5,
-	0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9,
-	0xba, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xfb,
-	0xd0, 0xff, 0xd9,
+// placeholderThumbGIF 生成失败时的兜底图：1×1 **透明** GIF（43 字节）。
+//
+// 为什么必须是透明而不是浅色（原实现是一张灰度 1×1 JPEG，291 字节）：
+// 深色网格上一块浅色就是「缩略图坏了」的观感，用户会把生成失败当成显示 bug。
+// 透明与「还没加载」一致，不引人注意。
+//
+// 代码审查 P0-1 顺带发现：原来的契约测试 grep 源码里有没有 "image/gif"，
+// 而 thumb.go 顶部有一句 `_ "image/gif" // 注册 GIF 解码器` —— 断言被它蒙混成永远为真，
+// 真实的占位图其实是浅色 JPEG。本版把**内容**与**断言**一起修正。
+var placeholderThumbGIF = []byte{
+	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01,
+	0x00, 0x3B,
 }
 
 // handleClearThumbCache 清除缩略图缓存。
@@ -1233,21 +1827,21 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("clear: done, deleted %d files for %s", deleted, absPath)
 
-		// 清除后触发当前目录的缩略图重新生成（后台预生成）
+		// 清除后重建当前目录的缩略图（后台预生成关闭时这里一个都不投）
 		time.Sleep(200 * time.Millisecond)
 		resp, err := listDir(absPath, "name")
 		if err != nil {
 			log.Printf("rebuild: list %s failed: %v", absPath, err)
 			return
 		}
-		var enqueued int
-		for i := range resp.Files {
-			if i >= 50 {
-				break
-			}
-			enqueueThumb(resp.Files[i].Path, resp.Files[i].Kind, thumbRequestSize())
-			enqueued++
-		}
+		// 1.8.164：改走 preloadBatchManual。
+		// 「清空缓存后立即重建」是**用户刚点了那个按钮**的即时动作，
+		// 与「要不要在后台常驻预生成」是两件事 —— 用 preloadBatch 会被
+		// PreloadConcurrency<=0 的闸门挡住（返回 0），与本 handler 文档承诺的
+		// 「立即触发重新生成」矛盾（与 1.8.153 修过的「手动生成」同一类问题）。
+		// 注：功能上不停摆 —— 前端重新加载目录时每个图片的 /api/thumb 前台请求
+		// 本就会直接生成；但后台这步"投了 0 个"是实打实的冗余与承诺不符。
+		enqueued := preloadBatchManual(resp.Files, 50)
 		log.Printf("rebuild: enqueued %d files for %s", enqueued, absPath)
 	}()
 
@@ -1290,5 +1884,7 @@ func handleResumeThumb(w http.ResponseWriter, r *http.Request) {
 	close(thumbResumeCh) // 广播恢复信号：所有持有旧引用的 worker 同时被唤醒
 	thumbResumeCh = make(chan struct{})
 	thumbPauseMu.Unlock()
+	// 用户关掉了大图窗口：把暂停期间被占位挡回去的缩略图补生成，
+	// 网格滚动回去就是缓存命中 —— 这就是「关掉大图浏览窗口后再继续生成」。
 	writeJSON(w, r, map[string]any{"ok": true})
 }

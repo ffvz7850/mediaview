@@ -48,7 +48,6 @@ func TestSettingsPersistRoundtrip(t *testing.T) {
 		"thumbConcurrency": 6,
 		"preloadConcurrency": 3,
 		"gpuDecode": true,
-		"gpuImageDecode": false,
 		"viewerPreload": 4,
 		"viewerAnimation": "fade",
 		"viewerMode": "overlay"

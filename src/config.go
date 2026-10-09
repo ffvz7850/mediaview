@@ -34,28 +34,101 @@ type Settings struct {
 	ThumbSize int `json:"thumbSize"`
 	// ThumbQuality JPEG 质量，50~95
 	ThumbQuality int `json:"thumbQuality"`
+	// ThumbEngine 缩略图压缩引擎：
+	//   "auto"（默认）：**按 JPEG 类型自动分流** —— 渐进式图走 ffmpeg、
+	//                   普通 baseline 图走 vips（见 thumbUseFFmpegForImage 的说明）。
+	//   "vips"        ：只用 libvips。
+	//   "ffmpeg"      ：图片一律走 ffmpeg（能吃 -lowres 提速）。
+	// 实测：普通图 vips 快 34%；渐进式 102MP 图 ffmpeg 快 26%（1920 档）。
+	ThumbEngine string `json:"thumbEngine"`
+	// ThumbLowres 图片缩略图是否用 ffmpeg 的 -lowres 快速解码（默认 true）。
+	// -lowres N 让解码器只取 DCT 低频系数，直接产出 1/2^N 尺寸的图像 ——
+	// 这正是 vips 的 shrink-on-load 在**渐进式 JPEG** 上做不到的事。
+	// 本机实测（6000x4000 与 8736x11648 真实样本）：
+	//   普通图 →320 档：387ms → 173ms（快 55%）
+	//   渐进式 102MP →320 档：1452ms → 1035ms（快 29%）
+	//   渐进式 102MP →1920 档：1582ms → 1169ms（快 26%）
+	// 档位按目标尺寸动态计算（lowresFor），取小了没收益、取大了会把图放大糊掉。
+	ThumbLowres bool `json:"thumbLowres"`
+
+	// ---- 1.8.144 新增：大图预览的画质 / 清晰度 / lowres 档位都能在设置里调 ----
+
+	// ViewerQuality 大图预览的 JPEG 画质：
+	//   0   = 自动（88，兼顾清晰与体积）
+	//   -1  = 跟随「缩略图质量」，**不再钳制**（用户设多少就用多少）
+	//   84/88/95 = 固定画质（实测：84→-q:v 4、88→3、95→2；90/92 与 88 等价、98 与 95 等价，故不列）
+	//
+	// 背景：1.8.137 起大图质量曾是"跟随缩略图质量但钳到 [82,86]"（恒为 -q:v 4），
+	// 于是设置里的质量对大图预览形同虚设 —— 用户调得越高，被砍得越狠。
+	ViewerQuality int `json:"viewerQuality"`
+
+	// ViewerMaxdim 大图预览的清晰度上限（像素长边）：
+	//   0 = 自动（按视口 × 1.4 计算，clamp 到 [2048,4096]）；2048 = 默认
+	//   2048/3072/4096/5120/6144 = 固定档位
+	ViewerMaxdim int `json:"viewerMaxdim"`
+
+	// ViewerLowres 大图预览的低分辨率解码档位（ffmpeg -lowres）：
+	//   0 = 自动（lowresFor 公式，保证「长边/2^N ≥ 目标×0.9」）
+	//   -1 = 关闭（完整解码）
+	//   1/2/3 = 固定档位（档位越高越快，但可能轻微缩水）
+	ViewerLowres int `json:"viewerLowres"`
+
+	// ThumbLowresLevel 缩略图的低分辨率解码档位（与 ThumbLowres 那个总开关叠加）：
+	//   0 = 自动（公式）；-1 = 关闭；1/2/3 = 固定档位
+	ThumbLowresLevel int `json:"thumbLowresLevel"`
 	// TakeoverSystemThumb 接管系统缩略图：开启后停止并禁用飞牛 auto_thumbnailer 服务，
 	// 系统不再生成缩略图，统一由本应用生成。关闭时恢复系统服务。
 	TakeoverSystemThumb bool `json:"takeoverSystemThumb"`
 	// CPUCores 限制使用的 CPU 核心数（1~NumCPU，0=不限制）。通过 cgroups v2 cpuset 限制。
 	CPUCores int `json:"cpuCores"`
-	// ThumbConcurrency 缩略图生成并发数（1~8，默认6）。HTTP 请求和后台共用，防止 OOM。
+	// ThumbConcurrency 缩略图生成并发数（1~maxThumbConcurrency，默认按核数收敛，见 thumbConcurrencyDefault）。
 	ThumbConcurrency int `json:"thumbConcurrency"`
-	// PreloadConcurrency 后台预生成 worker 数（1~8，默认3）。进入目录后后台预生成缩略图。
+	// PreloadConcurrency 后台预生成 worker 数（0~8，默认0=关闭）。
+	// 0 = 不启动 worker、也不主动投递：进入目录后完全由前台按需生成。
 	PreloadConcurrency int `json:"preloadConcurrency"`
+	// SchemaVersion 配置结构版本，仅供一次性迁移使用（见 migrate）。
+	// 前端 body 不含该字段，由服务端在保存时补上当前值。
+	SchemaVersion int `json:"schemaVersion"`
 	// GPUDecode 是否启用 GPU 视频硬件解码（VAAPI，默认 true）。
 	// 视频抽帧（H.264/HEVC）走核显硬解，大幅降低 CPU 占用。A8-7680 已实测支持 H.264 + HEVC Main 8-bit。
 	GPUDecode bool `json:"gpuDecode"`
-	// GPUImageDecode 是否启用 GPU 图片硬件解码（VAAPI JPEG，默认 false，实验性）。
-	// AMD Carrizo/GCN 3.0 的 JPEG 硬解在 Mesa radeonsi 下可能产出颜色错误的图（绿图），
-	// 仅在 vainfo 明确暴露 VAProfileJPEGBaseline 且实测正常时开启。需同时 GPUDecode=true。
-	GPUImageDecode bool `json:"gpuImageDecode"`
 	// ViewerPreload 大图浏览时切换后预加载后面几张图（0~5，默认2）。打开时只加载当前图，切换后才预加载。
 	ViewerPreload int `json:"viewerPreload"`
 	// ViewerAnimation 大图浏览翻页动画效果：slide(滑动)/fade(淡入淡出)/zoom(缩放)/none(无动画)，默认 slide
 	ViewerAnimation string `json:"viewerAnimation"`
 	// ViewerMode 大图浏览方式：window(独立桌面窗口)/overlay(窗口内遮罩)，默认 window
 	ViewerMode string `json:"viewerMode"`
+	//
+	// 为什么必须是 *bool 而不是 bool：loadSettings 是「从零值 struct 开始
+	// json.Unmarshal」的，用 bool 的话「配置文件里没有这个字段」（老版本升级上来的
+	// 用户，占绝大多数）和「用户明确关掉了」会变成同一个值 false —— 升级即被静默
+	// 改成关闭。用指针区分「没写过」(nil) 与「写成了 false」，nil 按默认值 true 处理。
+}
+
+// thumbConcurrencyDefault 缩略图并发的默认值：按 CPU 核数收敛，**永远给前台留 2 个核**。
+//
+// 为什么不是固定值：缩略图是批量的（打开一个目录可能几十张），大图转码是单张但用户
+// 正在等。固定并发在 4 核机器上会把核占满（默认原来是 3，用户设置常见 4），
+// 于是点大图时它抢不到 CPU，只能干等 —— 实测 4 核机器上大图与缩略图同时解码时
+// 大图耗时数倍于空闲时。按核数留出余量后，缩略图侧最多用 nproc-2 个核。
+//
+// 用户仍可在设置里手动调整（1~maxThumbConcurrency），此项只影响默认值。
+func thumbConcurrencyDefault() int {
+	// 实测（4 核 NAS、6000x4000 原图）缩略图生成期间：
+	//   CPU 71% 空闲、14% wa、后端 size=big 仅 11ms —— **并发不是争用源**。
+	// 而并发偏低会直接放大「打开大图要等整页缩略图」：
+	//   飞牛一次发出整页（~50 张）list 请求，它的 size=big（大图预览）排在队尾，
+	//   并发 1 时 50 x 210ms = 10.5s，big 请求要等这么久才轮到 —— 等到时
+	//   暂停机制才生效，而两页早已生成完。并发 4 时是 2.6s，快 4 倍。
+	// 所以默认给 4，并把上限交给用户（1~maxThumbConcurrency）。
+	n := 4
+	if n > runtime.NumCPU() {
+		n = runtime.NumCPU()
+	}
+	if n > maxThumbConcurrency {
+		n = maxThumbConcurrency
+	}
+	return n
 }
 
 var (
@@ -88,17 +161,29 @@ func defaultSettings() Settings {
 		ThumbDir:            "",
 		ThumbSize:           320,
 		ThumbQuality:        80,
+		ThumbEngine:         "auto",
+		ThumbLowres:         true,
+		ViewerQuality:       0,    // 自动（88）
+		ViewerMaxdim:        2048, // 1.8.146 起默认 2048（用户要求）
+		ViewerLowres:        0,    // 自动（按公式）
+		ThumbLowresLevel:    0,    // 自动（按公式）
 		TakeoverSystemThumb: false,
 		CPUCores:            0, // 0 = 不限制
-		ThumbConcurrency:    6,
-		PreloadConcurrency:  3,
+		ThumbConcurrency:    thumbConcurrencyDefault(),
+		PreloadConcurrency:  2, // 默认开 2 个后台 worker：把"等待"提前到空闲时段（0 = 关闭）
+		SchemaVersion:       currentSettingsSchema,
 		GPUDecode:           true,
-		GPUImageDecode:      false, // 图片 JPEG 硬解默认关闭（Carrizo 下可能出绿图）
 		ViewerPreload:       2,
 		ViewerAnimation:     "slide",
 		ViewerMode:          "window",
+		// 默认跟随文件管理器排序：这才是不用配置就正确的那一项。
+		// 关掉它 = 回到「本应用自己一套顺序」，只有用户明确不想要跟随时才该用。
 	}
 }
+
+// boolPtr 取 bool 的地址。Settings 里几个「默认开」的开关用指针区分
+// 「配置里没这一项」与「用户关掉了」，需要一个取址辅助函数。
+func boolPtr(v bool) *bool { return &v }
 
 // ---- 读写 ----
 
@@ -113,7 +198,17 @@ func loadSettings() {
 		saveSettingsFile()
 		return
 	}
-	var s Settings
+	// P0-1 治本：从默认值出发再反序列化，缺失字段保留默认值 ——
+	// 这样以后**每一个新加的 bool 字段**都不会再因为"零值 = false"而静默失效
+	// （1.8.136 的 ThumbLowres 就是这么丢的：normalize 里没有它，bool 缺失即 false，
+	//   还会被 migrate/save 落盘固化）。
+	//
+	// ★ SchemaVersion 必须在 Unmarshal **之前**清零：
+	//   defaultSettings() 会把它设成 currentSettingsSchema，而"磁盘上从来没写过
+	//   schemaVersion 的老配置"Unmarshal 后不会覆盖它 → migrated 判为 false →
+	//   migrate 整段跳过、迁移失效。清零后：JSON 里有就覆盖、没有就保持 0 → 迁移照常跑。
+	s := defaultSettings()
+	s.SchemaVersion = 0
 	if err := json.Unmarshal(data, &s); err != nil {
 		// 配置损坏：退回默认值，但保留原文件（改名备份）以便排查
 		if len(data) > 0 {
@@ -125,10 +220,20 @@ func loadSettings() {
 		saveSettingsFile()
 		return
 	}
+	// 先留原始值再 normalize：normalize 会做交叉钳制（Preload ≤ Thumb−1），
+	// 迁移判据「是否仍等于旧默认值」必须看磁盘上的原值，见 migrate 注释。
+	rawThumb, rawPreload := s.ThumbConcurrency, s.PreloadConcurrency
 	s.normalize()
+	migrated := s.SchemaVersion < currentSettingsSchema
+	s.migrate(rawThumb, rawPreload)
 	settingsMu.Lock()
 	settings = s
 	settingsMu.Unlock()
+	if migrated {
+		// 迁移结果必须落盘：否则 SchemaVersion 永远停在 0，每次启动都重判一遍，
+		// 用户手动把值设回 6/3 会被反复改掉。
+		saveSettingsFile()
+	}
 }
 
 func resolveSettingsPath() string {
@@ -173,8 +278,84 @@ func saveSettingsFile() {
 	_ = os.WriteFile(settingsFile, data, 0o644)
 }
 
+// currentSettingsSchema 当前配置结构版本。需要「把旧默认值升到新默认值」时 +1。
+//
+//	v1：1.8.66 —— ThumbConcurrency 6→3、PreloadConcurrency 3→0，
+//	    但判据是「两个值同时等于旧默认组合」，太窄。
+//	v2：1.8.67 —— 两个旧默认值各自独立判断。v1 的窄判据会漏掉
+//	    「改过并发数、没碰过预生成」的配置（旧版预生成默认 3，
+//	    只要用户调过并发数就不再等于 6，于是预生成一直是 3 —— 表现就是「关不掉」）。
+const currentSettingsSchema = 4
+
+// migrate 把旧默认值升到新默认值。
+//
+// rawThumb / rawPreload 必须是**磁盘上的原始值**，要在 normalize() 之前取：
+// normalize 的交叉钳制（Preload ≤ Thumb−1）会先把 3 改成 2，
+// 那样下面「是否仍等于旧默认值」的判断就落空了。
+//
+//	ThumbConcurrency    旧默认 6 → 3
+//	PreloadConcurrency  旧默认 3 → 0（0 = 关闭）
+//
+// 两个值各自独立判断：只要仍等于旧默认值就升级。用户主动改过的非默认值
+// （例如把预生成调到 5）不会被覆盖。迁移后写入 SchemaVersion，所以只发生一次 ——
+// 之后用户手动把值设回 6 或 3 不会被反复改掉。
+func (s *Settings) migrate(rawThumb, _ int) { // 第二个参数（rawPreload）已无规则使用
+	if s.SchemaVersion >= currentSettingsSchema {
+		return
+	}
+	if rawThumb == 6 {
+		// 6 是旧版本的固定默认值 → 迁移到「按核数收敛」的新默认，
+		// 而不是硬编码 3（那样存量用户永远拿不到 thumbConcurrencyDefault 的结果）。
+		s.ThumbConcurrency = thumbConcurrencyDefault()
+	}
+	// 【已删除】schema 3 曾有一条「rawPreload == 3 || == 0 → 新默认」的迁移，
+	// 于 1.8.139 按用户要求移除：0 是合法的「关闭」值，而这条规则没有版本守卫，
+	// 每次 schema 升级都会重跑一次，等于用户永远关不掉后台预生成。
+	// 现在磁盘上是几就是几（旧默认 3 会被 normalize 钳到 ThumbConcurrency-1）。
+	// 1.8.139：原先这里有一条「rawPreload == 3 || == 0 → 新默认」的迁移，
+	// 已按需求删除。原因：0 是合法的「关闭」值，而这条规则没有版本守卫，
+	// 每次 schema 升级都会重跑一次，等于用户永远关不掉后台预生成。
+	// 删除后行为：磁盘上是几就是几（旧默认 3 会被 normalize 钳到 ThumbConcurrency-1）。
+	// schema 4：ThumbLowres 是 1.8.136 新加的 bool 字段。
+	// 存量配置里没有它 → 反序列化成零值 false → -lowres 静默失效，
+	// 而且会被 migrate/save 落盘固化（用户此后打开设置保存还会再写一次 false）。
+	// 该字段在 1.8.136 之前不可能被用户显式设置过，直接给新默认。
+	//
+	// 这一条专门救"已经升到 1.8.136、配置里已被写成 thumbLowres:false"的情况
+	// （他们 schemaVersion 已是 3，光靠治本路径不够 —— Unmarshal 会用磁盘上的 false 覆盖默认值）。
+	if s.SchemaVersion < 4 {
+		s.ThumbLowres = defaultSettings().ThumbLowres
+	}
+	s.SchemaVersion = currentSettingsSchema
+}
+
 // normalize 把越界值收敛到合法范围
 func (s *Settings) normalize() {
+	// ThumbEngine 非法值一律回落到 auto（空值也走这里 —— 老配置没有这个字段）
+	// 1.8.144：新增档位字段的白名单收敛
+	switch s.ViewerQuality {
+	// 只保留实测有意义的档：84→-q:v 4、88/92→3、95/98→2（后两者各自等价，去掉重复项）
+	case -1, 0, 84, 88, 95:
+	default:
+		s.ViewerQuality = 0
+	}
+	switch s.ViewerMaxdim {
+	case 0, 2048, 3072, 4096, 5120, 6144:
+	default:
+		s.ViewerMaxdim = 0
+	}
+	if s.ViewerLowres < -1 || s.ViewerLowres > 3 {
+		s.ViewerLowres = 0
+	}
+	if s.ThumbLowresLevel < -1 || s.ThumbLowresLevel > 3 {
+		s.ThumbLowresLevel = 0
+	}
+
+	switch s.ThumbEngine {
+	case "vips", "ffmpeg", "auto":
+	default:
+		s.ThumbEngine = "auto"
+	}
 	if s.ThumbSize < 64 || s.ThumbSize > 640 {
 		s.ThumbSize = 320
 	}
@@ -184,11 +365,25 @@ func (s *Settings) normalize() {
 	if s.CPUCores < 0 {
 		s.CPUCores = 0
 	}
-	if s.ThumbConcurrency < 1 || s.ThumbConcurrency > 8 {
-		s.ThumbConcurrency = 6
+	if s.ThumbConcurrency < 1 || s.ThumbConcurrency > maxThumbConcurrency {
+		// 用 thumbConcurrencyDefault()（按核数收敛）而不是硬编码 3：
+		// 否则「越界回落」与「新装默认」给出不同答案，存量用户永远拿不到按核数的值。
+		s.ThumbConcurrency = thumbConcurrencyDefault()
 	}
-	if s.PreloadConcurrency < 1 || s.PreloadConcurrency > 8 {
-		s.PreloadConcurrency = 3
+	// 0 = 关闭后台预生成，是合法值（不启动 worker、也不主动投递）。
+	if s.PreloadConcurrency < 0 || s.PreloadConcurrency > 8 {
+		s.PreloadConcurrency = 0
+	}
+	// 交叉钳制：后台实际并发最多 ThumbConcurrency−1（留 1 个槽给前台），
+	// 超过部分是死配置（worker 抢不到槽，每 200ms 纯轮询），直接钳到有效值。
+	// PreloadConcurrency=0（关闭）不参与钳制：0 > maxBg 恒不成立，保持 0。
+	// 绝不能把 0 当越界值补成 1 —— 那会让用户设的「关闭」自己变回开启。
+	maxBg := s.ThumbConcurrency - 1
+	if maxBg < 1 {
+		maxBg = 1
+	}
+	if s.PreloadConcurrency > maxBg {
+		s.PreloadConcurrency = maxBg
 	}
 	if s.ViewerPreload < 0 || s.ViewerPreload > 5 {
 		s.ViewerPreload = 2
@@ -206,6 +401,9 @@ func (s *Settings) normalize() {
 	default:
 		s.ViewerMode = "window"
 	}
+	// 没写过这一项（老配置升级上来）补成默认值「开」。
+	// 补成具体值而不是留 nil：/api/settings 的响应里就会是一个真实 bool，
+	// 用户在前端看到的开关状态与磁盘上的内容一致，排查时不会被 null 绕。
 	s.ThumbDir = strings.TrimSpace(s.ThumbDir)
 }
 
@@ -291,13 +489,30 @@ func dirUsable(dir string) bool {
 // applyThumbRoot 重新计算并切换缩略图根目录（配置变更后调用）
 func applyThumbRoot() {
 	root, note := resolveThumbRoot()
-	// 缓存根目录必须是**真实目录**：若它（或路径中任何一段）是符号链接，
-	// 后面的 MkdirAll / Chmod / RemoveAll 全部会跟着链到别处 ——
-	// 用户只要把自己 ThumbDir 下的 .mediaview-thumbs 换成指向 /etc 的链接，
-	// 再点一次「清空缓存」，root 进程就会把 /etc 权限改成 0644（丢掉 +x），把系统弄坏。
-	if st, err := os.Lstat(root); err == nil && st.Mode()&os.ModeSymlink != 0 {
-		note = "缩略图缓存目录是符号链接，已回退到默认目录"
+	// 缩略图根目录必须是**真实目录**：若路径中任何一段是链接，后面的
+	// MkdirAll / Chmod / RemoveAll 全部会跟着链到别处 —— 用户只要把自己 ThumbDir 下的
+	// .mediaview-thumbs 换成指向 /etc 的链接，再点一次「清空缓存」，
+	// root 进程就会把 /etc 权限改成 0644（丢掉 +x），把系统弄坏。
+	//
+	// 只 Lstat 最后一段是不够的，两个盲区：
+	//   ① 中间段是链接时，Lstat(整条路径) 会跟随中间段，最后一段看起来仍是普通目录；
+	//   ② Windows 目录联接（junction）连 Lstat 都不标记为符号链接（ModeSymlink=false）。
+	// 所以统一走 resolveRealPath 逐段解析：
+	//   - 解析不出来（成环 / Readlink 失败）→ 回退，绝不放行；
+	//   - 解析结果仍落在允许范围内（例如链接指向另一个存储空间）→ 采纳解析后的路径；
+	//   - 解析结果跑到允许范围之外 → 回退到默认目录，并把原因告诉用户。
+	if real, ok := resolveRealPath(root); !ok {
+		note = "缩略图缓存目录无法解析（存在循环链接），已回退到默认目录"
 		root = filepath.Join(workDir, thumbSubdir)
+	} else if !samePath(real, root) {
+		// 注意这里必须用 pathAllowedStrict（独立根），不能用 pathAllowed：
+		// 后者把 ThumbDir 自己也当根 → 校验缩略图目录时成了自我引用。
+		if pathAllowedStrict(real) {
+			root = real
+		} else {
+			note = "缩略图缓存目录是链接且指向允许范围之外，已回退到默认目录"
+			root = filepath.Join(workDir, thumbSubdir)
+		}
 	}
 	_ = os.MkdirAll(root, 0o755)
 	thumbRootMu.Lock()
@@ -353,7 +568,10 @@ func cacheStats() (files int, bytes int64) {
 		}
 		// 跳过缩略图的内容标识 sidecar（每个缩略图旁边一个），
 		// 否则「已缓存 N 个文件」会凭空翻倍
-		if strings.HasSuffix(d.Name(), thumbKeySuffix) {
+		// 1.8.148：附属文件都跳过。.key 已不再产生（旧缓存可能还有），
+		// .meta.json 也已停止落盘 —— 但旧缓存里存在，若不算进去，
+		// 界面上「已缓存 N 张」会虚高近一倍（实测 19356 vs 真实 9664）。
+		if strings.HasSuffix(d.Name(), thumbKeySuffix) || strings.HasSuffix(d.Name(), ".meta.json") {
 			return nil
 		}
 		if info, err := d.Info(); err == nil {
@@ -632,6 +850,28 @@ func isVolUserDir(clean string) bool {
 }
 
 func allowedRoots() []string {
+	roots := independentRoots()
+	if t := currentThumbRoot(); t != "" {
+		roots = append(roots, t)
+	}
+	// 配置里声明过但暂时不可用的目录也要放行，否则用户无法在界面里纠正它
+	if s := getSettings(); s.ThumbDir != "" {
+		if d, ok := cleanThumbDir(s.ThumbDir, false); ok {
+			roots = append(roots, d)
+		}
+	}
+	return roots
+}
+
+// independentRoots 返回**与用户配置无关**的白名单根：存储空间、系统注入的可访问路径、
+// 以及本应用自己的数据目录。
+//
+// 为什么要单独拆出来：allowedRoots() 会把 settings.ThumbDir / currentThumbRoot()
+// 也算成根，而这正是「用户可配置、可被替换成链接」的值。拿它去校验缩略图根目录
+// 就是自我引用 —— 把 ThumbDir 设成指向 /etc 的链接，解析后的结果恰好落在
+// 「刚刚被写进根列表的那个位置」之下，校验永远通过。凡是「被校验的值有可能来自
+// 用户配置」的场景，都必须用独立根。
+func independentRoots() []string {
 	roots := []string{}
 	for _, vol := range listVolDirs() {
 		roots = append(roots, vol)
@@ -643,18 +883,29 @@ func allowedRoots() []string {
 			}
 		}
 	}
-	for _, p := range []string{workDir, appDest, settingsDir(), currentThumbRoot()} {
+	for _, p := range []string{workDir, appDest, settingsDir()} {
 		if p != "" {
 			roots = append(roots, p)
 		}
 	}
-	// 配置里声明过但暂时不可用的目录也要放行，否则用户无法在界面里纠正它
-	if s := getSettings(); s.ThumbDir != "" {
-		if d, ok := cleanThumbDir(s.ThumbDir, false); ok {
-			roots = append(roots, d)
+	return roots
+}
+
+// pathAllowedStrict 用独立根做范围校验（不含用户配置派生出来的根）。
+// 根目录自身同样解析一次链接（某些 NAS 上 /vol1 就是挂载点/链接）。
+func pathAllowedStrict(abs string) bool {
+	for _, r := range independentRoots() {
+		if r == "" {
+			continue
+		}
+		if underRoot(abs, r) {
+			return true
+		}
+		if real, ok := resolveRealPath(r); ok && !samePath(real, r) && underRoot(abs, real) {
+			return true
 		}
 	}
-	return roots
+	return false
 }
 
 func underRoot(abs, root string) bool {
@@ -854,6 +1105,9 @@ func handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.normalize()
+	// 前端 body 不含 schemaVersion，保存时补上当前版本；
+	// 否则保存一次就把它清回 0，下次启动又会触发一次迁移。
+	in.SchemaVersion = currentSettingsSchema
 
 	// 先在副本上完成全部校验，任何一项不通过就整体拒绝。
 	// （绝不能"边校验边写入"：那样非法请求会把配置改坏一半 —— 实测踩过。）

@@ -88,10 +88,12 @@ func scaleOnce(t *testing.T, path string, maxdim int) (int, []byte) {
 	return rec.Body.Len(), rec.Body.Bytes()
 }
 
-func scaledOutPath(path string, maxdim int) string {
+func scaledArtifactPath(path string, maxdim int) string {
 	info, _ := os.Stat(path)
-	return filepath.Join(os.TempDir(),
-		"mediaview-scaled-"+scaledCacheTag+"-"+cacheKey(path, info)+"-"+strconv.Itoa(maxdim)+".jpg")
+	// 1.8.162：产物名新增画质与 lowres 档位两维，改用生产代码里的同一个构造函数
+	// （名字里少一维 = 用户改了设置不生效，见 media.go 的 scaledParams 注释）
+	q, lr := scaledParams(path, maxdim)
+	return scaledOutPath(cacheKey(path, info), maxdim, q, lr)
 }
 
 // --- 1) withinMaxdim：只读文件头，尺寸判定正确 ---
@@ -191,7 +193,7 @@ func TestScaleOnlyShrinks(t *testing.T) {
 		p := filepath.Join(dir, "case.jpg")
 		mkJPEG(t, p, c.w, c.h)
 		n, _ := scaleOnce(t, p, c.maxdim)
-		out := scaledOutPath(p, c.maxdim)
+		out := scaledArtifactPath(p, c.maxdim)
 		w, h := dims(t, out)
 		longest := w
 		if h > w {
@@ -219,7 +221,7 @@ func TestScaledCacheHit(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "big.jpg")
 	mkJPEG(t, p, 3000, 2000)
-	out := scaledOutPath(p, 1024)
+	out := scaledArtifactPath(p, 1024)
 	if !strings.Contains(filepath.Base(out), "mediaview-scaled-"+scaledCacheTag+"-") {
 		t.Errorf("产物名未带算法版本标记：%s", filepath.Base(out))
 	}
@@ -263,7 +265,7 @@ func TestScaledConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "c.jpg")
 	mkJPEG(t, p, 2400, 1600)
-	out := scaledOutPath(p, 1024)
+	out := scaledArtifactPath(p, 1024)
 	os.Remove(out)
 	defer os.Remove(out)
 
@@ -341,7 +343,7 @@ func TestHandleRawEndToEnd(t *testing.T) {
 	if rec2.Code != 200 {
 		t.Fatalf("大图状态码 %d", rec2.Code)
 	}
-	out := scaledOutPath(big, 1024)
+	out := scaledArtifactPath(big, 1024)
 	w, h := dims(t, out)
 	if w > 1024 || h > 1024 {
 		t.Errorf("大图产物 %dx%d 未缩到 1024 以内", w, h)
@@ -448,7 +450,7 @@ func TestNonNativeImageMustTranscode(t *testing.T) {
 	tif := filepath.Join(dir, "scan.tif")
 	genTIFF(t, jpg, tif)
 	tifSrc, _ := os.ReadFile(tif)
-	tifOut := scaledOutPath(tif, 1024)
+	tifOut := scaledArtifactPath(tif, 1024)
 	os.Remove(tifOut)
 
 	// (a) 带 maxdim 的正常请求：必须转成 JPEG，且缩到 maxdim 内

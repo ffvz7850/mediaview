@@ -8,14 +8,17 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"log"
 	"mime"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,7 +26,12 @@ import (
 // 每张 7000px 级照片的转码都要全解码（内存数百 MB），不设上限时
 // 快速翻页 + 预加载会同时 fork 多个 ffmpeg，在低功耗 NAS 上互相抢 CPU，
 // 首图反而更慢。默认 2：一张前台 + 一张后台预加载，足够流畅。
-var scaledSem = make(chan struct{}, 2)
+// scaledGenCount 生成计数，用于给 /tmp 清理降频（A5）。
+var scaledGenCount int64
+
+// scaledSem 容量 3（原为 2）。实测连切 3 张时第 3 张要等到 6.34s —— 明显是排队，
+// 而不是真的慢。3 槽约需 900MB 峰值内存，本机 available 5.3G，有余量。
+var scaledSem = make(chan struct{}, 3)
 
 func init() {
 	// ensure common media mime types are registered
@@ -54,6 +62,10 @@ func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// lastListedDir 记录上一次列出的目录。只有当目录**真的换了**才清空后台队列 ——
+// 同一目录的重复请求（刷新、排序变化）不应该白清一次。
+var lastListedDir atomic.Value // string
+
 func handleList(w http.ResponseWriter, r *http.Request) {
 	touchThumbActivity() // 用户正在浏览目录：后台预生成先让路
 	q := r.URL.Query()
@@ -71,18 +83,38 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a directory", http.StatusBadRequest)
 		return
 	}
+	// 1.8.147：换目录时清掉上个目录遗留的缩略图待办。
+	// 网格缩略图优先级低，没必要为了旧目录一直生成 —— 把 worker 让给新目录。
+	// 安全性见 dropQueuedThumbs 的注释（只丢弃未开始的任务，产物 rename 是原子的）。
+	if prev, _ := lastListedDir.Load().(string); prev != path {
+		if dropped := dropQueuedThumbs(); dropped > 0 {
+			log.Printf("换目录 %q → %q：清掉 %d 个遗留的缩略图待办", prev, path, dropped)
+		}
+		lastListedDir.Store(path)
+	}
 	resp, err := listDir(path, q.Get("sort"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// enqueue pre-generation for the first batch（缩略图关闭时 enqueueThumb 自身是 no-op）
-	// 限制预生成数量，避免进入未缓存目录时大量并发 ffmpeg 导致卡顿
-	for i := range resp.Files {
-		if i >= 12 {
-			break
+	// 预生成前 12 张（后台预生成关闭时 preloadBatch 直接返回 0，一个都不投）。
+	// 限制数量避免进入未缓存目录时大量并发 ffmpeg 导致卡顿。
+	// 1.8.146：?preload=N 允许前端「手动生成」按钮请求更大的批量（默认仍是 12）。
+	// 上限 200：再大就会一次性堆很多 ffmpeg，反而拖慢当前这一屏。
+	preloadN := 12
+	if v := q.Get("preload"); v != "" {
+		if iv, err := strconv.Atoi(v); err == nil && iv > 0 && iv <= 200 {
+			preloadN = iv
 		}
-		enqueueThumb(resp.Files[i].Path, resp.Files[i].Kind, thumbRequestSize())
+	}
+	// 1.8.153：进目录时把**整个目录按排序入队**（原来只投前 12 张，覆盖率 2.6%~17%，
+	// 观感就是"后台预生成没起作用"）。并发由 worker 数（PreloadConcurrency，默认 2）
+	// 限住 —— 一次只有 2 张在跑，所以"全部入队"不会造成 ffmpeg 风暴，只是按顺序慢慢做掉。
+	// ?preload=N 是「手动生成」：走独立通道，只受总开关约束（见 preloadBatchManual）。
+	if q.Get("preload") != "" {
+		preloadBatchManual(resp.Files, preloadN)
+	} else {
+		preloadBatch(resp.Files, len(resp.Files))
 	}
 	writeJSON(w, r, resp)
 }
@@ -113,19 +145,14 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// enqueue pre-generation for the first batch（缩略图关闭时 enqueueThumb 自身是 no-op）
-	for i := range files {
-		if i >= 5 {
-			break
-		}
-		enqueueThumb(files[i].Path, files[i].Kind, thumbRequestSize())
-	}
+	// 递归扫描结果里预生成前 5 张（后台预生成关闭时 preloadBatch 直接返回 0）
+	preloadBatch(files, 5)
 	writeJSON(w, r, map[string]any{"files": files, "count": len(files)})
 }
 
 // maxAllowedMaxdim 是 /api/raw 接受的缩放预算上限。
 // 与前端 app.js 的 PICK_MAX 一致：前端最多只会要 4096，更大的值只可能来自手工拼 URL。
-const maxAllowedMaxdim = 4096
+const maxAllowedMaxdim = 8192
 
 // clampMaxdim 把请求里的缩放预算收敛到服务端允许区间（返回 0 表示「未指定」）。
 func clampMaxdim(m int) int {
@@ -140,6 +167,13 @@ func clampMaxdim(m int) int {
 
 func handleRaw(w http.ResponseWriter, r *http.Request) {
 	touchThumbActivity() // 用户正在看图：后台预生成让路
+	// 光让「后台预生成」让路不够 —— 网格的 size=list 是**前台**请求，会继续占满 CPU。
+	// 实测本机 4 核、thumbConcurrency=4 时，4 个缩略图转码把核占满，大图转码几乎
+	// 拿不到 CPU，用户看到的就是「要等跑完两页缩略图，大图才出来」。
+	// 用与 systemthumb.go 里 size=big 相同的机制：暂停窗口内到达的缩略图请求直接
+	// 返回占位图（tryServeDeferredThumb），CPU 全部让给大图。
+	// /api/raw 自己走 scaledSem，与缩略图信号量相互独立，不会被这次暂停挡住。
+	noteForegroundPreview()
 	path, sc := resolveMediaPath(r.URL.Query().Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
@@ -309,6 +343,58 @@ func scaledMutex(key string) *sync.Mutex {
 //
 // 旧版 ffmpeg 不认识 flags=lanczos 时会直接执行失败，调用方的失败分支随即回退到
 // 原图直出 —— 结果是更清晰，不会出现坏图。
+// bigQualityQScale 大图浏览档的 ffmpeg -q:v。
+//
+// A2：跟随设置里的 ThumbQuality，但**钳到 [82,86]**（→ 稳定落在 -q:v 4）。
+//
+//	理由：大图幅面大，编码开销与传输体积都更敏感；82~86 对应 -q:v 4，
+//	实测 PSNR > 50 dB（视觉无差别），而原来的硬编码 -q:v 2（≈质量 95）
+//	只是白花 18% 时间与 42% 体积。
+//	注意：这条只作用于**会走 ffmpeg 转码的预览档**；放大到原图是原图直出、不转码，
+//	所以降质量不会影响"放大看原图"的画质。
+func bigQualityQScale() int {
+	q := getSettings().ViewerQuality
+	if q == -1 {
+		// 跟随「缩略图质量」，**不钳制** —— 用户在设置里调多少就用多少
+		return qualityToQScale(getSettings().ThumbQuality)
+	}
+	if q == 0 {
+		q = 88 // 自动：兼顾清晰与体积
+	}
+	return qualityToQScale(q)
+}
+
+// kindIsImage 判断按扩展名是否为图片（-lowres 只对图片生效）。
+func kindIsImage(p string) bool { return classify(filepath.Ext(p)) == "image" }
+
+// scaledParams 返回影响缩放产物内容的两个参数：
+// ffmpeg 的 -q:v（由「大图画质」决定）与 -lowres 档位（由「lowres 档位」决定）。
+//
+// 把这两个值抽出来是必需的，不是整理代码的洁癖：它们必须进入**产物文件名与 ETag**，
+// 否则用户改了设置却一直看到旧产物（服务端缓存命中 + 浏览器 immutable 一年）。
+func scaledParams(path string, maxdim int) (qScale, lrLevel int) {
+	qScale = bigQualityQScale()
+	if kindIsImage(path) {
+		if ow, oh := imageDimCached(path); ow > 0 && oh > 0 {
+			lrLevel = lowresForViewer(ow, oh, maxdim)
+		}
+	}
+	return qScale, lrLevel
+}
+
+// scaledOutPath 缩放产物的完整路径。**所有影响输出的参数都要出现在名字里**：
+// 算法 tag + 原图标识 + maxdim + 画质 + lowres 档位。
+func scaledOutPath(cacheKey string, maxdim, qScale, lrLevel int) string {
+	return filepath.Join(os.TempDir(), "mediaview-scaled-"+scaledCacheTag+"-"+cacheKey+"-"+
+		strconv.Itoa(maxdim)+"-q"+itoa(qScale)+"-l"+itoa(lrLevel)+".jpg")
+}
+
+// scaledETag 与产物名同源的 ETag。前端带 ?v= 时响应是 `immutable, max-age=1年`，
+// ETag 不随设置变化的话浏览器连 304 都不会来问。
+func scaledETag(cacheKey string, maxdim, qScale, lrLevel int) string {
+	return cacheKey + "-" + strconv.Itoa(maxdim) + "-q" + itoa(qScale) + "-l" + itoa(lrLevel)
+}
+
 func imageScaleFilter(maxdim int) string {
 	return "scale='min(" + strconv.Itoa(maxdim) + ",iw)':'min(" + strconv.Itoa(maxdim) +
 		",ih)':force_original_aspect_ratio=decrease:flags=lanczos"
@@ -321,13 +407,19 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 		return
 	}
 	cacheKey := cacheKey(path, info)
-	out := filepath.Join(os.TempDir(), "mediaview-scaled-"+scaledCacheTag+"-"+cacheKey+"-"+strconv.Itoa(maxdim)+".jpg")
+	// 产物名必须包含**所有影响输出的参数**：画质（-q:v）与 lowres 档位。
+	// cacheKey 只含 path+mtime+size，不含设置 —— 少了这两维时，用户在设置里改
+	// 「大图画质 / lowres 档位」后服务端判定缓存命中、直接返回旧产物，改了等于没改。
+	qScale, lrLevel := scaledParams(path, maxdim)
+	out := scaledOutPath(cacheKey, maxdim, qScale, lrLevel)
+	// ETag 同样要含这两维（前端带 ?v= 时下发 immutable，若 ETag 不变则浏览器永不重取）
+	etag := scaledETag(cacheKey, maxdim, qScale, lrLevel)
 	// 缓存判据只取"存在且非空"：cacheKey 里已含原图的 path + mtime + size，
 	// 原图一改就是新的文件名，所以产物存在就说明它是当前原图的结果。
 	// （旧代码比较产物 mtime 与原图 mtime，两者永不可能相等 → 缓存恒失效，
 	//   每次请求都要重跑一遍 ffmpeg。）
 	if fi, err := os.Stat(out); err == nil && fi.Size() > 0 {
-		serveScaledFile(w, r, out, info.ModTime(), cacheKey)
+		serveScaledFile(w, r, out, info.ModTime(), etag)
 		return
 	}
 
@@ -336,7 +428,7 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 	defer mu.Unlock()
 	// 等锁期间可能已被其它请求生成好
 	if fi, err := os.Stat(out); err == nil && fi.Size() > 0 {
-		serveScaledFile(w, r, out, info.ModTime(), cacheKey)
+		serveScaledFile(w, r, out, info.ModTime(), etag)
 		return
 	}
 
@@ -352,6 +444,31 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 	// 预取性质走请求头，不污染 URL。旧的 ?prefetch=1 形式继续兼容。
 	// 注意这里读请求对象而不改函数签名：serveScaledImage 有既有测试直接调用。
 	isPrefetch := r.Header.Get("X-MediaView-Prefetch") == "1" || r.URL.Query().Get("prefetch") == "1"
+
+	// 走到这里 = 缓存没命中、真要起一次 ffmpeg 全解码：用户此刻正在等这一张。
+	// 这是「用户正在看大图」的触发点**之一** —— /api/raw 是 mediaview 自己查看器的
+	// 大图路径（前端 openSingle → showCurrent，含双击图片经 mediaview.open 文件关联
+	// 进入的单文件模式）。
+	//
+	// 另有一条**互相独立**的路径，触发点不在本函数：飞牛文件管理器**原生预览窗口**
+	// 直接请求 /thumb/getIcon?size=big，钩子在 systemthumb.go。1.8.56 曾以
+	// 「文件管理器从不请求 size=big」为由删掉后者，该结论已证伪（飞牛前端 ImagePlayer
+	// 与预览入口都明确请求 big），1.8.61 已恢复。两处触发点并存，分别覆盖
+	// 「用 mediaview 看」与「用文件管理器看」，不存在谁替代谁。
+	//
+	// 触发后：后台预生成整体停摆（kill 在跑的 ffmpeg），文件管理器网格与本地网格的
+	// **新增**缩略图请求一律不生成、改回占位图（见 thumb.go 的「大图浏览期间：不生成、
+	// 快速返回占位」），把低功耗 NAS 的 CPU 与浏览器连接都让给用户正在等的这一张。
+	//
+	// 两条边界，都不能少：
+	//   1) 放在缓存判定之后 —— 缓存命中的大图是毫秒级返回，让它去停后台毫无收益，
+	//      反而会在用户连翻已缓存图片时把后台预生成一直摁住；
+	//   2) 排除预取请求 —— 悬停预取会连发好几张，每次都 kill 一轮在跑的后台 ffmpeg
+	//      会让预生成反复白干（解码到一半被杀 → 重新入队 → 又被杀）。
+	//      用户只是把鼠标划过去，不该算「在看大图」。
+	if !isPrefetch {
+		noteForegroundPreview()
+	}
 	// 槽必须在「生成结束」时立刻释放，而不是等整个 handler 返回：
 	// 函数末尾还要用 http.ServeContent 把几百 KB 写进连接，而服务端 WriteTimeout=0，
 	// 于是一个停滞的客户端（窗口挂起、网关阻塞）就能把槽占死 —— 只有 2 个槽，
@@ -365,12 +482,16 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 	}
 	defer releaseSlot()
 	if isPrefetch {
+		// 1.8.153：从「立刻 204」改成「**短等待 250ms** 再放弃」。
+		//
+		// 原来抢不到槽就直接作废 —— 那样虽然绝不挡用户，但忙的时候"预载后两张"约等于没做，
+		// 观感就是"预载没起作用"。而 250ms 的等待远小于一次转码（1~3s），
+		// 既能等到空档把服务端缓存做掉，又不会长时间占着槽。
 		select {
 		case scaledSem <- struct{}{}:
 			slotHeld = true
-		default:
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusNoContent) // 204：本次预取作废，用户点击时会重新请求
+		case <-time.After(250 * time.Millisecond):
+			w.WriteHeader(http.StatusNoContent) // 忙：作废这次预取，绝不挡用户
 			return
 		}
 	} else {
@@ -388,11 +509,27 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 	// 避免 ffmpeg 失控堆积。
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, ffmpegPath,
-		"-i", path, "-vf", vf,
-		"-f", "image2", "-update", "1", "-q:v", "2", "-y", tmp)
+	// A4：图片预览档加动态 -lowres（只解 DCT 低频系数）。
+	// 复用缩略图那套 lowresFor 公式 —— 它保证「长边 / 2^N ≥ 目标」，
+	// 所以不会出现报告里那个 `min(N, iw)` 把输出缩小的坑（那是手写 N 才有的问题）。
+	// 只对图片加：视频要 -ss 抽帧，语义不同。
+	var ffArgs []string
+	if lrLevel > 0 {
+		ffArgs = append(ffArgs, "-lowres", itoa(lrLevel))
+	}
+	ffArgs = append(ffArgs, "-i", path, "-vf", vf,
+		"-f", "image2", "-update", "1", "-q:v", itoa(qScale), "-y", tmp)
+	cmd := exec.CommandContext(ctx, ffmpegPath, ffArgs...)
 	if err := cmd.Run(); err != nil {
 		// 缩放失败回退到原图直出（先把转码槽还回去，别让写响应继续占着它）
+		releaseSlot()
+		serveOriginal(w, r, path, info)
+		return
+	}
+	// 产物校验：ffmpeg 退出码 0 不代表产物可用。缺这一步时会把 0 字节/残缺 JPEG
+	// rename 进缓存并**直接返回给客户端**（浏览器得到破图，而且不像"转码失败"那样
+	// 回退原图）；同时因为缓存判据要求 size>0，还会导致每次请求都重跑一遍完整解码。
+	if st, serr := os.Stat(tmp); serr != nil || st.Size() == 0 {
 		releaseSlot()
 		serveOriginal(w, r, path, info)
 		return
@@ -407,10 +544,14 @@ func serveScaledImage(w http.ResponseWriter, r *http.Request, path string, maxdi
 		}
 	}
 	// 生成新文件后顺手清理 /tmp 下超过 1 小时的旧缩放缓存，避免 /tmp 被占满
-	cleanupScaledTempFiles()
+	// A5：降频到每 20 次生成清一次。原来每生成一张就 os.ReadDir(/tmp)
+	// 全目录扫一遍，而 /tmp 是共享目录，文件一多这个 O(n) 扫描会随生成次数累积。
+	if atomic.AddInt64(&scaledGenCount, 1)%20 == 0 {
+		cleanupScaledTempFiles()
+	}
 	// 转码已结束、产物已落盘：立刻归还转码槽，后面的文件传输不再占用它
 	releaseSlot()
-	serveScaledFile(w, r, out, info.ModTime(), cacheKey)
+	serveScaledFile(w, r, out, info.ModTime(), etag)
 }
 
 // serveOriginal 原文件直出：视频拖动进度、GIF 动画、以及"尺寸未超 maxdim"的图片
@@ -430,19 +571,44 @@ func serveOriginal(w http.ResponseWriter, r *http.Request, path string, info os.
 	// 让浏览器严格按 Content-Type 处理：媒体目录里混进 .html 之类的文件时，
 	// 不做嗅探可以避免它被当页面执行（同源 XSS 的第二道闸）。
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// SVG 是「可以执行脚本的图片」：它是 XML 文档，直接导航到该 URL 时里面的
+	// <script> 会以本应用的**同源**身份执行 —— 本进程 run-as=root，白名单又是整卷
+	// /vol{n}，任何人都能往共享目录里放一个 evil.svg 再让人打开。
+	// 类型闸门（classify）对 SVG 是放行的（它在 imageExts 里，且界面把 svg 列为
+	// 支持格式），所以必须在这里补一道：CSP sandbox + default-src 'none'
+	// 既禁止脚本执行、也禁止它去读同源接口，同时不影响把它当图片渲染出来。
+	if strings.EqualFold(filepath.Ext(path), ".svg") {
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
 
-// cleanupScaledTempFiles 清理 /tmp 下超过 1 小时的 mediaview-scaled-*.jpg。
-// 只在生成新缩放图时调用（缓存命中时不触发），开销可忽略。
+// scaledCacheMaxFiles 缩放缓存数量上限。
+//
+// 1.8.163 修正：这里原来写「/tmp 在 fnOS 上是 tmpfs（内存盘）…占满内存」——
+// **实测不成立**，/tmp 挂在根分区（磁盘）上，不会"吃满内存"。
+// 前提错了但**上限保留**，换成实际成立的理由：大图转码产物单张可达数 MB，
+// 长期不清理会持续占磁盘；而"按时间清理（1 小时）"在连续快速翻很多大图时
+// 追不上产生速度 —— 数量上限是那一道兜底。**行为不变，只把理由写对。**
+const scaledCacheMaxFiles = 300
+
+// cleanupScaledTempFiles 清理 /tmp 下的 mediaview-scaled-*.jpg。
+// 两道清理：① mtime 超过 1 小时的全删；② 剩余总数超过 300 时按 mtime 删最旧的。
+// 只在生成新缩放图时调用（缓存命中时不触发）。
 func cleanupScaledTempFiles() {
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		return
 	}
 	cutoff := time.Now().Add(-1 * time.Hour)
+	type fileInfo struct {
+		path string
+		mod  time.Time
+	}
+	var kept []fileInfo
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "mediaview-scaled-") {
 			continue
@@ -451,8 +617,18 @@ func cleanupScaledTempFiles() {
 		if err != nil {
 			continue
 		}
+		fp := filepath.Join(os.TempDir(), e.Name())
 		if info.ModTime().Before(cutoff) {
-			_ = os.Remove(filepath.Join(os.TempDir(), e.Name()))
+			_ = os.Remove(fp) // 超过 1 小时直接删
+			continue
+		}
+		kept = append(kept, fileInfo{path: fp, mod: info.ModTime()})
+	}
+	// 数量超限：按 mtime 从旧到新删，直到不超过上限
+	if len(kept) > scaledCacheMaxFiles {
+		sort.Slice(kept, func(i, j int) bool { return kept[i].mod.Before(kept[j].mod) })
+		for i := 0; i < len(kept)-scaledCacheMaxFiles; i++ {
+			_ = os.Remove(kept[i].path)
 		}
 	}
 }
@@ -470,7 +646,14 @@ func serveScaledFile(w http.ResponseWriter, r *http.Request, out string, modTime
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "no-cache")
+	// A7：带版本号（前端 ?v=<mtime>）时用长缓存 —— 翻页回到同一张图可以完全走
+	// 浏览器缓存（0 请求、0 解码）。没有版本号（外部工具手工拼 URL）仍用 no-cache，
+	// 避免"覆盖同名文件后 24h 内取旧图"。
+	if r.URL.Query().Get("v") != "" {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 	w.Header().Set("ETag", "\""+cacheKey+"\"")
 	w.Header().Set("Accept-Ranges", "bytes")
 	http.ServeContent(w, r, "preview.jpg", modTime, f)
@@ -510,7 +693,7 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// image: header dimensions
-	w0, h0 := imageDim(path)
+	w0, h0 := imageDimCached(path)
 	m := &Meta{W: w0, H: h0}
 	saveMeta(cacheKey(path, info), path, thumbRequestSize(), m)
 	writeJSON(w, r, m)
