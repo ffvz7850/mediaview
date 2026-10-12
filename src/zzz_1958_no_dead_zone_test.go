@@ -64,7 +64,8 @@ func Test1958NoDeadZoneBeforePan(t *testing.T) {
 	}
 
 	// ④ pointerup 的点击守卫必须还在（「拖动≠点击」的唯一依据，不能因为这次改动被删）
-	if !strings.Contains(js, "var isTap = Math.abs(swipe.dx) <= 8 && Math.abs(swipe.dy) <= 8;") {
-		t.Error("pointerup 的 8px 点击守卫丢了")
+	// 2.3.3：切图入口统一到 vStage 的 click（endSwipe 不再切图）。
+	if !strings.Contains(js, "if (Math.abs(swipe.dx) > 8 || Math.abs(swipe.dy) > 8) return;") {
+		t.Error("vStage click 里的 8px 点击守卫丢了 —— 它是「拖动 ≠ 点击」的唯一依据")
 	}
 }

@@ -22,6 +22,14 @@
 
 <!-- 顶部工具栏 -->
 <header id="topbar">
+  <!-- 返回上级目录。**只在触屏档位显示**（样式在 @media (pointer: coarse) 里）：
+       手机上飞牛桌面没有可见的返回入口，系统边缘手势又只会退出整个应用，
+       "进去就出不来"是手机上最难受的一点 —— 这里给一个不依赖任何手势的显式出口。
+       语义：子目录 → 回上级；已在第一级（存储空间列表）→ 弹「是否退出软件」确认框。 -->
+  <button class="tbtn" id="navBack" title="返回" aria-label="返回">←</button>
+  <!-- 面包屑（含"存储空间"那一段）。**触屏档位整块隐藏**（见 style.css 的
+       @media (pointer: coarse) 块）：手机屏窄，它会把工具栏挤到看不清；
+       而手机上本来就有左上角箭头可以逐级退回，不依赖面包屑导航。 -->
   <div class="crumb" id="crumb"></div>
   <div class="tools">
     <button class="tbtn" id="sizeLarge" title="大图标">⊡</button>
@@ -62,6 +70,7 @@
 <div id="viewer" class="viewer hidden">
   <div class="v-stage" id="vStage">
     <span class="v-counter-float" id="vCounterFloat"></span>
+    <span class="v-list-hint hidden" id="vListHint">正在加载目录…</span>
     <div class="v-media-wrap" id="vMediaWrap"></div>
     <div class="v-controls" id="vControls">
       <button class="vbtn vctrl" id="vActual" title="原始大小（1:1）">1:1</button>
@@ -413,5 +422,6 @@
 <script type="module" src="bridge.js?v=__MV_VERSION__"></script>
 <script src="fnos_sort.js?v=__MV_VERSION__"></script>
 <script src="app.js?v=__MV_VERSION__"></script>
+
 </body>
 </html>

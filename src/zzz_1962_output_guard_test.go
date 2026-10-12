@@ -189,7 +189,7 @@ func Test1962ExtractFrameRejectsEmptyProduct(t *testing.T) {
 	src := filepath.Join(dir, "v.mp4")
 	_ = os.WriteFile(src, []byte("x"), 0o644)
 	out := filepath.Join(dir, "f.jpg")
-	_, _, err := extractVideoFrame(context.Background(), src, 320, out)
+	_, _, err := extractVideoFrame(context.Background(), src, 320, out, 0) // 0 = 时长未知（假 ffmpeg 探不出时长）
 	st, serr := os.Stat(out)
 	size := int64(-1)
 	if serr == nil {

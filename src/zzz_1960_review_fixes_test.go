@@ -72,9 +72,10 @@ func Test1960SuppressClickIsReset(t *testing.T) {
 func Test1960ClickAndKeyboardAgree(t *testing.T) {
 	js := stripLineComments(readSourceOrSkip(t, "web/app.js"))
 	const want = "if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }"
-	if n := strings.Count(js, want); n != 2 {
-		t.Errorf("「先归位」形态有 %d 处，期望恰好 2 处（vStage 的 click + swipeTo）—— "+
-			"两个切图入口必须表现一致", n)
+	// 2.3.3：用户要求取消「≥2× 单击先归位」⇒ 只剩 swipeTo（键盘/❮❯）这一处。
+	if n := strings.Count(js, want); n != 1 {
+		t.Errorf("「先归位」形态有 %d 处，期望恰好 1 处（**只剩键盘 ←/→**）—— "+
+			"vStage 的 click 里已按用户要求取消", n)
 	}
 	// swipeTo 里必须是它
 	i := strings.Index(js, "function swipeTo(")
@@ -82,10 +83,12 @@ func Test1960ClickAndKeyboardAgree(t *testing.T) {
 	if j := strings.Index(rest, "\n  function "); j > 0 {
 		rest = rest[:j]
 	}
-	if !strings.Contains(rest, want) {
-		t.Error("swipeTo（键盘 ←/→ 与界面 ❮/❯）没有「先归位」")
+	// 2.4.0：归位**故意**从 swipeTo 移出（见 1952 的说明）。它现在只在键盘 ←/→ 那一处。
+	if strings.Contains(rest, want) {
+		t.Error("swipeTo 里**不该**再有「先归位」—— prev/next 都走它；" +
+			"归位只应留在键盘 ←/→")
 	}
-	// vStage click 里也必须是它。
+	// 2.3.3：vStage 的 click 里**不该**再有它（用户要求取消「≥2× 单击先归位」）。
 	// ⚠ 必须锚 "$('vStage')"，否则会匹配到页面上其它 'click' 监听（我第一版就错在这里）。
 	k := strings.Index(js, "$('vStage').addEventListener('click'")
 	if k < 0 {
@@ -95,8 +98,9 @@ func Test1960ClickAndKeyboardAgree(t *testing.T) {
 	if l := strings.Index(clk, "\n  });"); l > 0 {
 		clk = clk[:l]
 	}
-	if !strings.Contains(clk, want) {
-		t.Error("vStage 的 click 没有「先归位」—— 与键盘行为不一致")
+	if strings.Contains(clk, want) {
+		t.Error("vStage 的 click 里**不该**再有 ≥2× 归位 —— 2.3.3 按用户要求取消；" +
+			"放大后点击应直接按分区切图")
 	}
 }
 

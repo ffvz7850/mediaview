@@ -31,7 +31,7 @@ import { TrimApp } from './vendor/trimjs-web-app.js?v=__MV_VERSION__';
 var HANDSHAKE_TIMEOUT_MS = 3000;
 
 // 本应用关心的宿主方法（仅用于诊断输出，不做硬编码开关）
-var WANTED = ['openApp', 'openCustomApp', 'setTitle', 'close', 'openURL'];
+var WANTED = ['openApp', 'openCustomApp', 'setTitle', 'close', 'openURL', 'setExitPageTips'];
 
 var sdk = null;
 var via = null;
@@ -201,6 +201,25 @@ function setTitle(t) { return call('setTitle', t); }
 function close() { return call('close'); }
 function openURL(url, target, features) { return call('openURL', url, target, features); }
 
+// 2.4.0：**恢复 setExitPageTips 的转发**（2.2.0 加过、2.2.1 删过）。
+//   恢复的理由：用户在 2.4.0 明确要求"到最上层再返回时弹一句是否退出软件"。
+//   它天生只适合**根层** —— 在子目录挂它会把"回上一层"整个吞掉（2.1.4 实测踩过），
+//   所以调用方（app.js 的 syncExitTips）必须跟状态走：进根层挂、离开就清。
+//   传对象 = 挂上；传 null = 清除。
+function setExitPageTips(tips) { return call('setExitPageTips', tips); }
+
+// ⛔ 下面是 2.2.1 当初删它的理由，保留作参考（恢复时仍然有效，只是本次用户明确要它）：
+//    ⛔ 这里曾有 setExitPageTips 的转发（2.2.0 加、2.2.1 删）：向宿主设置/
+//    清除「用户离开应用页面时」的确认提示。
+//    删它的理由有两条，缺一不可：
+//      ① 能力本身**不合用** —— 它只能"问一句"，不能"拦住"；而用户要的是
+//         **滑动无反应**，任何弹窗（包括宿主弹的）都属于"有反应"，方向相反；
+//      ② 有**真机实测依据** —— 挂上它之后滑动返回仍然是"直接退出应用"，
+//         说明那台设备的宿主没把这个能力落到页面上（否则会弹框而不是直接退）。
+//    ⇒ 能"拦住"的只有 app.js 里那条**历史守卫条目**（popstate 里补回守卫）。
+//    将来若真需要它，恢复办法：照 SDK 文档重新透传一遍即可，但务必记住
+//    铁律 —— **必须跟状态走**（常挂的后果是每次返回都弹框、把"回上一层"整个吞掉）。
+
 function describe() {
   var s = getSdk();
   var names = methodNames();
@@ -225,6 +244,7 @@ var api = {
   call: call,
   openApp: openApp,
   setTitle: setTitle,
+    setExitPageTips: setExitPageTips,
   close: close,
   openURL: openURL,
   describe: describe,

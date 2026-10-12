@@ -157,17 +157,17 @@ func Test1867PreloadBatchIsTheOnlyEnqueueEntrypoint(t *testing.T) {
 		t.Errorf("thumb.go 里 enqueueThumb 有 %d 处调用，期望恰好 1 处（preloadBatch 内部）", calls)
 	}
 
-	// 四处批量投递点各有归属：
-	//   · 自动路径（进目录 / 扫描）走 preloadBatch —— 受「后台预生成」开关约束，这是对的；
-	//   · 手动路径（?preload=N 手动生成 / 清完缓存后重建）走 preloadBatchManual ——
+	// 批量投递点各有归属（2.0.0：/api/list 的自动预生成已挪到 /api/pregen）：
+	//   · 自动路径（前端重排后回传 /api/pregen / 递归扫描）走 preloadBatch —— 受开关约束；
+	//   · 手动路径（「立即生成」/ 清完缓存后重建）走 preloadBatchManual ——
 	//     它们是**用户刚点了按钮**的即时动作，不该被那个开关挡住
 	//     （1.8.164：清缓存重建原先误用 preloadBatch，PreloadConcurrency=0 时投 0 个，
 	//      与本 handler「立即触发重新生成」的承诺矛盾）。
 	for _, want := range []string{
-		"preloadBatch(resp.Files, len(resp.Files))", // /api/list 进入目录：整目录按序入队（自动）
-		"preloadBatchManual(resp.Files, preloadN)",  // ?preload=N 手动生成（手动）
-		"preloadBatch(files, 5)",                    // /api/scan 递归扫描（自动）
-		"preloadBatchManual(resp.Files, 50)",        // 清完缓存重建（手动）
+		"preloadBatch(files, len(files))",       // /api/pregen 自动（前端排序后回传整目录）
+		"preloadBatchManual(files, len(files))", // /api/pregen 手动（「立即生成」）
+		"preloadBatch(files, 5)",                // /api/scan 递归扫描（自动）
+		"preloadBatchManual(resp.Files, 50)",    // 清完缓存重建（手动）
 	} {
 		if !strings.Contains(med+th, want) {
 			t.Errorf("缺少预期调用点：%s", want)

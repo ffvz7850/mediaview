@@ -181,10 +181,6 @@ func defaultSettings() Settings {
 	}
 }
 
-// boolPtr 取 bool 的地址。Settings 里几个「默认开」的开关用指针区分
-// 「配置里没这一项」与「用户关掉了」，需要一个取址辅助函数。
-func boolPtr(v bool) *bool { return &v }
-
 // ---- 读写 ----
 
 func loadSettings() {

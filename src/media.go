@@ -66,9 +66,58 @@ func writeJSON(w http.ResponseWriter, r *http.Request, v any) {
 // 同一目录的重复请求（刷新、排序变化）不应该白清一次。
 var lastListedDir atomic.Value // string
 
+// aggregateRoot 聚合"最上层"：把每个存储空间**用户目录**（/vol{n}/1000）下的子目录
+// 合并成一层返回。
+//
+// 为什么需要它（用户要求）：原来首页是"存储空间列表"（一个格子一个 /vol1、/vol2），
+// 用户要先点进某个存储空间才能看到自己的文件夹。飞牛文件管理器不是这样的 ——
+// 它直接列出内容。现在两边一致：首页就是"所有存储空间的文件夹合并成一层"。
+//
+// 设计要点：
+//
+//	· 每个 DirEntry.Path 仍是**真实绝对路径**（如 /vol2/1000/图库），
+//	  所以点进去走的还是原来的目录逻辑，前端不需要任何额外状态；
+//	· **同名允许并列**（/vol1/1000/照片 与 /vol2/1000/照片 都列出）——
+//	  用户明确选了这一项；前端按名字排序后会挨在一起；
+//	· 只列**目录**，不列文件：最上层放散落文件没有意义，也会把界面撑乱；
+//	· 某个存储空间没有用户目录就跳过（不让一个坏盘位毁掉整个首页）。
+func aggregateRoot(sortBy string) *ListResponse {
+	resp := &ListResponse{Path: "/", Parent: "", Dirs: []DirEntry{}, Files: []FileItem{}}
+	for _, vol := range listVolDirs() {
+		home, err := defaultUserDir(vol)
+		if err != nil || !dirExists(home) {
+			continue
+		}
+		sub, err := listDir(home, sortBy)
+		if err != nil {
+			continue // 单个盘位读失败不影响其它盘位
+		}
+		resp.Dirs = append(resp.Dirs, sub.Dirs...)
+		if sub.Sort != "" {
+			resp.Sort, resp.SortDesc = sub.Sort, sub.SortDesc
+		}
+	}
+	// 合并后按**同一套规则**重排一次：各盘位内部本来有序，但盘位之间需要重新交错，
+	// 否则会把 /vol1 的全部排在 /vol2 前面，看起来像"按盘位分组"而不是"合并成一层"。
+	// 复用 listDir 用的 parseSort + sortKey.less，保证与单目录排序完全一致。
+	sp := parseSort(sortBy)
+	sort.SliceStable(resp.Dirs, func(i, j int) bool {
+		return resp.Dirs[i].sortKey().less(resp.Dirs[j].sortKey(), sp)
+	})
+	resp.Total = len(resp.Dirs)
+	resp.Sort = sp.field
+	resp.SortDesc = sp.desc
+	return resp
+}
+
 func handleList(w http.ResponseWriter, r *http.Request) {
 	touchThumbActivity() // 用户正在浏览目录：后台预生成先让路
 	q := r.URL.Query()
+	// 2.4.0：`path=/` 是**聚合根**（首页）—— 它不是真实目录，要在 safePath/白名单之前拦下来。
+	if raw := strings.TrimSpace(q.Get("path")); raw == "/" {
+		writeJSON(w, r, aggregateRoot(q.Get("sort")))
+		return
+	}
 	path, sc := resolveMediaPath(q.Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
@@ -97,25 +146,16 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 预生成前 12 张（后台预生成关闭时 preloadBatch 直接返回 0，一个都不投）。
-	// 限制数量避免进入未缓存目录时大量并发 ffmpeg 导致卡顿。
-	// 1.8.146：?preload=N 允许前端「手动生成」按钮请求更大的批量（默认仍是 12）。
-	// 上限 200：再大就会一次性堆很多 ffmpeg，反而拖慢当前这一屏。
-	preloadN := 12
-	if v := q.Get("preload"); v != "" {
-		if iv, err := strconv.Atoi(v); err == nil && iv > 0 && iv <= 200 {
-			preloadN = iv
-		}
-	}
-	// 1.8.153：进目录时把**整个目录按排序入队**（原来只投前 12 张，覆盖率 2.6%~17%，
-	// 观感就是"后台预生成没起作用"）。并发由 worker 数（PreloadConcurrency，默认 2）
-	// 限住 —— 一次只有 2 张在跑，所以"全部入队"不会造成 ffmpeg 风暴，只是按顺序慢慢做掉。
-	// ?preload=N 是「手动生成」：走独立通道，只受总开关约束（见 preloadBatchManual）。
-	if q.Get("preload") != "" {
-		preloadBatchManual(resp.Files, preloadN)
-	} else {
-		preloadBatch(resp.Files, len(resp.Files))
-	}
+	// 2.0.0：**预生成不再挂在 /api/list 上**（原来这里是无条件整目录入队）。
+	//
+	// 根因：/api/list 的顺序是**后端字节序**（naturalLess），而前端实际显示顺序是
+	// Intl.Collator('zh') 的 ICU 序（数字 < 汉字 < 拉丁）。实测「X:\测试排序」129 个
+	// 文件里，两者有 121 个位置不一致 —— 汉字项会被后端排到队尾。挂在 list 上就等于
+	// 让后台把绝大部分算力花在**用户最后才会看到**的文件上（中文目录尤甚），
+	// 首屏缩略图反而更慢，而大图浏览根本不用列表缩略图。
+	//
+	// 现在改由前端在**重排之后**调用 POST /api/pregen 回传最终有序 path（见 handlePregen），
+	// 使「预生成顺序 == 用户看到的顺序」。
 	writeJSON(w, r, resp)
 }
 
@@ -126,6 +166,50 @@ func thumbRequestSize() int {
 		return 320
 	}
 	return s
+}
+
+// handlePregen 由前端在**按显示顺序重排之后**调用，回传有序 path 列表，
+// 让后台预生成按「用户实际看到的顺序」入队。
+//
+// 它取代了原先挂在 /api/list 上的自动预生成：那个顺序是后端字节序，与前端 ICU 显示顺序
+// 不一致（见 handleList 注释），会把算力花在用户最后才看到的文件上。
+//
+// body: { "paths": ["/vol1/1000/a.jpg", ...], "manual": false }
+//
+//	manual=false → preloadBatch（受「后台预生成」总开关约束，进目录的自动预生成）
+//	manual=true  → preloadBatchManual（「立即生成」手动通道，只受缩略图总开关约束）
+//
+// 只接收媒体扩展名（其余兜底忽略）；顺序**原样保留**，不在这里重排。
+func handlePregen(w http.ResponseWriter, r *http.Request) {
+	touchThumbActivity() // 用户正在浏览：后台预生成先让路
+	var body struct {
+		Paths  []string `json:"paths"`
+		Manual bool     `json:"manual"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	files := make([]FileItem, 0, len(body.Paths))
+	for _, p := range body.Paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(p))
+		kind := classify(ext)
+		if kind == "" {
+			continue // 非媒体：前端不该传，兜底忽略
+		}
+		files = append(files, FileItem{Name: filepath.Base(p), Path: p, Ext: ext, Kind: kind})
+	}
+	var n int
+	if body.Manual {
+		n = preloadBatchManual(files, len(files))
+	} else {
+		n = preloadBatch(files, len(files))
+	}
+	writeJSON(w, r, map[string]any{"enqueued": n, "total": len(files)})
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {

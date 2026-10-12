@@ -1042,10 +1042,18 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 		ftmp := out + ".gen.jpg"
 		_ = os.Remove(ftmp)
 		var ferr error
+		var preMeta *Meta
 		if kind == "image" {
 			_, _, ferr = extractImageFrame(ctx, path, size, ftmp) // 图片不用 -ss
 		} else {
-			_, _, ferr = extractVideoFrame(ctx, path, size, ftmp) // 视频 seek 到 0.05s
+			// 视频：先探时长，再决定 seek 到第几秒（见 chooseVideoSeekSec）——
+			// 比 3 秒还短的视频在 3s 处 seek 会越界，直接抽会失败。
+			// 这个 probe 原先在抽帧**成功之后**才做（saveMeta 用），提前到这里复用，
+			// 整条路径的 ffprobe 次数不变（仍是一次），也不再多等一轮。
+			if m, err := probeMeta(ctx, path); err == nil {
+				preMeta = m
+			}
+			_, _, ferr = extractVideoFrame(ctx, path, size, ftmp, durOf(preMeta))
 		}
 		if ferr == nil {
 			// 与图片分支（L1-E）对齐：ffmpeg 返回 0 不代表产物可用。
@@ -1061,8 +1069,10 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 			if err := os.Rename(ftmp, out); err != nil {
 				return "", err
 			}
-			// probe & cache meta
-			if m, err := probeMeta(ctx, path); err == nil {
+			// probe & cache meta：视频的元数据在抽帧前已经探过，直接复用（不再 probe 第二次）
+			if preMeta != nil {
+				saveMeta(key, path, size, preMeta)
+			} else if m, err := probeMeta(ctx, path); err == nil {
 				saveMeta(key, path, size, m)
 			}
 			return finishThumb(out, cacheID)

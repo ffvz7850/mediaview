@@ -103,9 +103,10 @@ func TestFrontendAuditFixPieces(t *testing.T) {
 		"if (!ok) host._ready = null;":          "桥接失败不缓存，允许重试",
 		"case 'bridge-error': return '桥接通讯异常';": "补上缺失的失败原因文案",
 		// 1.8.40
-		"API + '/volumes'":      "首页改走 /api/volumes（不再硬编码盘位）",
-		"new AbortController()": "悬停预取可被取消",
-		"v.hiSrc = '';":         "切换图片时复位「已升级原图」标记",
+		// 2.4.0：首页不再走 /api/volumes（列盘位），而是走**聚合根** /api/list?path=/
+		"API + '/list?path=' + enc('/')": "首页改走聚合根（所有存储空间的文件夹合并成一层，不再列盘位）",
+		"new AbortController()":          "悬停预取可被取消",
+		"v.hiSrc = '';":                  "切换图片时复位「已升级原图」标记",
 	}
 	for s, why := range must {
 		if !strings.Contains(js, s) {

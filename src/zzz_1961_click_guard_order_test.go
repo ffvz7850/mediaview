@@ -40,14 +40,16 @@ func Test1961TapGuardBeforeZoomReset(t *testing.T) {
 	}
 
 	// ③ ≥2 倍归位
+	// 2.3.3：click 里不该再有 ≥2× 归位（用户要求取消）。
 	iReset := strings.Index(seg, "if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }")
-	if iReset < 0 {
-		t.Fatal("click 里没有 ≥2 倍的「先归位」")
+	if iReset >= 0 {
+		t.Fatal("click 里**不该**再有 ≥2 倍的「先归位」—— 2.3.3 按用户要求取消（放大后点击直接切图）")
 	}
 
-	if !(iSup < iTap && iTap < iReset) {
+	// 只剩两道判据：suppressClick 消费必须在距离守卫之前。
+	if !(iSup < iTap) {
 		t.Errorf("click 处理器的判据顺序不对（suppressClick=%d, 距离守卫=%d, ≥2倍归位=%d）："+
-			"距离守卫**必须**在 ≥2 倍归位之前，否则「放大后拖动」松手触发的 click "+
+			"suppressClick 的消费必须在距离守卫之前，否则「拖动过」的那次 click 会切两次 "+
 			"会把缩放重置回适应窗口", iSup, iTap, iReset)
 	}
 }

@@ -124,15 +124,21 @@
         req.onblocked = function () { finish(null); };
         req.onsuccess = function () {
           var db = req.result;
+          var closeDb = function () { try { db.close(); } catch (e2) {} };
           try {
-            if (!db.objectStoreNames.contains(STORE)) { finish(null); return; }
+            if (!db.objectStoreNames.contains(STORE)) { closeDb(); finish(null); return; }
             var tx = db.transaction(STORE, 'readonly');
+            // 2.0.0：用完即关。原来读到结果就 return、连接从不关闭 ——
+            // 每读一个目录就留一个打开的 IndexedDB 连接，长会话跨很多目录会持续累积。
+            tx.oncomplete = closeDb;
+            tx.onabort = closeDb;
+            tx.onerror = closeDb;
             var all = tx.objectStore(STORE).getAll();
             all.onsuccess = function () {
               finish(parseFnOsViewPreference(all.result, dir));
             };
             all.onerror = function () { finish(null); };
-          } catch (e) { finish(null); }
+          } catch (e) { closeDb(); finish(null); }
         };
       } catch (e) { finish(null); }
     });

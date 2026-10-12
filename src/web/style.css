@@ -278,6 +278,21 @@ body {
   text-shadow: 0 1px 3px rgba(0,0,0,.5);
 }
 .v-counter-float:hover { background: rgba(0,0,0,.2); }
+/* 2.0.0：大图打开后、同目录列表尚未就绪时的提示（这期间左右切换还不可用，
+   原来完全没有反馈，用户会以为"打开后不能翻页/坏了"）。 */
+.v-list-hint {
+  position: absolute;
+  top: 44px;
+  left: 16px;
+  font-size: 12px;
+  color: rgba(255,255,255,.72);
+  background: rgba(0,0,0,.35);
+  z-index: 10;
+  pointer-events: none;
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+[data-theme="light"] .v-list-hint { color: rgba(0,0,0,.75); background: rgba(255,255,255,.72); }
 .vctrl {
   width: 40px; height: 40px;
   background: transparent;
@@ -481,6 +496,10 @@ body {
 .save-hint { flex: 1; font-size: 12px; color: var(--text-dim); }
 .save-hint.err { color: #ff8a80; }
 
+/* ⛔ 这里曾有 .confirm-box / .confirm-text（2.2.0 的「退出媒体浏览？」确认层）。
+   2.2.1 按用户要求把那个弹层连同 DOM 一起删掉了 —— 第一级返回改成**无响应**，
+   不再需要任何确认框。别只删样式不删 DOM（会留下一坨看不见的死标记）。 */
+
 .set-row {
   display: flex;
   align-items: center;
@@ -656,4 +675,91 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ============================================================
+   移动端 / 触屏适配
+   ------------------------------------------------------------
+   ⚠️ 全部包在 @media (pointer: coarse) 内 —— 判据是【输入能力】，不是窗口宽度。
+      鼠标设备不命中此块 ⇒ 对桌面零影响（zzz_2100 有专门的闸门测试）。
+   ⚠️ 不要为手机样式新起 @media (max-width: ...) 块：桌面把窗口拖窄到 560px
+      也会命中，那就等于把手机样式"搅和"到电脑上了（533 行那条只管设置页
+      栅格、是内容驱动的响应式，属于另一类，可以保留）。
+   ⚠️ 新增手机样式一律追加到本块内。
+   ============================================================ */
+
+/* 触屏专属的「返回上级目录」按钮：默认不显示，只有触屏档位才出现（见下面的媒体查询）。
+   放在媒体查询**外面**是必要的 —— 否则永远不显示。
+   ⚠️ 大图查看器里**没有**这个按钮（按用户要求去掉）：手机飞牛窗口自带返回箭头，
+      从文件管理器点开单图时它等价于"关闭看图窗口"。
+   ⚠️ 2.2.0 起 touch.js 只做双指捏合，右边缘横滑返回已整块删除（用户要求）——
+      别再把"退回网格走右边缘横滑"这类说法写回来。 */
+#navBack { display: none; }
+
+@media (pointer: coarse) {
+  /* 顶部栏：44px 的触摸目标装不进 48px，把变量抬高，`#topbar` 与 `#main`
+     都读同一个变量，改一处两边同步（不会有"栏变高了、内容区没跟上"）。 */
+  :root { --topbar-h: 56px; }
+  #topbar {
+    height: calc(var(--topbar-h) + env(safe-area-inset-top));
+    gap: 4px;                 /* 压窄：箭头与工具要看起来是**一组**（原来是 8px，像两块） */
+    padding-top: env(safe-area-inset-top);
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+  }
+  #main { height: calc(100% - var(--topbar-h) - env(safe-area-inset-top)); }
+
+  /* ① 手势本体：查看器不再把触摸交给浏览器。
+       不加这条的实际后果：
+         · 双指捏合被浏览器当成"页面缩放"，轮不到我们的脚本（永远做不了）；
+         · 单指滑动中途浏览器接管、发 pointercancel → 翻页随机失败。
+       touch-action 沿祖先链取交集（#vStage 的 none 会覆盖子元素的 pan-y），
+       所以这一条就够；它只在查看器打开时有效（关闭时 #viewer 是 display:none）。 */
+  #vStage { touch-action: none; }
+
+  /* ② 越界手势不要传给宿主页面：在飞牛桌面的 iframe 里，
+       "滚到头/滑到头继续滑" 触发的正是"边缘滑动退出整个应用"那件事。 */
+  html, body { overscroll-behavior: none; }
+
+  /* ③ 触摸目标尺寸：32px 在手指上偏小（iOS HIG 44pt / Material 48dp） */
+  .tbtn { width: 44px; height: 44px; font-size: 18px; flex-shrink: 0; }
+  .sel { height: 44px; font-size: 14px; flex-shrink: 0; }
+
+  /* 左上角：**只留「箭头 + 工具」两组，去掉面包屑**。
+     面包屑那段"存储空间 / vol1 / 1000 / 相册"在手机上会占掉大半个顶栏，
+     而它同时还是可点的导航（手机上一排小字很容易误触）；何况手机上本来就有
+     左上角箭头能逐级退回 —— 所以整块隐藏，把宽度全部让给工具。
+     ⚠️ 只在触屏档位隐藏：桌面（鼠标）那套面包屑是主要导航，保留不动。 */
+  #topbar .crumb { display: none; }
+
+  /* 两样东西**并成一组**排：箭头固定最左，工具紧随其后、占满剩余宽度；
+     按钮变多时工具区自己横向滚动，而不是把最右边的「设置」挤出屏幕。 */
+  .tools {
+    flex: 1 1 auto; min-width: 0; gap: 6px;
+    justify-content: flex-start;        /* 紧贴箭头，视觉上连成一组 */
+    overflow-x: auto; scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tools::-webkit-scrollbar { display: none; }
+
+  /* ④ 返回上级目录的按钮出现（大图里没有按钮，见本块上方的说明）。
+        它在第一级时点的语义是"**无响应**"（2.2.1 起，见 app.js 的 goUpLevel）：
+        那里既不退出应用、也不弹确认框。 */
+  #navBack {
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+
+  /* ⑤ 查看器左上角序号：触屏上稍微放大一点（位置沿用默认，不再给按钮让位） */
+  .v-counter-float { font-size: 14px; }
+
+  /* ⑥ 查看器控件加大 + 底部/右侧安全区 */
+  .v-controls {
+    bottom: max(16px, env(safe-area-inset-bottom));
+    right: max(16px, env(safe-area-inset-right));
+    gap: 12px;
+  }
+  .vctrl { width: 48px; height: 48px; }
+
+  /* ⑦ 设置弹层：100vh 在移动端包含地址栏，底部会被顶出屏幕 → 用 dvh */
+  .modal-box { max-height: calc(100dvh - 40px); }
 }

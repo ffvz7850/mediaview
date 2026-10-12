@@ -24,13 +24,14 @@ func Test1952SwipeNotBlockedByZoomFlag(t *testing.T) {
 		t.Errorf("endSwipe 少了「到阈值以上不切」的提前返回（只有 %d 处）", nRet)
 	}
 	nReset := strings.Count(js, "if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }")
-	if nReset != 2 {
-		t.Errorf("「先归位」形态有 %d 处，期望恰好 2 处（swipeTo 键盘/❮❯ + vStage 的 click）"+
+	if nReset != 1 {
+		t.Errorf("「先归位」形态有 %d 处，期望恰好 2 处（2.4.0 起只剩键盘 ←/→）"+
 			"—— 两个入口必须表现一致，否则点图与键盘行为不同", nReset)
 	}
 	// 点击切图那处原来是 `if (!v.zoomed)`
-	if !strings.Contains(js, "if (isTap && v.scale < SWIPE_LOCK_SCALE) {") {
-		t.Error("pointerup 的「点击切图」判据不对 —— 应同时要求「几乎没动(isTap)」与「2 倍以内」")
+	// 2.3.3：切图唯一入口是 vStage 的 click；「几乎没动」这条保护由 8px 距离守卫承担。
+	if !strings.Contains(js, "if (Math.abs(swipe.dx) > 8 || Math.abs(swipe.dy) > 8) return;") {
+		t.Error("点击切图的判据不对 —— 2.3.3 起切图唯一入口是 vStage 的 click，它必须同时有「8px 距离守卫」（几乎没动）与「分区判定」")
 	}
 	// swipeTo 开头也不能再用 v.zoomed
 	i := strings.Index(js, "function swipeTo(")
@@ -41,8 +42,12 @@ func Test1952SwipeNotBlockedByZoomFlag(t *testing.T) {
 	if strings.Contains(rest, "if (v.zoomed)") {
 		t.Error("swipeTo 仍用 v.zoomed 判断是否先归位")
 	}
-	if !strings.Contains(rest, "if (v.scale >= SWIPE_LOCK_SCALE)") {
-		t.Error("swipeTo 没有按放大倍数决定是否先归位")
+	// 2.4.0：归位**故意**从 swipeTo 移出 —— prev/next 走的就是 swipeTo，
+	//   归位留在这里会让"放大后点左/右 1/3"又变成"先归位、不切图"（用户实测报的正是这个）。
+	//   现在归位只在键盘 ←/→ 那一处。
+	if strings.Contains(rest, "if (v.scale >= SWIPE_LOCK_SCALE)") {
+		t.Error("swipeTo 里**不该**再有归位 —— prev/next 都走它，会让点击退化成'先归位不切图'；" +
+			"归位只应留在键盘 ←/→")
 	}
 }
 

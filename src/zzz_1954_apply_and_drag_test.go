@@ -78,10 +78,11 @@ func Test1954DragPansWithoutSwitching(t *testing.T) {
 		t.Error("pointermove 的放大分支没有显式关闭 horizontal")
 	}
 
-	if !strings.Contains(js, "var isTap = Math.abs(swipe.dx) <= 8 && Math.abs(swipe.dy) <= 8;") {
-		t.Error("pointerup 的点击切图没有 8px 距离守卫 —— 拖着看图松手会把图切走")
+	// 2.3.3：切换图入口统一到 vStage 的 click，保护由它的 8px 距离守卫承担。
+	if !strings.Contains(js, "if (Math.abs(swipe.dx) > 8 || Math.abs(swipe.dy) > 8) return;") {
+		t.Error("点击切图的唯一入口（vStage click）没有 8px 距离守卫 —— 拖着看图松手会把图切走")
 	}
-	if !strings.Contains(js, "if (isTap && v.scale < SWIPE_LOCK_SCALE) {") {
-		t.Error("点击切图的判据没有同时包含「几乎没动」与「两倍以内」")
+	if !strings.Contains(js, "if (x >= _left && x <= _right) return;") {
+		t.Error("点击切图的判据没有「8px 距离守卫」（2.3.3 起切图只在 click 里做）")
 	}
 }

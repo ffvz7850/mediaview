@@ -234,16 +234,82 @@ func parseFFmpegInfo(s string) (*Meta, error) {
 	return m, nil
 }
 
-// extractVideoFrame produces a center-cropped square thumbnail via ffmpeg.
-// extractVideoFrame 从视频提取一帧生成缩略图。
-// 注意：对图片文件不要用 -ss（图片没有时间轴，seek 会失败），由调用方决定是否 seek。
-func extractVideoFrame(ctx context.Context, path string, size int, out string) (int, int, error) {
-	return extractFrame(ctx, path, size, out, true)
+// ---- 视频抽帧的时间点 ----
+//
+// 取的不是「第 0 帧」，而是**时间轴上的某一秒**：很多视频第一帧是黑屏/淡入，
+// 原来取 0.05s 实质上就是第 0 帧，缩略图黑乎乎一片。
+// 为什么按「秒」而不按「第几帧」：ffmpeg 的 -ss 是时间 seek，帧号＝时间×帧率，
+// 不同视频帧率不同，无法用一个"第 N 帧"跨视频统一。
+const (
+	// videoFrameSeekSec 默认抽帧时间点（秒）。
+	videoFrameSeekSec = 3.0
+	// videoFrameSeekFallbackSec 兜底时间点（秒）。视频比 videoFrameSeekSec 还短时
+	//（手机连拍、几秒的切片），3s 处 seek 会越过末尾 —— ffmpeg 报 "Output file is empty"
+	// 或产出 0 字节。这时退回开头附近再抽一次，避免整张缩略图失败
+	//（失败还会进 10 分钟负缓存，网格那格一直显示占位图）。
+	videoFrameSeekFallbackSec = 0.05
+)
+
+// seekArg 把秒数格式化成 ffmpeg -ss 的参数（3 → "3"，0.05 → "0.05"）。
+func seekArg(sec float64) string { return strconv.FormatFloat(sec, 'f', -1, 64) }
+
+// durOf 取元数据里的时长（秒）；无元数据返回 0 = 未知。
+func durOf(m *Meta) float64 {
+	if m == nil {
+		return 0
+	}
+	return m.Duration
+}
+
+// chooseVideoSeekSec 决定视频抽帧的时间点。
+// dur <= 0 表示探不到时长（VFR / 容器头缺失 / 探测失败）—— 这时直接用默认值，
+// 越界由 extractVideoFrame 的兜底重试接住。
+func chooseVideoSeekSec(dur float64) float64 {
+	if dur <= 0 {
+		return videoFrameSeekSec
+	}
+	// 视频本身比目标时间点还短：取中点，同时避开「开头黑场」与「末尾黑场 / 无帧」。
+	if dur <= videoFrameSeekSec+0.5 {
+		if mid := dur / 2; mid > videoFrameSeekFallbackSec {
+			return mid
+		}
+		return videoFrameSeekFallbackSec
+	}
+	return videoFrameSeekSec
+}
+
+// extractVideoFrame 从视频提取一帧生成缩略图（中心裁剪正方形）。
+// dur = 视频时长（秒，0 表示未知），用于决定 seek 到哪一秒（见 chooseVideoSeekSec）。
+// 注意：对图片文件不要用 -ss（图片没有时间轴，seek 会失败），图片走 extractImageFrame。
+func extractVideoFrame(ctx context.Context, path string, size int, out string, dur float64) (int, int, error) {
+	seek := chooseVideoSeekSec(dur)
+	w, h, err := extractFrameAt(ctx, path, size, out, true, seek)
+	if err == nil {
+		return w, h, nil
+	}
+	// 兜底：时长不准（VFR / 探测失败）时 3s 仍可能越界。清掉半成品，回退到开头附近重抽一次。
+	// 超时 / 被取消不重试 —— 第二次只会把同样的失败再等一遍。
+	if seek <= videoFrameSeekFallbackSec || ctx.Err() != nil {
+		return 0, 0, err
+	}
+	_ = os.Remove(out)
+	log.Printf("ffmpeg: 视频 seek %.2fs 抽帧失败，回退 %.2fs 重试: %s (%v)",
+		seek, videoFrameSeekFallbackSec, filepath.Base(path), err)
+	return extractFrameAt(ctx, path, size, out, true, videoFrameSeekFallbackSec)
 }
 
 // extractImageFrame 从图片生成缩略图（不用 -ss）。
 func extractImageFrame(ctx context.Context, path string, size int, out string) (int, int, error) {
-	return extractFrame(ctx, path, size, out, false)
+	return extractFrameAt(ctx, path, size, out, false, 0)
+}
+
+// extractFrame 统一入口：图片（seek=false）不 seek；视频按默认时间点抽帧。
+// 视频那条时长感知的路径请用 extractVideoFrame（先探时长选时间点 + 越界兜底重试）。
+func extractFrame(ctx context.Context, path string, size int, out string, seek bool) (int, int, error) {
+	if !seek {
+		return extractFrameAt(ctx, path, size, out, false, 0)
+	}
+	return extractFrameAt(ctx, path, size, out, true, videoFrameSeekSec)
 }
 
 // lowresFor 按目标尺寸计算 ffmpeg 的 -lowres 档位。
@@ -318,7 +384,9 @@ func lowresFor(w, h, target int) int {
 	return n
 }
 
-func extractFrame(ctx context.Context, path string, size int, out string, seek bool) (int, int, error) {
+// extractFrameAt 是真正干活的抽帧实现。seek=false 时走图片语义（-lowres 输入选项、
+// 不 seek）；seek=true 时按 seekSec 秒做输入 seek 抽一帧。
+func extractFrameAt(ctx context.Context, path string, size int, out string, seek bool, seekSec float64) (int, int, error) {
 	if ffmpegPath == "" {
 		return 0, 0, errNoFFmpeg
 	}
@@ -328,7 +396,7 @@ func extractFrame(ctx context.Context, path string, size int, out string, seek b
 	// 熔断机制：连续失败 5 次后关闭硬解 10 分钟，避免不支持的编码每个都白跑两次 ffmpeg。
 	if seek && getSettings().GPUDecode && !hwCircuitOpen() {
 		if dev := detectVAAPIDevice(); dev != "" {
-			vaErr := extractFrameVAAPI(ctx, path, size, out, dev)
+			vaErr := extractFrameVAAPI(ctx, path, size, out, dev, seekSec)
 			if vaErr == nil {
 				hwRecordSuccess()
 				return 0, 0, nil
@@ -349,7 +417,7 @@ func extractFrame(ctx context.Context, path string, size int, out string, seek b
 
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	if seek {
-		args = append(args, "-ss", "0.05")
+		args = append(args, "-ss", seekArg(seekSec))
 	}
 	// 图片缩略图：加动态 -lowres（只解 DCT 低频系数）。
 	// 必须是**输入选项**，所以放在 -i 之前。
@@ -396,7 +464,7 @@ func extractFrame(ctx context.Context, path string, size int, out string, seek b
 // 不设置 LIBVA_DRIVER_NAME：让 libva 根据 DRM 设备 vendor ID 自动选择驱动
 // （AMD→radeonsi, Intel→iHD/i965, NVIDIA→nvidia via nvidia-vaapi-driver），
 // 跨 GPU 平台兼容。驱动不可用时 VAAPI 失败，自动回退软件解码。
-func extractFrameVAAPI(ctx context.Context, path string, size int, out string, device string) error {
+func extractFrameVAAPI(ctx context.Context, path string, size int, out string, device string, seekSec float64) error {
 	vf := "scale=" + itoa(size) + ":" + itoa(size) +
 		":force_original_aspect_ratio=increase,crop=" + itoa(size) + ":" + itoa(size)
 	q := qualityToQScale(getSettings().ThumbQuality)
@@ -409,7 +477,7 @@ func extractFrameVAAPI(ctx context.Context, path string, size int, out string, d
 		"-hide_banner", "-loglevel", "error",
 		"-hwaccel", "vaapi",
 		"-hwaccel_device", device,
-		"-ss", "0.05",
+		"-ss", seekArg(seekSec),
 		"-autorotate", "-i", path,
 		"-frames:v", "1", "-f", "image2", "-update", "1",
 		"-vf", vf, "-an", "-y", "-q:v", itoa(q), out,

@@ -18,7 +18,7 @@ import (
 
 const (
 	appName  = "mediaview"
-	version  = "1.8.191"
+	version  = "2.4.3"
 	gwPrefix = "/app/mediaview"
 )
 
@@ -165,6 +165,8 @@ func main() {
 func registerRoutes(mux *http.ServeMux) {
 	// API
 	mux.HandleFunc(gwPrefix+"/api/list", handleList)
+	// 2.0.0：前端重排后回传有序 path，驱动后台预生成按显示顺序入队
+	mux.HandleFunc(gwPrefix+"/api/pregen", handlePregen)
 	mux.HandleFunc(gwPrefix+"/api/scan", handleScan)
 	mux.HandleFunc(gwPrefix+"/api/thumb", handleThumb)
 	mux.HandleFunc(gwPrefix+"/api/raw", handleRaw)
@@ -179,7 +181,9 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(gwPrefix+"/api/thumb/resume", handleResumeThumb)
 	mux.HandleFunc(gwPrefix+"/api/volumes", handleVolumes)
 	mux.HandleFunc(gwPrefix+"/api/browse", handleBrowse)
-	// 1.8.191 只读读飞牛「资源管理器」的目录排序偏好（读它自己的 SQLite，不碰 WS）。
+	// 2.0.0：「跟随文件管理器排序」的偏好由**前端** fnos_sort.js 读飞牛的 IndexedDB
+	// （db=trim-file-manager / store=file-view-preferences）获得；后端**不参与**排序解析，
+	// 也不读飞牛的任何 SQLite —— 飞牛的目录排序根本不落在 SQLite 里（旧注释是错的）。
 	// static frontend (embedded)
 	mux.Handle(gwPrefix+"/", &frontendHandler{})
 }
@@ -199,7 +203,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"thumb_size":   s.ThumbSize,
 		"settings":     settingsFile,
 		"thumb_note":   currentThumbNote(),
-		// 1.8.191：「跟随文件管理器排序」的偏好来源（只读飞牛自己的 SQLite）。
+		// 2.0.0：「跟随文件管理器排序」的偏好来源在**前端**（fnos_sort.js 读飞牛 IndexedDB），
+		// 后端不参与、也不读飞牛 SQLite。
 		// 报数量与来源即可 —— 这条链一旦失效，用户只能"感觉顺序不对"。
 		"vaapi_device":    detectVAAPIDevice(),
 		"gpu_decode":      s.GPUDecode,

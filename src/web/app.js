@@ -289,6 +289,37 @@
   var cellPool = {};   // data-idx -> element
   var rafPending = false;
 
+  // ================= 输入能力分档（INPUT PROFILE）=================
+  // 目的：手机上的手势增强**只对触屏生效**，桌面（鼠标）路径一行行为都不变。
+  //
+  // 判据用【能力探测】，不是 UA，也不是窗口宽度：
+  //   · (pointer: coarse)  —— 主输入设备是触摸
+  //   · (hover: none)      —— 没有悬停能力
+  //   · maxTouchPoints > 0 —— 确实有触点
+  // 三项同时成立才判触屏。用户在手机浏览器里开「请求桌面版网站」也照样命中
+  // （物理输入就是手指）—— 这一点比 UA 判断可靠得多，UA 会被那个开关改掉。
+  // 桌面（鼠标）三项都不命中 ⇒ PROFILE === 'mouse' ⇒ 下面所有触屏分支短路。
+  var INPUT = (function () {
+    function mq(q) {
+      try { return !!(window.matchMedia && window.matchMedia(q).matches); } catch (e) { return false; }
+    }
+    var touch = mq('(pointer: coarse)') && mq('(hover: none)') &&
+      (navigator.maxTouchPoints || 0) > 0;
+    return { touchPrimary: touch, profile: touch ? 'touch' : 'mouse' };
+  })();
+  var PROFILE = INPUT.profile;
+
+  // 触屏专属手势模块**按需注入**。
+  // ⚠️ 必须是动态注入，不能在 index.html 里写静态 `<script src="touch.js">` ——
+  //    静态标签会让桌面也下载并执行这一整块手势代码，那就"搅和"了。
+  //    （zzz_2100 有一条测试专门禁止静态写法，防止以后被"顺手改回去"。）
+  if (PROFILE === 'touch') {
+    var touchScript = document.createElement('script');
+    touchScript.src = 'touch.js?v=__MV_VERSION__';
+    touchScript.defer = true;
+    document.head.appendChild(touchScript);
+  }
+
   // ---------- Sort helpers ----------
   // 排序统一用 'field:dir' 两段式字符串（如 'mtime:desc'），后端 parseSort 认这种
   // 格式；方向随字符串一起走，让列表顺序、大图切换顺序、预生成顺序共用同一来源。
@@ -497,6 +528,33 @@
       return r.json();
     });
   }
+
+  // 2.0.0：把**按显示顺序重排之后**的有序文件列表回传后端，让后台预生成按
+  // 「用户实际看到的顺序」入队。
+  //
+  // 取代了原先挂在 /api/list 上的自动预生成 —— 那个顺序是后端**字节序**（汉字排最后），
+  // 与前端 ICU 显示顺序不一致（实测「X:\测试排序」129 个文件里 121 个位置不同），
+  // 等于把绝大部分算力花在用户**最后**才会看到的文件上，中文目录首屏反而更慢。
+  //
+  // 上限 512 与后端队列容量一致（thumb.go: make(chan thumbReq, 512)），再多也装不下。
+  // 返回 Promise（手动「立即生成」用它报入队数量）；自动路径可忽略返回值。
+  function postPregen(files, manual) {
+    if (!files || !files.length) return Promise.resolve(null);
+    var paths = [];
+    for (var i = 0; i < files.length && paths.length < 512; i++) {
+      if (files[i] && files[i].path) paths.push(files[i].path);
+    }
+    if (!paths.length) return Promise.resolve(null);
+    try {
+      return fetch(API + '/pregen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // &preload=50
+        body: JSON.stringify({ paths: paths, manual: !!manual })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  }
   function fmtB(n) {
     if (!n) return '0 B';
     if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
@@ -518,13 +576,24 @@
     loadingEl.classList.remove('hidden');
     // 一次拿到真实盘位列表：原来是硬编码 /vol1..10（盘位更多的机器看不到后面的存储空间），
     // 而且每一轮还先发一个返回值完全没用的 /api/health —— 首屏白白多打 10 个请求。
-    fetchJSON(API + '/volumes').then(function (d) {
+        // 2.4.0：首页 = **聚合文件夹层**（所有存储空间用户目录下的文件夹合并成一层）。
+    //   原来是 `/api/volumes`（列出 /vol1、/vol2 这些盘位），用户要先点进盘位才看到自己的文件夹；
+    //   飞牛文件管理器不是这样，它直接列内容。现在两边一致。
+    //   `?path=/` 是后端约定的"聚合根"，返回的每条 dirs 都带**真实绝对路径**，
+    //   所以点进去走的还是原来的目录逻辑，前端无需额外状态。
+    fetchJSON(API + '/list?path=' + enc('/') + '&sort=' + enc(state.sort)).then(function (d) {
       loadingEl.classList.add('hidden');
-      var vols = (d && d.volumes) || [];
-      state.items = vols.map(function (v) { return { kind: 'dir', name: v.name, path: v.path }; });
+      // ⚠️ 必须**转成 {kind:'dir'}**：后端返回的是 DirEntry（只有 name/path/size/mtime），
+      //   而渲染靠 `item.kind === 'dir'` 决定"画文件夹图标"还是"去取缩略图"。
+      //   少了这一步，首页的文件夹会被当成文件渲染（格子空白、还白跑缩略图请求）。
+      //   loadDir 里一直有这一步，首页聚合时漏了 —— 真 Edge 实测抓出来的。
+      state.items = ((d && d.dirs) || []).map(function (x) {
+        return { kind: 'dir', name: x.name, path: x.path };
+      });
       state.files = [];
       renderCrumb();
       layout();
+      syncExitTips();            // 2.4.0：到根层 ⇒ 挂上"是否退出"的确认
     }).catch(function () {
       loadingEl.classList.add('hidden');
       state.items = [];
@@ -538,12 +607,52 @@
   // 目录加载序号：快速连点两个目录时先发的请求可能后返回 ——
   // 没有这个守卫就会出现「面包屑是后点的目录、网格却是先点目录的内容」。
   var loadSeq = 0;
+  // ── 2.3.1：触屏档的"换目录"走**真 URL 导航**（从 2.1.12 移植） ──────────────
+  //
+  // 为什么（2.1.x 线的实测结论）：
+  //   · 宿主的**页面栈只有一层** —— 它看不见我们内部的目录切换，
+  //     也**不感知我们的 pushState**（2.1.9-probe：hist 涨到 11，手感毫无改善）；
+  //   · 于是网格里"回上一层"在宿主看来就是"离开应用" ⇒ 容易直接退出；
+  //   · 让"进目录"变成**真的页面导航**，宿主才会跟着记账，返回手势就变成"退回上一页"。
+  //
+  // ⚠️ 参数名必须是 `dir`：`?path=` 已被"单文件模式"占用
+  //    （boot 里 var single = qs.get('path') 会把目录当成文件去 openSingle）。
+  // ⚠️ 代价：进目录会重新加载页面（约 0.5~2 秒）。所以**只对触屏档**启用；
+  //    桌面档（PROFILE==='mouse'）保持原来的内部切换，一点变化都没有。
+  function navigateTo(path) {
+    if (PROFILE === 'touch') {
+      try {
+        // 2.4.1：用 **replace** 而不是 href —— href 每进一层都往历史里压一条真实 URL，
+        //   而守卫条目删不掉已有条目，于是"退到聚合根后继续返回"会恢复旧的
+        //   /vol{n}/1000/xxx 整页（用户实测："到聚合根还应该停止，现在还能退回去"）。
+        //   replace 替换当前条目 ⇒ 整个会话始终只有「1 条页面 + 1 条守卫」，
+        //   返回完全由守卫 + mvOnPop 接管，历史不再累积。
+        location.replace(GW + '/?dir=' + encodeURIComponent(path));
+        return;
+      } catch (e) { /* 极端环境导航失败 ⇒ 退化成内部切换，不能卡住用户 */ }
+    }
+    loadDir(path);
+  }
+
+  // 回"存储空间列表"（最上层）。必须显式带 ?dir=/，
+  // 否则 boot 会走 last 分支、从 localStorage 跳回上次访问的目录。
+  function navigateRoot() {
+    if (PROFILE === 'touch') {
+      try {
+        location.replace(GW + '/?dir=/');   // 2.4.1：同 navigateTo，不压历史
+        return;
+      } catch (e) {}
+    }
+    buildRoot();
+  }
+
   function loadDir(path) {
     // 先释放浏览器连接池再发 /api/list：网格里在飞的缩略图会占满同源 6 条连接，
     // 不取消的话这个 list 请求要排队等好几个缩略图生成周期（详见函数注释）。
     cancelPendingGridRequests();
     state.root = false;
     state.path = path;
+    syncExitTips();   // 2.4.2：离开聚合根 ⇒ 撤掉宿主的退出确认（此后返回是「退一层」）
     loadingEl.classList.remove('hidden');
     emptyEl.classList.add('hidden');
     var mySeq = ++loadSeq;
@@ -573,6 +682,9 @@
       state.files = files;
       renderCrumb();
       layout();
+      // 2.0.0：用**重排后**的顺序驱动后台预生成（预生成顺序 == 显示顺序）。
+      // 关闭「后台预生成」时不发请求（后端也会兜底返回 0）。
+      if ((cfg.preloadConcurrency || 0) > 0) postPregen(state.files);
       try { localStorage.setItem('mediaview_last', path); } catch (e) {}
     }).catch(function (e) {
       if (mySeq !== loadSeq) return;
@@ -589,6 +701,226 @@
       emptyEl.classList.remove('hidden');
     });
   }
+
+  // ---------- 返回上一级（触屏档位的返回按钮用）----------
+  // 手机上飞牛桌面没有可见的返回入口，系统边缘手势又只会退出**整个应用** ——
+  // 所以给一个页面内的、语义确定的入口：左上角箭头。
+  //
+  // 语义：还在子目录 → 回上级；**已在第一级（存储空间列表）→ 什么也不做**。
+  //
+  // ⚠️ 第一级为什么是"**无响应**"（用户明确要求，2.2.1 起）：
+  //    第一级是最外面一层，再退就是**离开应用**。用户要的是"在应用里怎么点都不出去"，
+  //    所以这里既**不退出**、也**不弹任何确认框** —— 纯空操作。
+  //    （2.2.0 曾在第一级弹「退出媒体浏览？」的确认框，2.2.1 按用户要求撤掉。）
+  //    要退出应用请用飞牛窗口自带的关闭入口 —— 那是宿主原生的，不经过网页。
+  function goUpLevel() {
+    // 2.4.2：聚合根层**什么都不做** —— "是否退出"交给**宿主原生弹窗**
+    //   （syncExitTips 只在聚合根层挂 setExitPageTips）。
+    //   系统返回手势是宿主原生行为，网页拿不到回调；自己画框反而会和宿主那个重复。
+    if (state.root || !state.path) return;
+    var up = dirName(state.path);
+    // 2.3.1：触屏档走真导航（宿主记账 ⇒ 返回能逐层退）
+    // 2.4.1：**到聚合根就停**。原来 `dirName('/vol1/1000')` 会得到 /vol1、再得到 /，
+    //   于是能一路退到"存储空间"那一层（用户实测："到聚合文件夹目录就应该停止"）。
+    //   现在判据换成"上一层是否还在某个存储空间用户目录之内"：出了就不再往上，
+    //   直接回聚合根，且**不再产生中间页面**。
+    if (!up || up === '/') { navigateRoot(); return; }
+    if (!isInsideAnyUserDir(up)) { navigateRoot(); return; }
+    navigateTo(up);
+  }
+
+  // 2.4.1：`/vol{n}/1000` 及其子目录才算"用户目录之内"。
+  //   再往上（/vol1、/vol2、/）就是"存储空间"那一层 —— 用户要求到聚合根就停止，不再显示它。
+  function isInsideAnyUserDir(p) {
+    if (!p) return false;
+    var seg = String(p).split('/').filter(function (s) { return s.length > 0; });
+    if (seg.length < 2) return false;              // 至少要是 /vol{n}/1000 这一级
+    if (!/^vol\d+$/.test(seg[0])) return false;   // 第一段必须是 volN
+    return seg[1] === '1000';                      // 第二段必须是用户目录
+  }
+
+  // ---------- 单图 / 独立看图窗口模式 ----------
+  // URL 带 ?path= 就是（飞牛给「看图子窗口」的 URL 就长这样）。
+  //
+  // ⚠️ 必须在**这里**（顶层，早于下面守卫接线）就定下来，不能等 boot()：
+  //    守卫压不压要按它决定 —— 单图窗口本身就是"一层"，返回的正确语义是**关掉它**
+  //（宿主在 canGoBack 为 false 时会 finish 那个窗口）；压了守卫反而让 canGoBack 恒 true，
+  //    宿主就会去"退历史"、把窗口显示成上一条页面。主窗口才需要守卫（它内部有很多层）。
+  // ⚠️ 判据只此一处：boot() 里不再重复赋值（同一条判据分两处写，迟早会分叉）。
+  var singleMode = false;
+  try { singleMode = !!new URLSearchParams(location.search).get('path'); } catch (e) {}
+
+  // ---------- 宿主返回的「守卫条目」：让系统的滑动返回退不出去 ----------
+  // 手机端的返回手势 / 返回键由**宿主原生层**处理，页面拿不到它的回调、也拦不住它 ——
+  // 但它的落地形式是"让 WebView 退一格历史"。这恰好给了我们一个着力点：
+  // **只要历史里始终有一条属于本应用的条目，它就永远退不到应用之外去。**
+  //
+  // 机制就两条：
+  //   ① 启动时压一条守卫条目（pushState）—— 给"别人发起的返回"准备一个落点；
+  //   ② popstate 里**立刻把守卫补回去**，除此之外什么都不做 —— 这就是"滑动无反应"。
+  // 于是无论滑多少次，历史指针都只在"当前条目 ↔ 守卫条目"之间来回，页面不会被卸载。
+  //
+  // ⚠️ 三条纪律（前几轮实测换来的，别再改回去）：
+  //   · **我们永远不主动 history.back()** —— 主动退历史会与宿主发起的那一次叠加，
+  //     一次滑动退两层（2.1.3 的实测教训）。这里只有 pushState，一次都没有 back。
+  //   · **只在触屏档压** —— 桌面有自己的关闭按钮，不该被改动（手机与桌面不搅和）。
+  //   · 压不上（极端沙箱环境）就静默退化：那只是回到"宿主可能把页面退出去"的旧状态，
+  //     绝不会让页面本身出错。
+  //
+  // ⚠️ 这里不再讨论"要不要挂宿主的 setExitPageTips" —— 2.4.2 起用户明确要求用它
+  //   （手势返回只有宿主原生框能拦到），实现见 syncExitTips。当年的分析留档如下：
+  //   它的语义是"**用户离开应用页面时**显示的确认提示"—— 只能"问一句"，不能"拦住"；
+  //   而用户要的是**滑动无反应**，所有弹窗（含宿主的）都属于"有反应"，方向相反。
+  //   何况实测那台设备上它并没有生效（否则滑动会弹框，而不是直接退出）。
+  //   ⇒ 能"拦住"的只有这条守卫条目。
+  // ⚠️ 不记"守卫压没压上"这种状态量：我们没有"敢不敢动历史"的分支（永不主动 back），
+  //    记了就是一个只写不读的死变量。真需要核查守卫在不在，看 `history.state.mvGuard`
+  //    就行 —— 那是**真实历史状态**，比我们自己的记录可信（探针就是这么验的）。
+  function mvGuardArm() {
+    try {
+      history.pushState({ mvGuard: 1 }, '');
+    } catch (e) {
+      // 极端沙箱环境压不上：静默退化（回到"宿主可能把页面退出去"的旧状态），
+      // 绝不因此让页面本身出错。
+    }
+  }
+
+  // 系统 / 宿主的返回都落在这里。**只补守卫；唯一的例外是大图查看器**。
+  //
+  // 为什么只对大图破例（这是本节最需要想清楚的一处）：
+  //   · 用户要的是**网格里滑动无反应**（"在文件夹滑动返回会直接退出"）—— 那里有左上角
+  //     箭头可以逐级退，所以"吃掉返回"不会把人困住；
+  //   · 但**大图里页面内没有任何返回出口**（2.1.1 起按用户要求删掉了大图的 ← 按钮，
+  //     手势也在 2.2.0 删了）。若把返回也吃掉，大图就成了死胡同 —— 只能退出整个应用
+  //     再重新进来。用户此前明确接受过"大图 → 网格"这个行为（他抱怨的是
+  //     "到了网格继续滑就退出应用"）。所以这里保留它。
+  //   其余（网格 / 子目录 / 第一级）一律**什么都不做**。
+  //
+  // ⚠️ 特意写成**具名函数**再注册，而不是内联匿名回调：匿名回调没法从测试里取出来
+  //    真跑，测试就只能"手抄一份逻辑"，于是改源码它照样绿 —— 那是自证式测试。
+  // 2.3.0：这次关查看器是不是"返回"触发的（是 ⇒ 历史已经退了，不要再补 back）
+  var mvViewerFromPop = false;
+  // 2.3.2：**我们自己**发起的 history.back()（closeViewer 收自己压的那条）。
+  //   它的 popstate 会被 mvOnPop 收到，但那时查看器已经关了 —— 如果不打标记，
+  //   mvOnPop 就会接着走"子目录回上级"，于是"点一次箭头 = 关查看器 + 退一层目录"
+  //   （真 Edge 实测：URL 从 ?dir=/vol1 直接变成 ?dir=/）。
+  var mvSelfBack = false;
+
+  function mvOnPop() {
+    mvGuardArm();
+    // 2.3.2：这一次 popstate 是 closeViewer 主动退历史引起的 —— 它已经把关查看器这件事做完了，
+    //   这里**只能补守卫、不能再退层**，否则一次点击会退两层（关查看器 + 回上级目录）。
+    if (mvSelfBack) { mvSelfBack = false; return; }
+    if (!viewer.classList.contains('hidden')) {
+      mvViewerFromPop = true;
+      try { closeViewer(); } finally { mvViewerFromPop = false; }
+      return;
+    }
+    // 2.3.0：**网格里返回 = 回上一层目录**。
+    //   2.2.x 这里曾是"什么都不做"（当时为了做到"滑动无反应"），但那让网格里的返回
+    //   完全失效 —— 用户在子目录里按返回，页面不动，只能靠左上角箭头。
+    //   现在与"查看器返回 = 关查看器"统一成**同一个出口**：
+    //     查看器开着 → 关查看器
+    //     子目录     → 回上一层目录
+    //     已在最上层 → 什么都不做（保持"滑动无反应"，不退出应用）
+    if (!state.root && state.path) { goUpLevel(); return; }
+    // 2.4.1：**已在聚合根层** ⇒ 问一句"是否退出"（宿主闸门实测不生效，改为页面自己弹）。
+    //   点「留下」会补回守卫，用户原地不动；点「退出」走 hostCall('close')。
+    // 2.4.2：已在聚合根层 —— **什么都不做**，把"是否退出"交给宿主原生弹窗
+    //   （syncExitTips 已在进根层时把它挂上）。这里若补守卫即可，不再自绘任何框。
+    return;
+  }
+
+  // 2.4.0：**离开确认闸门** —— 只在"聚合根层"挂上（仅手机版）。
+  //
+  //   语义：在根层再返回一次就是"离开这个应用"，这时问一句是合理的；
+  //   子目录/查看器里问就成了"把回上一层吞掉"，所以**必须跟状态走**。
+  //   （bridge.js 里保留了 2.2.1 删它时的分析，可对照。）
+  // ---------- 退出前的确认（照搬 2.2.0 的双入口方案）----------
+  //
+  // 两条入口共用同一句文案，但**用不同的框**：
+  //   ② 系统返回（返回手势 / 返回键）：那是宿主原生行为，网页拿不到回调、也拦不住 ——
+  //      唯一能施加影响的是宿主提供的 setExitPageTips（见 syncExitTips），弹的是**原生**框。
+  //
+  // 为什么不用 window.confirm()：宿主 WebView 里它可能被禁用、样式也不受控；
+  // 自绘能保证「有取消键、且取消真的留在原地」。
+  
+
+  // 通用确认弹层：确定 → onOk()；取消 / 点遮罩 → 什么都不做（留在原地）。
+  // 每次都重新绑定 handler 并在收起时清掉，避免"上一次的 onOk 被下一次触发"。
+  
+
+  // 退出整个应用：借宿主桥接的 close。
+  // 不在宿主内（独立标签页/桌面浏览器）时 hostCall 会 reject —— 忽略即可。
+  
+
+  // 2.4.3：初始值必须是 **null**，不能是 false。
+  //
+  //   语义是"**我不知道宿主侧现在是挂着的还是清掉的**"。
+  //   为什么不能用 false：手机版进目录走**真导航**（整页重载），新页面里这个变量会回到
+  //   初始值；而宿主侧的 setExitPageTips 是**应用级**的，整页重载**不会**清掉它。
+  //   若初始成 false，新页面在子目录算出的 want 也是 false ⇒ 判定"状态没变"⇒ **不下发**，
+  //   于是上一个页面挂的闸门就一直留着 —— 用户实测到的"任何层返回都弹框"就是这么来的。
+  //   用 null 则每个新页面**首次一定下发一次**，把宿主侧纠正到与当前层级一致；之后照旧去重。
+  // 2.4.3：**聚合根层的判据**（内存状态 + URL 双保险）。
+  //
+  //   为什么还要看 URL：手机版进目录是真导航（整页重载），刚加载时内存里的 state
+  //   可能还没就绪；而 **URL 就是层级的唯一真相**：
+  //     · `?dir=/`            → 聚合根（navigateRoot 显式带的）
+  //     · 没有任何 dir/path   → 首页（从桌面图标直接进来）
+  //     · `?dir=/vol1/1000/x` → 用户目录里，不是聚合根
+  //     · 有 `?path=`         → 单文件模式（独立看图窗口），不是聚合根
+  //   聚合根页面的 URL 是**固定**的，所以这个判据比内存状态更稳。
+  function isAggregateRoot() {
+    if (state.root && !state.path) return true;              // 内存说在根层 ⇒ 根层
+    if (state.path) return false;                            // 内存说在子目录/某个文件 ⇒ 不是根层
+                                                             //   （此时 URL 可能还没跟上，不能只看它）
+    // ⚠️ 必须**先解码**：真导航拼 URL 时用 encodeURIComponent，
+    //    所以 `?dir=/` 在 location.search 里实际是 `?dir=%2F`。
+    //    不解码的话"显式 ?dir=/"这一条永远不成立（行为探针抓出来的）。
+    var q = location.search || '';
+    try { q = decodeURIComponent(q); } catch (e) { /* 参数里有非法转义：用原串 */ }
+    if (/[?&]path=/.test(q)) return false;                   // 单文件模式
+    if (/[?&]dir=\/(?:&|$)/.test(q)) return true;             // 显式 ?dir=/
+    if (!/[?&]dir=/.test(q)) return true;                    // 没有任何 dir ⇒ 首页
+    return false;
+  }
+
+  var exitTipsArmed = null;
+  function syncExitTips() {
+    var want = (PROFILE === 'touch') && viewer.classList.contains('hidden') &&
+      isAggregateRoot();
+    if (want === exitTipsArmed) return;      // 状态没变就不重复打扰宿主
+    exitTipsArmed = want;
+    try {
+      var b = window.fnosBridge;
+      if (!b || typeof b.setExitPageTips !== 'function') return;   // 宿主没这能力：静默
+      // ⚠️ 官方签名是 `{ title?, content? }`。
+      //    2.4.0/2.4.1 我写成了 `{ tip: ... }` —— 宿主收不到有效参数，**根本不弹**。
+      b.setExitPageTips(want
+        ? { title: '退出急速媒体浏览？', content: '浏览位置与设置都会保留，下次进入可以接着看。' }
+        : null);
+    } catch (e) { /* 能力缺失 / 调用失败都不影响页面本身 */ }
+  }
+
+  // 启动接线：压守卫 + 接上 popstate。
+  // ⚠️ 单独包成具名函数（而不是让下面的 if 直接写两行）是为了**可测**：
+  //    测试能把这个函数抠出来真跑，验"压了几条、接没接上"；
+  //    若写成 if 里的裸两行，测试就只能手抄——那就是自证式测试。
+  function mvGuardInit() {
+    mvGuardArm();
+    window.addEventListener('popstate', mvOnPop);
+  }
+
+  // ⚠️ `!singleMode` 这一条不能少：独立看图窗口里压守卫，会把"返回=关掉这个窗口"
+  //    变成"返回=退到历史里上一条"，宿主再按它自己的规则收尾 —— 这是不可控的一段。
+  if (PROFILE === 'touch' && !singleMode) mvGuardInit();
+
+  // ⛔ 这里曾有 syncExitTips()（2.2.0）：把宿主的「离开页面确认」**只在第一级**挂上，
+  //    其余时刻清除。2.2.1 按用户要求整体撤掉，理由见上面「守卫条目」那段的最后一段：
+  //    用户要的是**滑动无反应**，任何弹窗都属于"有反应"；而且它实测在那台设备上没生效。
+  //    如果将来又想加回来，注意那条铁律：**必须跟状态走**（常挂的后果是每次返回都弹框、
+  //    把"回上一层"整个吞掉 —— 这是 2.1.4 实测踩过的坑）。
 
   // ---------- Breadcrumb ----------
   function renderCrumb() {
@@ -610,7 +942,7 @@
     var d = document.createElement('div');
     d.className = 'crumb-item' + (current ? ' current' : '');
     d.textContent = label;
-    d.onclick = function () { if (path === null) buildRoot(); else loadDir(path); };
+    d.onclick = function () { if (path === null) navigateRoot(); else navigateTo(path); };
     return d;
   }
   function makeSep() {
@@ -794,7 +1126,7 @@
         '<div style="font-size:42px;line-height:1;">📁</div>' +
         '<div style="font-size:11px;color:var(--text-dim);padding:0 6px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;">' +
         escapeHtml(item.name) + '</div></div>';
-      inner.onclick = function () { loadDir(item.path); };
+      inner.onclick = function () { navigateTo(item.path); };
     } else if (!cfg.thumbEnabled) {
       // 缩略图已关闭：降级为「图标 + 扩展名 + 文件名」，不产生任何缩略图请求
       inner.appendChild(fileCard(item));
@@ -1045,6 +1377,10 @@
   }
 
   // ================= VIEWER =================
+  // 查看器内「控件」统一判定：指针事件落在这类元素上时不参与滑动/点击切图。
+  // 集中成一个常量，避免以后新增控件时漏改 —— 漏改的症状很怪：
+  // 「点控件，图片先切一张、然后才响应」。
+  var VIEWER_CTL_SEL = '.v-controls';
   var v = {
     index: 0,
     list: [],
@@ -1056,6 +1392,20 @@
   };
 
   function openViewer(target) {
+    // ⚠️ **触屏档强制遮罩模式**（不看 viewerMode 设置）—— 2.2.2 按用户实测做的改动。
+    //
+    // 用户报的："大图浏览应该退到网格，可现在点击进去退出再点击大图退出就会退出软件。"
+    // 根因不在我们这一层：`viewerMode` 的默认值是 'window'，也就是**请宿主另开一个独立的
+    // 看图窗口**（那份文档的 URL 带 ?path=）。那个窗口的历史栈是它自己的，主窗口压的守卫
+    // 管不到它；而它"返回"时怎么收尾（关子窗口 / 退历史 / 结束页面）完全由宿主决定 ——
+    // 我们既拿不到回调、也拦不住。这正是"返回却退出软件"的来源。
+    //
+    // 遮罩模式下大图只是**叠在网格上的一层**：返回 → 我们的 popstate → 关查看器 → 退回网格，
+    // 全程由本应用掌控。真浏览器里连做 3 轮「点开 → 返回」已实测：文档存活、
+    // 每次都退回网格、守卫每次补回。
+    //
+    // 桌面（鼠标）**仍尊重设置** —— 多窗口在桌面上是有意义的，不该被手机的问题牵连。
+    if (PROFILE === 'touch') { openViewerOverlay(target); return; }
     // 独立窗口模式：尝试通过宿主桥接打开独立看图窗口
     if (cfg.viewerMode === 'window') {
       openViewerWindow(target);
@@ -1080,6 +1430,22 @@
     suspendGridRequests();
     showCurrent(false); // 打开时只加载当前图，不预加载
     pauseThumbGen();
+    // 2.3.0：**查看器 = 一层历史**（仅触屏档）。
+    //
+    // 为什么必须做：查看器此前只是"叠在网格上的遮罩"、**不产生任何历史条目**。
+    //   历史里只有 mvGuardArm 压的那一条常驻守卫，于是：
+    //     在查看器里按返回 → 退掉的是那条**守卫条目**（而不是"关掉查看器"）
+    //     → 查看器仍开着、而守卫已经没了 ⇒ 用户再返回一次就**直接退出应用**。
+    //   （这正是用户报的"点进大图 → 返回 → 退出软件"。）
+    //   压上这一条之后，"返回"先退掉查看器这一层 ⇒ popstate → closeViewer ⇒ 回到网格。
+    // ⚠️ 网格的"进目录"在本版**不是**真导航（goUpLevel → loadDir 内部切换），
+    //    所以网格里的逐层返回靠的是"守卫每次补回 + mvOnPop 里回上级"，与查看器这条各管各的层级。
+    // 桌面档不加：桌面查看器是独立窗口，语义不同。
+    if (PROFILE === 'touch') {
+      try { history.pushState({ mvViewer: 1 }, ''); } catch (e) {}
+    }
+    // 2.4.2：查看器打开 ⇒ 不是"最外层"了，撤掉宿主闸门（旧版 2.2.0 也是这么接的）
+    try { syncExitTips(); } catch (e) {}
   }
 
   // 独立窗口模式：三层降级
@@ -1216,6 +1582,13 @@
 
   // Single-file open mode (fileTypes entry): ?path=...
   // 打开后异步加载同目录媒体，支持左右切换到相邻图片/视频
+  // 2.0.0：大图同目录列表的加载提示（DOM 见 index.html #vListHint）。
+  // 列表就绪前左右切换不可用，原来没有任何反馈 → 用户以为"打开后不能翻页/坏了"。
+  function showListHint(on) {
+    var el = $('vListHint');
+    if (!el) return;
+    if (on) el.classList.remove('hidden'); else el.classList.add('hidden');
+  }
   function openSingle(path, sort) {
     // 打开前清掉本页可能残留的媒体（防御：任何"隐藏而非销毁"的上一次会话）
     stopAllMediaIn(vWrap);
@@ -1242,6 +1615,8 @@
     // 异步拉取同目录列表，把当前文件定位进去，即可左右切换
     var dir = dirName(path);
     if (!dir) return;
+    // 2.0.0：列表就绪前左右切换不可用 —— 给个提示，别让用户以为坏了。
+    showListHint(true);
     // sort 为 null 时：等设置就绪后读文件管理器的排序偏好（「跟随」开关控制）。
     // 列表顺序决定左右切换顺序与大图预加载方向，这里必须和文件管理器一致。
     var listPromise;
@@ -1263,16 +1638,19 @@
       // 却每次打开目录都要付：控制台一条红字 + 白占一条同源 HTTP/1.1 连接
       // （同源只有 6 条，缩略图正在抢）+ 白等一个 RTT。
       //
-      // 现在这条才是真正干活的：**清单一律走 /api/list**（元素带 size/mtime 等字段），
-      // **顺序完全用后端的结果** —— 后端 naturalLess（sortkey.go）就是与飞牛逐字
-      //   一致的实现（字节序 + 连续数字按值）；1.8.180 起前端不再重排。
-      // 排序由 resolveSortForDir 决定：大图用 name:asc，网格用本应用的 state.sort。
+      // 现在这条才是真正干活的：**清单一律走 /api/list**（元素带 size/mtime 等字段）。
+      //
+      // ⚠️ 顺序：后端 naturalLess 是**字节序**，对中文并不等于飞牛（它把汉字排到最后）。
+      //    真正的飞牛顺序由**前端**用 Intl.Collator('zh',{numeric:true}) 重排得到
+      //    （见 resortLikeFnOs）；1.8.180 曾误删前端重排、以为"后端才与飞牛逐字一致"，
+      //    190/191 已改回。排序字段由 resolveSortForDir 决定：大图读偏好，网格用 state.sort。
       listPromise = resolveSortForDir(dir, true).then(function (s) {
         usedSort = s;
         return fetchJSON(API + '/list?path=' + enc(dir) + '&sort=' + enc(s));
       });
     }
     listPromise.then(function (d) {
+      showListHint(false); // 列表已就绪：现在可以左右切换了
       var files = d.files || [];
       // 前端重排必须用「本次实际请求的排序」（带方向）。后端回传的 sort 字段只有
       // 字段名（如 "name"），拿它重排会退化成默认方向 —— 升序/降序就都变成同一个
@@ -1315,16 +1693,10 @@
       } else {
         showCurrent(false);
       }
-    }).catch(function () { /* 列表加载失败不影响当前文件查看 */ });
+    }).catch(function () { showListHint(false); /* 列表加载失败不影响当前文件查看 */ });
   }
   function videoExtJS(ext) {
     return ['mp4','mov','mkv','avi','webm','m4v','flv','wmv','ts','mts','m2ts','mpg','mpeg','3gp','3g2','rmvb','vob','f4v','rm'].indexOf(ext) >= 0;
-  }
-  // 是否媒体文件扩展名（图片 + 视频）。用于从文件管理器给的 paths 列表里
-  // 过滤掉目录/其它非媒体项 —— 目录不能看大图，混进去会导致 /api/raw 加载失败。
-  function isMediaExt(ext) {
-    return videoExtJS(ext) ||
-      ['jpg','jpeg','jpe','jfif','png','gif','webp','bmp','tif','tiff','heic','heif','avif','svg'].indexOf(ext) >= 0;
   }
 
   // 把「当前文件名」写到窗口标题：宿主小窗标题栏（setTitle）+ document.title 兜底。
@@ -1389,8 +1761,15 @@
     }
     // current 始终渲染（优先创建，浏览器优先加载）
     var curBox = createMediaBox(v.list[v.index], true);
-    // prev：空占位（不预加载上一张，减少内存；左滑时才加载）
+    // 2.3.0（P1）：prev **也预加载**。
+    //   原来 prevBox 恒为空占位（为省内存），后果是"向左回看第一下必然白屏等待" ——
+    //   而向右切因为有 next，是顺的。左右手感不对称，用户能直接感觉到。
+    //   这里与 next 对称：viewerPreload >= 1 且存在上一张就渲染它。
+    //   （DOM 仍是有限个盒子：prev + cur + next，换图时 stopMedia 会释放解码器。）
     var prevBox = emptyBox();
+    if (cfg.viewerPreload >= 1 && v.index > 0) {
+      prevBox = createMediaBox(v.list[v.index - 1], false);
+    }
     // next：始终渲染（只要 viewerPreload >= 1），确保第一次切换时 next 已在 DOM、不闪屏
     // current 在 DOM 中排前面，浏览器仍优先加载 current
     var nextBox = emptyBox();
@@ -1812,6 +2191,10 @@
   // 换来的是"刚放大一点点就被挡住、要点两次"的情况更少。
   var SWIPE_LOCK_SCALE = 2;
 
+  // 放大上限。原来是散在滚轮处理器里的字面量 6，触屏捏合也要用同一个上限 ——
+  // 抽成常量，避免"改一处漏一处"（两处上限不一致会出现滚轮能放大到 8、捏合只能到 6）。
+  var MAX_SCALE = 6;
+
   function resetView() {
     v.scale = 1; v.tx = 0; v.ty = 0; v.zoomed = false; v.actual = false;
     updateFitBtn();
@@ -2019,8 +2402,20 @@
   function attachImageGestures(img) {
     img.classList.add('zoomable');
     img.addEventListener('dblclick', function (e) {
-      if (v.zoomed) { resetView(); }
-      else { v.scale = 2; v.zoomed = true; v.actual = false; updateFitBtn(); }
+      // 2.3.0：**以双击点为中心**放大（原来只是居中放大到 2×）。
+      //   做法：把"双击点相对图片中心"的偏移取负作为平移量，双击点在屏幕上保持不动。
+      if (v.zoomed) {
+        resetView();
+        applyTransform();
+        return;
+      }
+      var rect = this.getBoundingClientRect();
+      var cx = e.clientX - (rect.left + rect.width / 2);
+      var cy = e.clientY - (rect.top + rect.height / 2);
+      // 2.4.0：双击放大倍数按用户要求 2 → **3 倍**（再双击还原）。
+      v.scale = 3; v.zoomed = true; v.actual = false;
+      v.tx = -cx; v.ty = -cy;
+      updateFitBtn();
       applyTransform();
       maybeUpgradeToFull();
     });
@@ -2029,9 +2424,9 @@
       var factor = e.deltaY < 0 ? 1.15 : 0.87;
       v.actual = false; // 手动缩放后不再是「原始大小」
       updateFitBtn();
-      // 放大上限 6x。超过 1.5x 后 maybeUpgradeToFull 会直接升级原图，
+      // 放大上限 6x（MAX_SCALE）。超过 1.5x 后 maybeUpgradeToFull 会直接升级原图，
       // 之后继续放大是原图 1:1 或插值，不会糊。
-      v.scale = Math.min(6, Math.max(1, v.scale * factor));
+      v.scale = Math.min(MAX_SCALE, Math.max(1, v.scale * factor));
       v.zoomed = v.scale > 1.01;
       if (!v.zoomed) { v.tx = 0; v.ty = 0; }
       applyTransform();
@@ -2040,6 +2435,21 @@
   }
 
   // ---------- 跟手滑动切换（手机相册式） ----------
+  // 2.3.3/2.3.4：边缘单击的延迟判定窗（毫秒）—— **仅手机版**使用（见使用处）。
+  //   为什么必须有它：要做到"双击零闪烁"，就不能在第一下就切图 —— 只能先等一小会儿，
+  //   若这段时间内来了第二下（双击），直接取消 ⇒ 从头到尾没切过。
+  //   中间 1/3 不切图，所以不需要延迟、仍是零延迟。
+  var MV_TAP_DELAY_MS = 220;
+
+  // 2.3.2：双击判定窗（毫秒）。两次 tap 间隔小于它就认为是双击的第二下。
+  //   用时间窗而不是"延时 250ms 再切图" —— 那样单击切图会慢一拍，用户明确不要延迟。
+  var MV_DBL_TAP_MS = 300;
+  // 2.3.2：上一次 tap 的状态 —— 用来判断"这是不是双击的第二下"，以及该把图换回哪一张。
+  //   undo: 0 = 没切过；1 = 上一步切到了上一张；-1 = 切到了下一张。
+  //   at  : 上一次 tap 的时间戳。
+  //   刻意用**对象**而不是两个裸变量：它俩天生是一对，绑在一起语义更清楚。
+  var mvTap = { undo: 0, at: 0, timer: null };
+
   var swipe = {
     active: false, startX: 0, startY: 0, dx: 0, dy: 0,
     locked: false, track: null,
@@ -2049,8 +2459,41 @@
   // （等目标图 decode 的 doIt、settleAfterSwipe 的 transitionend 与 400ms 兜底）。
   var swipeSeq = 0;
 
+  // ---------- 触屏手势让位（多指 / 被 touch.js 接管）----------
+  // 触屏上有些手势必须由 touch.js 独占（多指捏合、右边缘横滑返回），此时 app.js
+  // 原有的单指逻辑（滑动切图 / 点击切图 / 单指平移）要**整体让位**。不让位会出两个真 bug：
+  //   ① 两指捏合时 pointerup 是**逐指触发**的，第一根手指抬起时位移≈0
+  //      → 走 endSwipe 的"点击"分支 → **捏合会顺手翻页**；
+  //   ② 右边缘横滑的横向拖动会被当成"滑动切图"，松手就把图切走了。
+  // 桌面：touch.js 从不加载，且鼠标只有一个 pointerId ⇒ mtCount() 恒为 1
+  //      ⇒ tgesture.own 恒为 false ⇒ 下面每个判断都短路，行为与改动前逐字节一致。
+  var mtDown = {};                            // pointerId -> 1：当前按在查看器上的触点集合
+  var tgesture = { own: false, muteClickUntil: 0 };
+  function mtCount() {
+    var n = 0;
+    for (var k in mtDown) { if (mtDown[k]) n++; }
+    return n;
+  }
+  // 本次手势让位：丢弃 app.js 侧已开始的手势状态（否则轨道会停在半路）
+  function tgestureClaim() {
+    tgesture.own = true;
+    swipe.active = false;
+    swipe.track = null;
+  }
+  // 全部触点抬起：解除让位，并短暂抑制紧随其后的 click。
+  // 用**时间窗**而不是布尔标记：布尔标记若没有 click 来清就会残留，
+  // 表现为"下一次点击被吞掉"（1.8.160 在这上面踩过一次，见 pointerdown 里的注释）。
+  function tgestureRelease() {
+    tgesture.own = false;
+    tgesture.muteClickUntil = Date.now() + 400;
+  }
+
   animateTransform(false); vWrap.addEventListener('pointerdown', function (e) {
-    if (e.target.closest('.v-controls')) return;
+    if (e.target.closest(VIEWER_CTL_SEL)) return;
+    // 触屏：登记触点。第二根手指落下 ⇒ 本次手势改判为多指，app.js 整体让位。
+    mtDown[e.pointerId] = 1;
+    if (mtCount() > 1) { tgestureClaim(); return; }
+    if (tgesture.own) return; // 已被 touch.js 接管（右边缘返回起手）
     // 视频也允许滑动切换（点击由 click 事件区分左右区域）
     swipe.active = true;
     swipe.startX = e.clientX;
@@ -2088,6 +2531,7 @@
   });
 
   vWrap.addEventListener('pointermove', function (e) {
+    if (tgesture.own) return; // 多指 / 已被 touch.js 接管：本次手势不参与
     if (!swipe.active) return;
     swipe.dx = e.clientX - swipe.startX;
     swipe.dy = e.clientY - swipe.startY;
@@ -2201,21 +2645,27 @@
       // 更糟的是它随后设了 suppressClick = true，**把 vStage click 里那道
       // `dx > 8 → return` 的守卫也一并抑制掉了** —— 两边都不拦，"拖动"就变成了"切图"。
       // 8px 与 vStage click 的守卫保持一致。
-      var isTap = Math.abs(swipe.dx) <= 8 && Math.abs(swipe.dy) <= 8;
-      if (isTap && v.scale < SWIPE_LOCK_SCALE) {
-        var stage = $('vStage');
-        if (stage) {
-          var rect = stage.getBoundingClientRect();
-          var tapX = swipe.startX - rect.left;
-          swipe.suppressClick = true; // 抑制紧随其后的 click，否则会切两次
-          if (tapX < rect.width / 2) prev(); else next();
-        }
-      }
+      // 2.3.3：**这里不再切图**。
+      //   原来它在 pointerup 就按三份判定切图/撤销，于是「第一下已切、第二下再撤回」——
+      //   用户能看到「切过去→瞬间切回→放大」的闪烁。
+      //   现在切图**统一由 vStage 的 click 负责**（带 220ms 判定窗，双击直接取消），
+      //   这里只做滑动收尾，不再碰索引。
     }
     swipe.track = null;
   }
-  vWrap.addEventListener('pointerup', endSwipe);
-  vWrap.addEventListener('pointercancel', endSwipe);
+  // 收尾守卫：让位期间**不跑** endSwipe（否则多指手势会被当成"点击"翻页/收尾动画）；
+  // 触点全部抬起后才解除让位。鼠标只有一个 pointerId ⇒ 分支与原来完全等价。
+  function endSwipeGuarded(e) {
+    var yielding = tgesture.own;
+    delete mtDown[e.pointerId];
+    if (yielding) {
+      if (mtCount() === 0) tgestureRelease();
+      return;
+    }
+    endSwipe();
+  }
+  vWrap.addEventListener('pointerup', endSwipeGuarded);
+  vWrap.addEventListener('pointercancel', endSwipeGuarded);
 
   // 动画结束后静默调整 track：不销毁当前图，只移除旧的相邻图、添加新的相邻图
   function settleAfterSwipe(track, dir) {
@@ -2324,7 +2774,12 @@
     //   · 放大不到 2 倍 → 直接切图（轻微缩放不该挡住切换）；
     //   · 放大到 2 倍及以上 → 先把视图归位（第一次点击只归位，第二次才切），
     //     避免"正在看细节时被切走、回来还要重新找位置"。
-    if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }
+    // 2.4.0：**归位不再放在这里**。
+    //
+    // 原来这里有 `if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); ...; return; }`，
+    // 于是"放大后点左/右 1/3"虽然已经从 click 里删掉了归位，走到这（prev/next → swipeTo）
+    // **又被归位了一次** —— 用户看到的就是"点了左右侧还是返回原样、而且没切图"。
+    // 现在归位只留在**键盘 ←/→** 那一处（点击直接切图，这是用户明确要求的）。
     var track = vWrap.querySelector('.v-track');
     if (!track) { v.index += dir; showCurrent(); return; }
     var mySeq = ++swipeSeq; // 本次切换的序号（见 doIt / settleAfterSwipe 的过期判定）
@@ -2423,6 +2878,7 @@
   function prev() { swipeTo(-1); }
 
   function closeViewer() {
+    showListHint(false); // 2.0.0：关掉查看器时顺手收起可能还挂着的加载提示
     // 恢复网格：把查看器期间变成占位图的缩略图重新请求回来。
     //
     // 1.8.175：**必须先让后端恢复，再重发** —— 顺序反了会拿到占位图，
@@ -2436,6 +2892,23 @@
     stopAllMediaIn(vWrap);
     vWrap.innerHTML = ''; // 轨道连同里面的 <img> 一起销毁
     v.media = null;       // 元素已销毁，v.media 不该再指向失效对象
+    // 2.3.0（P2）：把解码引用一并清掉 —— 手机连开十几张大图后不容易被系统杀。
+    v.hiSrc = '';
+    // 2.3.0：**主动关闭**（点关闭按钮 / 点背景 / Esc）时补一次历史回退。
+    //
+    // 为什么：打开查看器时我们压了一条 {mvViewer:1}（见 openViewerOverlay）。
+    //   · 若是"返回"触发的关闭（mvViewerFromPop=true）⇒ 历史已经退了，这里不能再动；
+    //   · 若是**主动关闭** ⇒ 那条历史还在栈顶，不补一次 back 的话，
+    //     用户下一次按返回会**直接退掉一层目录**（多退一层）。
+    //   ⇒ 一句话：**我们压的条目，只有我们自己收得回来。**
+    if (PROFILE === 'touch' && !mvViewerFromPop && !singleMode) {
+      try {
+        if (history.state && history.state.mvViewer) {
+          mvSelfBack = true;   // 让紧接着的 mvOnPop 知道"这次是我们自己退的"
+          history.back();
+        }
+      } catch (e) {}
+    }
     // 1.8.160：轨道没了，但视图状态（v.scale / v.zoomed / v.tx / v.ty）是挂在 v 上的、
     // 不会被这一步清掉。下次打开若走 rebuildTrackInPlace 由它重置；**在这里也重置一次**，
     // 是为了不依赖"下次一定走哪条分支"——状态与 DOM 同生共死，语义更清楚。
@@ -2459,6 +2932,62 @@
     // 注意：后台恢复已经在函数开头（resumeThumbGenNow）做过了 ——
     // 这里不能再调 resumeThumbGen()，那会**取消并重排**一个 1 秒后的 resume，
     // 白白把"已恢复"拖成"1 秒后才恢复"。
+  
+    // 2.4.3：关掉查看器后**重新判定**宿主闸门 —— 若此时正停在聚合根层，
+    //   闸门要重新挂上（打开查看器时清过一次）。旧版 2.2.0 也有这一处。
+    try { syncExitTips(); } catch (e) {}
+  }
+
+  // ================= 触屏模块接口（仅触屏档位暴露）=================
+  // touch.js 用它做**双指捏合缩放**，而不是自己去猜 DOM 结构或复制一份状态。
+  // （2.2.0 起本接口只服务捏合：返回手势已整个删除，相关出口一并撤掉。）
+  // 桌面（PROFILE !== 'touch'）**不创建这个对象** ⇒ 桌面连入口都没有
+  //（zzz_2100 断言"桌面档 window.__mvMobile === undefined"）。
+  // 这是"不与电脑搅和"的第三层隔离：契约收敛到这一个出口，不散落 isMobile 判断。
+  if (PROFILE === 'touch') {
+    window.__mvMobile = {
+      version: '__MV_VERSION__',
+      // --- 查询 ---
+      viewerOpen: function () { return !viewer.classList.contains('hidden'); },
+      stageRect: function () {
+        var s = $('vStage');
+        if (!s) return null;
+        var r = s.getBoundingClientRect();
+        return { left: r.left, top: r.top, width: r.width, height: r.height };
+      },
+      view: function () { return { scale: v.scale, tx: v.tx, ty: v.ty }; },
+      maxScale: function () { return MAX_SCALE; },
+      // --- 让位（多指捏合 / 边缘返回期间，app.js 的单指逻辑整体退出）---
+      claimGesture: tgestureClaim,
+      releaseGesture: tgestureRelease,
+      // --- 动作 ---
+      // 手势专用：**必须关掉过渡**，否则 transform 追着手指跑、手感发飘
+      //（与滚轮/拖拽同一原因，见 animateTransform 的注释）。
+      // 返回 false 表示"这张不能缩放"（视频），调用方据此不发手势效果。
+      setView: function (scale, tx, ty) {
+        if (!v.media || v.media.tagName !== 'IMG') return false;
+        var s = Math.max(1, Math.min(MAX_SCALE, scale));
+        v.actual = false;                       // 手动缩放后不再是「原始大小」
+        v.scale = s;
+        v.zoomed = s > 1.01;
+        v.tx = tx || 0;
+        v.ty = ty || 0;
+        animateTransform(false);
+        updateFitBtn();
+        applyTransform();   // 内部负责 s<=1.01 时归中，以及平移边界钳位
+        return true;
+      },
+      // 手势收尾：定稿一次（≥1.5x 触发原图升级，与滚轮/1:1 走同一条链路）
+      commitView: function () {
+        if (!v.media || v.media.tagName !== 'IMG') return;
+        animateTransform(true);
+        maybeUpgradeToFull();
+      },
+      // ⚠️ 这里**刻意没有** closeViewer / goUpLevel（2.2.0 删掉了）。
+      //    它们是为"右边缘横滑返回"准备的出口；那条手势已按用户要求整块删除，
+      //    返回改走页面内的显式入口（左上角箭头 / 退出确认框），不再需要对手势暴露。
+      //    接口越窄，touch.js 能误碰的东西越少 —— 这就是隔离层的意义。
+    };
   }
 
   // 页面被隐藏（切到别的标签/窗口、被宿主遮住、最小化）时，把正在播的视频暂停。
@@ -2505,9 +3034,9 @@
     b.title = v.actual ? '适应窗口' : '原始大小（1:1）';
   }
 
-  // 1.8.146：手动执行一次后台预生成（针对当前浏览的目录）。
-  // 实现上复用列表接口 —— 它本来就对返回的文件调用 preloadBatch()，
-  // 这里用 ?preload=50 请求更大的批量，不必新增接口。
+  // 2.0.0：手动执行一次后台预生成（针对当前浏览的目录）。
+  // 改走 /api/pregen（manual=true），按当前目录的**显示顺序**入队；
+  // 不再用 /api/list?preload=N —— 那条会把顺序绑在后端字节序上（见 postPregen 注释）。
   (function () {
     var btn = $('setPreloadRun');
     if (!btn) return;
@@ -2517,11 +3046,19 @@
         if (hint) hint.textContent = '请先进入一个目录';
         return;
       }
+      var files = state.files || [];
+      if (!files.length) {
+        if (hint) hint.textContent = '当前目录没有可生成的媒体文件';
+        return;
+      }
       if (hint) hint.textContent = '正在请求…';
-      fetchJSON(API + '/list?path=' + enc(state.path) + '&preload=50').then(function () {
-        if (hint) hint.textContent = '已请求后台生成（最多 50 张）';
-      }).catch(function () {
-        if (hint) hint.textContent = '请求失败';
+      postPregen(files, true).then(function (res) {
+        if (!hint) return;
+        if (res && typeof res.enqueued === 'number') {
+          hint.textContent = '已请求后台生成（入队 ' + res.enqueued + ' 张，按当前显示顺序）';
+        } else {
+          hint.textContent = '请求失败';
+        }
       });
     };
   })();
@@ -2563,9 +3100,12 @@
 
   // 点击左/右半区切换（滑动后不触发，避免误触）
   animateTransform(false); $('vStage').addEventListener('click', function (e) {
+    // 刚结束的多指手势（捏合 / 边缘返回）浏览器仍可能补一个 click —— 抑制掉，
+    // 否则"捏合松手"会顺手翻一页。时间窗 400ms，过期自动失效（不会残留吞掉下一次点击）。
+    if (Date.now() < tgesture.muteClickUntil) return;
     // pointerup 已经按点击处理过（见 endSwipe 的 dir === 0 分支），别再切一次
     if (swipe.suppressClick) { swipe.suppressClick = false; return; }
-    if (e.target.closest('.v-controls')) return;
+    if (e.target.closest(VIEWER_CTL_SEL)) return;
     // ★ 顺序要紧：**先判"这是不是一次点击"，再决定 ≥2 倍时归位。**
     //
     // 1.8.161 修：1.8.160 把下面那条 ≥2 倍的 `return` 改成了 `resetView()`，
@@ -2583,17 +3123,63 @@
     // `if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }`
     // —— 同一个"切图"动作两个入口表现不同，而"点了一下完全没反应"最容易让人
     // 以为功能坏了，所以统一成"先归位"。
-    if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }
+    // 2.3.1：**先分区、再决定要不要归位**。
+    //
+    // 原来这条 ≥2× 的归位放在分区**之前** ⇒ 放大后点**中间**也会"恢复原状"，
+    // 而用户要的是"中间什么都不做"（中间只负责双击缩放）。
+    // 现在：中间直接 return；只有左右 1/3 才有"先归位"这一步（与键盘 ←/→ 一致）。
     var rect = this.getBoundingClientRect();
     var x = e.clientX - rect.left;
-    var isVideo = e.target.tagName === 'VIDEO';
-    if (isVideo) {
-      // 视频：左右 25% 区域切换，中间 50% 留给播放/暂停和 controls
-      if (x < rect.width * 0.25) prev();
-      else if (x > rect.width * 0.75) next();
+    var _left = rect.width / 3;
+    var _right = rect.width * 2 / 3;
+    if (x >= _left && x <= _right) return;   // 中间 1/3：无论缩放，什么都不做
+    // 2.3.2：**双击的第二下（detail >= 2）不再切图**，并把第一下切走的索引还原。
+    //   否则"在左/右 1/3 双击"= 切一张 + 放大（用户实测报的"边缘双击还会切图然后放大"）。
+    //   还原后由 dblclick 负责放大；单击切图仍是零延迟。
+    // 2.3.3：双击的第二下 ⇒ **取消**待执行的单击切图（于是全程没有切过图，零闪烁）。
+    if (e.detail >= 2) {
+      if (mvTap.timer) { clearTimeout(mvTap.timer); mvTap.timer = null; }
+      return;
+    }
+    // 2.3.3：**取消"放大到 2× 以上时单击先归位"**（用户明确要求）。
+    //   现在放大后点击直接按分区切图；拖动仍然是平移（pointermove 的放大分支没动）。
+    // 2.3.0：**屏幕分三份**（图片与视频统一）。
+    //
+    //   左 1/3 = 上一张；中间 1/3 = **什么都不做**；右 1/3 = 下一张。
+    //
+    // 2.3.2：**双击的第二下不切图，并把第一下切走的索引还原**。
+    //   中间 1/3 本来就不切图，但左右 1/3 的第一下会立即切（这是"零延迟"的代价）。
+    //   若紧接着来了第二下（e.detail >= 2）说明用户其实是在双击，
+    //   于是把索引换回来、让 dblclick 去放大 —— 用户看到的就是"双击只放大"。
+    //   （不做 250ms 延迟，单击切图仍是零延迟。）
+    //
+    // 为什么中间必须"什么都不做"：双击的两下 click 都会命中同一个区域。
+    //   如果中间也切图，双击就会"先切一张/两张、再放大"（用户实测报的正是这个）。
+    //   而把中间留空之后，双击的两下 click 都落在"不切图"区 ⇒
+    //   **不需要用 300ms 延迟去区分单击与双击**，切图仍是零延迟。
+    //   （这正是 touch.js 文件末尾"加双击必须延迟 300ms"那个死结的解法。）
+    // （分区变量在函数开头已经算好：_left / _right。中间 1/3 已在上面 return，
+    //   所以能走到这里必然是左右两侧 —— 不要再重复算一遍，那会让"分区"有两个来源。）
+    // 2.3.3：**延迟 MV_TAP_DELAY_MS 再切图**。
+    //   这段窗口内若来了双击的第二下，上面的 clearTimeout 会把它取消 ⇒ 一次都没切过。
+    //   中间 1/3 已在上面 return，所以只有左右边缘会走到这里。
+    // 2.3.4：**延迟只对手机版**。
+    //   手机：手指双击误触率高，需要 220ms 判定窗来做到"双击零闪烁"。
+    //   桌面：鼠标双击精准，而"单击切图"是高频操作，220ms 是能被感知的延迟 ⇒ 立即切。
+    // 2.4.1：**手机版放大后不响应左右切图**（用户要求）。
+    //   放大是为了看细节 —— 此时点左右应该什么都不做，只能拖动查看；
+    //   切图必须先缩回原状（双击还原）再点。桌面版不受影响（鼠标精确，直接切更顺手）。
+    if (PROFILE === 'touch' && v.scale > 1.01) return;
+    if (PROFILE === 'touch') {
+      if (mvTap.timer) { clearTimeout(mvTap.timer); mvTap.timer = null; }   // 连点多次只算最后一次
+      mvTap.timer = setTimeout(function () {
+        mvTap.timer = null;
+        if (x < _left) prev();
+        else if (x > _right) next();
+      }, MV_TAP_DELAY_MS);
     } else {
-      // 图片：左右半区切换
-      if (x < rect.width / 2) prev(); else next();
+      if (x < _left) prev();
+      else if (x > _right) next();
     }
   });
 
@@ -2608,8 +3194,12 @@
       }
       closeViewer();
     }
-    else if (e.key === 'ArrowRight') next();
-    else if (e.key === 'ArrowLeft') prev();
+    // 2.4.0：**归位只在这两个入口做**（键盘离得远、不易误触）。
+    //   点击（左/右 1/3）不归位 —— 直接切图，这是用户明确要求的。
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }
+      if (e.key === 'ArrowRight') next(); else prev();
+    }
   });
 
   // ---------- Scroll / resize ----------
@@ -2941,6 +3531,30 @@
   }
   initTheme();
 
+  // 触屏档位的返回按钮（**显示**由 CSS 的 @media (pointer: coarse) 控制，
+  // 桌面根本看不见它；这里只接行为）。加 null 判断是为了容忍
+  // "旧 index.html + 新 app.js" 这种版本错配 —— 缺元素时只是没这个按钮，不该整页报错。
+  // 注：大图查看器**不再**单独放返回按钮（按用户要求去掉，别再加回来）——
+  //     手机飞牛窗口自带返回箭头，从文件管理器点开单图时它等价于"关闭看图窗口"。
+  //     应用内"大图 → 网格"由窗口那个返回箭头负责（它会退一格历史，
+  //     而历史里常驻着我们压的守卫条目，所以只会关掉查看器那一层，不会退出应用）。
+  //     ⚠️ 2.2.0 起 touch.js **只做双指捏合**，右边缘横滑返回整块删除（用户要求），
+  //        别再把"退回网格走右边缘横滑"这类说法写回去。
+  var navBackBtn = $('navBack');
+  if (navBackBtn) navBackBtn.onclick = function () {
+    // 2.3.2：**按状态分流**。此前它直接绑 goUpLevel —— 于是"在大图里点箭头"会走
+    //   goUpLevel → navigateTo(上级) → **真导航整页重载**，而不是"关掉查看器回网格"。
+    //   查看器里只有**系统返回**才走 popstate → closeViewer，箭头这条路整个绕过了它。
+    //   ⇒ 这正是"大图没加载完成时返回就退出软件"的来源：
+    //      点箭头触发了真导航、页面正在加载，此时再返回，宿主的状态机就乱了。
+    if (!viewer.classList.contains('hidden')) {
+      // closeViewer 内部会在"主动关闭"时补一次 history.back()，把我们压的那条收回。
+      closeViewer();
+      return;
+    }
+    goUpLevel();
+  };
+
   $('btnSettings').onclick = openSettings;
   $('btnRebuildThumbs').onclick = function () {
     if (!state.path) { toast('请先进入一个目录'); return; }
@@ -3033,12 +3647,12 @@
 
   // ---------- Boot ----------
 
-  var singleMode = false;
   function boot() {
     var qs = new URLSearchParams(location.search);
     var single = qs.get('path');
     if (single) {
-      singleMode = true;
+      // ⚠️ 这里**不再** `singleMode = true` —— 它已经在顶层按 URL 定好了
+      //（见「单图 / 独立看图窗口模式」那段）。同一条判据分两处写，迟早会分叉。
       // 单文件模式（独立窗口）：立即隐藏工具栏和网格，只显示查看器，避免闪烁
       $('topbar').style.display = 'none';
       $('main').style.display = 'none';
@@ -3060,8 +3674,30 @@
       }
       return;
     }
+    // 2.3.1：**真导航落地**时 URL 带 `?dir=` —— 优先用它打开目标目录。
+    //   ⚠️ 不能用 `?path=`：那个参数**已经被"单文件模式"占用**（见上面的 single 分支）。
+    var dirParam = qs.get('dir');
+    if (dirParam !== null && dirParam !== '') {
+      if (dirParam === '/') {
+        // 显式要求"最上层"：**不能**走下面的 last 分支，
+        // 否则会从 localStorage 跳回上次目录（"回到最上层失败"就是这么来的）。
+        settingsReady = loadSettings();
+        settingsReady.then(function () { buildRoot(); });
+        return;
+      }
+      state.root = false;
+      state.path = dirParam;
+      settingsReady = loadSettings();
+      settingsReady.then(function () { loadDir(dirParam); });
+      return;
+    }
+    // 2.4.0：**手机版不再"跳回上次目录"**（用户要求）——
+    //   从飞牛桌面图标进来时必须落在新首页（聚合文件夹层），而不是上次看的深层目录。
+    //   桌面版保持原行为（那边窗口常驻、恢复上次位置更自然）。
     var last = null;
-    try { last = localStorage.getItem('mediaview_last'); } catch (e) {}
+    if (PROFILE !== 'touch') {
+      try { last = localStorage.getItem('mediaview_last'); } catch (e) {}
+    }
     settingsReady = loadSettings();
     settingsReady.then(function () {
       if (last) {
