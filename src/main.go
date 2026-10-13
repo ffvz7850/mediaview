@@ -18,7 +18,7 @@ import (
 
 const (
 	appName  = "mediaview"
-	version  = "2.4.3"
+	version  = "2.4.12"
 	gwPrefix = "/app/mediaview"
 )
 

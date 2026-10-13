@@ -98,6 +98,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o med
 
 ## 版本历史
 
+- **v2.4.12**：修复大图浏览排序 100/100（飞牛里按文件名升序双击第 1 张却显示最后一张）——基于 2.4.3 基线，仅改 web/fnos_sort.js：normDir 支持 URL 解码、不再采用全局默认排序；推荐更新
 - **v1.8.43**：设置页加入赞助框；修复 finishThumb key 混用导致小图/视频缩略图缓存永久失效；修复暂停时清空队列导致缩略图任务丢失
 - **v1.8.42**：P0/P1 修复
 - **v1.8.x**：大图浏览体验优化、GPU 加速、系统缩略图接管、虚拟滚动等

@@ -15,6 +15,11 @@
  * 注意：当 sorting 与默认值（name asc）相同时该字段会被整段删除 —— 读不到就按
  * 默认 name asc 处理，而不是报错。
  *
+ * 2.4.12：**只采用目录级记录**（location 与该目录匹配），不再采用全局默认
+ * （location 为空）—— 全局默认是历史残留的列排序，与用户当前视图经常不符，
+ * 采用它必然出现"点第 1 张显示 100/100"。没有目录级记录时由调用方兜底
+ * name:asc（飞牛默认视图）。
+ *
  * 本文件不依赖任何框架，纯函数（parse/normDir）可独立测试；getDirSort 是薄
  * 异步包装，任何异常都 resolve(null)，绝不让「跟随排序」这个增强功能把主流程搞挂。
  */
@@ -33,11 +38,21 @@
     btim: 'btime'
   };
 
-  // 归一化目录路径：反斜杠转正斜杠、去掉首尾斜杠。file-view-preferences 的
-  // location 存的就是「去掉首尾斜杠」的目录路径，比对前两边都必须归一。
+  // 归一化目录路径：反斜杠转正斜杠、URL 解码、合并重复斜杠、去掉首尾斜杠。
+  // file-view-preferences 的 location 存的就是「去掉首尾斜杠」的目录路径。
+  //
+  // 2.4.12：**必须 URL 解码**。看图窗口 URL 的 path 参数是编码的
+  // （%2Fvol2%2F1000%2F%E5%9B%BE%E5%BA%93...），而 IndexedDB 里的 location 是
+  // 解码后的真实路径。旧实现不解码 ⇒ 中文目录（尤其带《》等字符的）永远匹配
+  // 不上目录级记录 ⇒ 只能退到全局默认 —— 全局默认又与当前视图不符，正是
+  // "点第 1 张显示 100/100"的成因之一。
   function normDir(p) {
     if (!p) return '';
     var s = String(p).replace(/\\/g, '/');
+    try {
+      if (s.indexOf('%') >= 0) s = decodeURIComponent(s);
+    } catch (e) {}
+    s = s.replace(/\/+/g, '/');
     while (s.length > 1 && s.charAt(0) === '/') s = s.slice(1);
     while (s.length > 1 && s.charAt(s.length - 1) === '/') s = s.slice(0, -1);
     return s;
@@ -48,18 +63,23 @@
   // dir: 目录路径（任意格式，内部归一化）
   // 返回 'field:dir' 字符串（如 'mtim:desc'），或 null（没找到/无排序信息）。
   //
-  // 三级优先：① 该目录自己、scope=my-files 的记录
-  //           ② 该目录自己、其它 scope 的记录
-  //           ③ **全局默认排序**（location 为空的记录）
-  // ③ 是必须的：用户在文件管理器里没单独设过某目录时，排序来自全局默认；
-  // 旧实现只精确匹配目录，于是"读不到"直接回退到本应用的 state.sort，
-  // 表现就是「文件管理器里明明是修改时间升序，大图却按降序走」。
+  // 两级优先（2.4.12 起**不再采用全局默认**）：
+  //   ① 该目录自己、scope=my-files 的记录
+  //   ② 该目录自己、其它 scope 的记录
+  //   ③ null —— 由调用方兜底 name:asc（飞牛默认视图）
+  //
+  // 为什么去掉"全局默认"（location 为空的记录）：
+  //   全局默认是用户很久以前在飞牛里设的**列排序**，与"当前视图"经常不符
+  //   （用户临时切换列/方向时飞牛不写偏好，只落盘最后设置的列）。
+  //   用户真实数据：全局默认 name:desc、当前视图 name:asc ⇒ 采用全局默认必然
+  //   "点第 1 张显示 100/100"（第 1 张是 0001.jpg，却按 name:desc 排到 100/100）。
+  //   目录级记录才是"用户在这个目录里明确设过的排序"，可信得多；没有目录级
+  //   记录时，跟随飞牛默认视图（name:asc）比猜一个历史残留值更接近用户所见。
   function parseFnOsViewPreference(records, dir) {
     if (!records || !records.length) return null;
     var target = normDir(dir);
     var now = Date.now();
     var best = null;
-    var globalSort = null;
     for (var i = 0; i < records.length; i++) {
       var r = records[i];
       if (!r) continue;
@@ -78,18 +98,13 @@
       var stRaw = String(r.sorting.sortType == null ? '' : r.sorting.sortType).toLowerCase().trim();
       var d = stRaw === 'desc' ? 'desc' : 'asc';
       var out = f + ':' + d;
-      var loc = normDir(r.location);
-      if (loc === '') {
-        // 全局默认排序：留作最后兜底（不覆盖目录级记录）
-        if (!globalSort) globalSort = out;
-        continue;
-      }
-      if (loc !== target) continue;
+      // 2.4.12：只匹配目录级记录，不再收集全局默认
+      if (normDir(r.location) !== target) continue;
       // scope 通常是 'my-files'，命中直接返回；其它 scope（若有）留作兜底。
       if ((r.scope || 'my-files') === 'my-files') return out;
       if (!best) best = out;
     }
-    return best || globalSort || null;
+    return best || null;
   }
 
   // 本次会话内缓存：同一目录不必反复读库；也保证「第一次读到的值」稳定可用。
