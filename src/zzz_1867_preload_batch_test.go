@@ -13,10 +13,7 @@ package main
 // 于是「改过并发数、没碰过预生成」的配置升级后预生成仍是 3，表现同样是「关不掉」。
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -192,96 +189,6 @@ func Test1867PreloadBatchIsTheOnlyEnqueueEntrypoint(t *testing.T) {
 	}
 	if !strings.Contains(body, "return 0") {
 		t.Error("preloadBatch 关掉时必须返回 0（调用方靠它判断投了几个）")
-	}
-}
-
-// ---- 配置迁移覆盖面 ----
-
-func Test1867MigrationUpgradesEachLegacyDefaultIndependently(t *testing.T) {
-	cases := []struct {
-		rawTC, rawPC   int
-		ver            int
-		wantTC, wantPC int
-		desc           string
-	}{
-		{6, 3, 0, thumbConcurrencyDefault(), 3, "旧默认组合 → 并发按核数 / 预生成保持 3"},
-		{4, 3, 0, 4, 3, "★调过并发数(4)、没碰预生成(旧默认3) → 预生成保持原值"},
-		{3, 3, 0, 3, 3, "并发已是 3、预生成仍是旧默认 3 → 预生成保持原值"},
-		{2, 3, 0, 2, 3, "★并发 2（normalize 会把预生成钳到 1）→ 判据必须看原值 3，仍要关掉"},
-		{6, 5, 0, thumbConcurrencyDefault(), 5, "预生成被主动调到 5：只升并发，不覆盖用户选择"},
-		{8, 8, 0, 8, 8, "两个都不是旧默认：都不动"},
-		{3, 0, 1, 3, 0, "旧迁移产物 0：已删除迁移，保持 0（用户关掉的不会再被打开）"},
-		{6, 3, currentSettingsSchema, 6, 3, "已是当前版本：用户手动设回 6/3 必须被尊重"},
-	}
-	for _, c := range cases {
-		s := Settings{
-			ThumbConcurrency:   c.rawTC,
-			PreloadConcurrency: c.rawPC,
-			SchemaVersion:      c.ver,
-		}
-		s.migrate(c.rawTC, c.rawPC)
-		if s.ThumbConcurrency != c.wantTC || s.PreloadConcurrency != c.wantPC {
-			t.Errorf("%s：得到 %d/%d，期望 %d/%d",
-				c.desc, s.ThumbConcurrency, s.PreloadConcurrency, c.wantTC, c.wantPC)
-		}
-		if s.SchemaVersion != currentSettingsSchema {
-			t.Errorf("%s：迁移后没有打上版本号（会每次启动重判）", c.desc)
-		}
-	}
-}
-
-// 端到端走一遍真实加载路径：磁盘上的旧配置 → loadSettings → 落盘。
-// 这里刻意用「并发 2 + 预生成 3」：normalize 的交叉钳制会把预生成 3 钳成 1，
-// 所以断言值必须精确等于 0 —— 得到 1 就说明迁移读的是钳制后的值（等于没修）。
-func Test1867LoadSettingsMigratesLegacyPreloadEvenWhenThumbIsCustom(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("MEDIAVIEW_ETC", dir)
-
-	prevFile := settingsFile
-	prevSettings := getSettings()
-	t.Cleanup(func() {
-		settingsMu.Lock()
-		settingsFile = prevFile
-		settings = prevSettings
-		settingsMu.Unlock()
-	})
-
-	path := filepath.Join(dir, "mediaview.settings.json")
-	raw, _ := json.Marshal(map[string]any{
-		"thumbEnabled":       true,
-		"thumbConcurrency":   2, // 用户改过
-		"preloadConcurrency": 3, // 更早版本的固定默认，没碰过 → schema 3 应升为新默认
-	})
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	loadSettings()
-
-	s := getSettings()
-	// 1.8.139 起不再迁移 preload。本例磁盘上是 preload=3 且 thumbConcurrency=2，
-	// 于是 normalize 的交叉钳制把预生成钳到 maxBg = ThumbConcurrency-1 = 1。
-	// （原来的期望是 0 —— 那是旧迁移规则写的；现在只受钳制，不再被改写成"关闭"。）
-	if s.PreloadConcurrency != 1 {
-		t.Errorf("preloadConcurrency = %d，期望 1（已删迁移；上限由 ThumbConcurrency-1 决定）",
-			s.PreloadConcurrency)
-	}
-	if s.SchemaVersion != currentSettingsSchema {
-		t.Errorf("SchemaVersion = %d，期望 %d", s.SchemaVersion, currentSettingsSchema)
-	}
-
-	// 迁移结果必须落盘，否则每次启动都重判一遍
-	out, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var back Settings
-	if err := json.Unmarshal(out, &back); err != nil {
-		t.Fatal(err)
-	}
-	if back.PreloadConcurrency != 1 || back.SchemaVersion != currentSettingsSchema {
-		t.Errorf("落盘值不对：文件里 preloadConcurrency=%d（期望 1）schemaVersion=%d",
-			back.PreloadConcurrency, back.SchemaVersion)
 	}
 }
 

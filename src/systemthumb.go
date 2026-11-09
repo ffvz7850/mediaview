@@ -72,7 +72,9 @@ func parseSystemThumbPath(apiPath, size string) (origPath, thumbPath string, err
 	// 必须走统一入口做范围校验：拼出来的路径直接交给 os.Stat / 缩略图引擎，
 	// 而本进程 run-as=root。旧实现只检查了 vol 前缀，rel 里的 ".." 原样保留。
 	// 改用 resolveMediaPath 后：Clean 折叠 ".."、落到白名单外即 403。
-	origPath, sc := resolveMediaPath(origPath)
+	// Broad：这条链路是**替飞牛文件管理器**供图，范围由宿主决定。
+	// 用收窄版会让「开了只显示已添加文件夹」之后，文件管理器里其它目录全部丢缩略图。
+	origPath, sc := resolveMediaPathBroad(origPath)
 	if sc != 0 {
 		return "", "", fmt.Errorf("path not allowed: %s", apiPath)
 	}

@@ -89,21 +89,16 @@ func Test2210BridgeExportsExitTips(t *testing.T) {
 	}
 }
 
-// Test2210GuardWiringIsTouchOnlyAndNeverCallsBack 静态钉住守卫机制的三条纪律：
+// Test2210HistoryDiscipline 静态钉住"历史只被用在一个地方"（2.4.40 重整后的纪律）：
 //
-//	① 接线包在 `if (PROFILE === 'touch')` 里（桌面不该被改动 —— 手机与桌面不搅和）；
-//	② 全文件只有 mvGuardArm 里那一处 pushState；
-//	③ **没有任何 history.back()** —— 我们永不主动退历史。
-func Test2210GuardWiringIsTouchOnlyAndNeverCallsBack(t *testing.T) {
+//	① 换目录是**真页面导航**（location.href）—— navigateTo / navigateRoot / goUpLevel 不碰历史；
+//	② 全文件只有 1 处 pushState，就是查看器自己那一层；
+//	③ history.back() 最多 1 处，且只允许在 closeViewer 的主动关闭路径上；
+//	④ replaceState 只有 1 处（boot 把首条条目改写成显式 ?dir=），且带 qsHadDir 保护；
+//	⑤ 2.4.33 ~ 2.4.39 那套「守卫条目」必须彻底消失 —— 半留半删比不删更危险。
+func Test2210HistoryDiscipline(t *testing.T) {
 	app := stripLineComments(mustReadWebFile(t, "app.js"))
 
-	if !strings.Contains(app, "if (PROFILE === 'touch' && !singleMode) mvGuardInit();") {
-		t.Error("守卫接线必须是 `if (PROFILE === 'touch' && !singleMode) mvGuardInit();` —— " +
-			"① 只在触屏档（桌面有自己的关闭按钮，不该被这套机制改动）；" +
-			"② **单图 / 独立看图窗口里不许压** —— 那个窗口本身就是一层，" +
-			"返回的正确语义是关掉它，压了守卫反而让宿主去退历史（2.2.2 的实测结论）")
-	}
-	// 取某个函数的函数体（大括号配平）。用于**逐处校验**压栈/退历史出现在哪。
 	jsBody := func(sig string) string {
 		i := strings.Index(app, sig)
 		if i < 0 {
@@ -128,62 +123,93 @@ func Test2210GuardWiringIsTouchOnlyAndNeverCallsBack(t *testing.T) {
 		return ""
 	}
 
-	// 2.3.0：pushState 从 1 处变成 2 处 —— 但**每一处都必须落在受控位置**，
-	//   而不是简单放宽计数（那样"历史膨胀"就没人管了）：
-	//     ① mvGuardArm()      → 那条常驻守卫（地板）
-	//     ② openViewerOverlay → 查看器自己的一层（带 mvViewer 标记，仅触屏档）
-	if n := strings.Count(app, "history.pushState("); n != 2 {
-		t.Errorf("history.pushState( 应恰好 2 处（守卫 1 + 查看器 1），实际 %d 处 —— "+
-			"多出来的压栈点会让历史膨胀、也会让\"守卫只有一条\"不再成立", n)
+	// ① 导航只用 location.href：每层目录 = 一条真实历史 ⇒ 宿主怎么数都能退。
+	for _, fn := range []string{"function navigateTo(", "function navigateRoot("} {
+		body := jsBody(fn)
+		if body == "" {
+			t.Fatalf("找不到 %s", fn)
+		}
+		if !strings.Contains(body, "location.href") || !strings.Contains(body, "?dir=") {
+			t.Errorf("★★ %s 必须用 location.href 真导航到 ?dir=（每层一条历史；"+
+				"replace/内部切换都会让会话只有一条历史 ⇒ 返回就退出应用）", fn)
+		}
+		if strings.Contains(body, "loadDir(") || strings.Contains(body, "buildRoot(") {
+			t.Errorf("%s 不许再走内部切换 —— 那正是「返回就退出」那类问题的来源", fn)
+		}
+		if strings.Contains(body, "history.") {
+			t.Errorf("%s 不许碰 history —— 真导航下历史由浏览器自己写", fn)
+		}
 	}
-	guardBody := jsBody("function mvGuardArm(")
-	if !strings.Contains(guardBody, "history.pushState(") {
-		t.Error("mvGuardArm() 里必须压那条常驻守卫条目")
+	// 逐层返回必须复用同一条导航路径（进目录真导航、回上级内部切换 = 两套语义）。
+	upBody := jsBody("function goUpLevel(")
+	if !strings.Contains(upBody, "navigateTo(up);") || !strings.Contains(upBody, "navigateRoot();") {
+		t.Error("goUpLevel 必须走 navigateTo / navigateRoot（与进目录同一条路径）")
+	}
+
+	// ② 唯一的一处压栈：查看器
+	if n := strings.Count(app, "history.pushState("); n != 1 {
+		t.Errorf("★★ history.pushState( 应恰好 1 处（查看器那一条），实际 %d 处 —— "+
+			"网格层与层之间由真导航负责，再压就是重复记账（返回要按两次）", n)
 	}
 	viewerBody := jsBody("function openViewerOverlay(")
 	if !strings.Contains(viewerBody, "history.pushState(") || !strings.Contains(viewerBody, "mvViewer: 1") {
 		t.Error("openViewerOverlay() 里必须压一条带 mvViewer 标记的**查看器历史** —— " +
-			"否则查看器没有自己的历史层级，返回会退掉上一层目录页（真导航重载），" +
-			"我们的 popstate/closeViewer 根本没机会跑（2.3.0 修的正是这个）")
+			"否则在查看器里按返回会直接退到上一层目录页（真导航会整页重载）")
 	}
-	// 2.3.0：允许 1 处 history.back()，但**只允许在 closeViewer 的主动关闭路径**上。
-	//   理由：我们压的条目只有我们自己收得回来；不补的话"点关闭按钮关大图 → 再按返回"
-	//   会直接退掉一层目录（多退一层）。
+	if !strings.Contains(app,
+		"if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);") {
+		t.Error("popstate 接线必须是 `if (PROFILE === 'touch' && !singleMode) ...` —— " +
+			"① 只在触屏档（桌面没有返回手势）；② 单图窗口本身就是一层，挂上去会抢走「关窗」")
+	}
+	if n := strings.Count(app, "'popstate'"); n != 1 {
+		t.Errorf("popstate 应恰好注册 1 处，实际 %d 处 —— 重复注册会让一次返回被处理多次", n)
+	}
+
+	// ③ back 只允许出现在 closeViewer 的主动关闭路径
 	if n := strings.Count(app, "history.back("); n > 1 {
 		t.Errorf("history.back( 最多 1 处（只允许 closeViewer 的主动关闭路径），实际 %d 处", n)
 	}
 	closeBody := jsBody("function closeViewer(")
-	if strings.Contains(app, "history.back(") && !strings.Contains(closeBody, "history.back(") {
-		t.Error("history.back( 只允许出现在 closeViewer() 的主动关闭路径上")
-	}
-	// 正向断言：还必须"收得回来"且"按来源分流"。
-	//   少了这两条，把 history.back 整行删掉也不会被抓红（那就是假绿）。
 	if !strings.Contains(closeBody, "history.back(") {
 		t.Error("closeViewer() 必须补一次 history.back() —— 打开查看器时压了一条 mvViewer 条目，" +
-			"点关闭按钮/背景/Esc 主动关闭时若不收回，用户**下一次**按返回会直接退掉一层目录（多退一层）")
+			"点关闭按钮/背景/Esc 主动关闭时不收回，用户下一次返回会直接退掉一层目录（多退一层）")
 	}
 	if !strings.Contains(closeBody, "mvViewerFromPop") {
-		t.Error("closeViewer() 必须按 mvViewerFromPop 分流 —— " +
-			"返回触发时历史**已经退了**，此时再补一次 back 就是一次返回退两层")
+		t.Error("closeViewer() 必须按 mvViewerFromPop 分流 —— 返回触发时历史已经退了，" +
+			"此时再补一次 back 就是一次返回退两层")
 	}
 	if !strings.Contains(closeBody, "history.state") || !strings.Contains(closeBody, "mvViewer") {
 		t.Error("closeViewer() 必须先确认栈顶确实是我们的查看器条目（history.state.mvViewer），再退历史")
 	}
-	// 更严的一条：**返回路径自身不许碰历史**（与 2.1.3 的实测教训一致 ——
-	//   那里主动退一次 + 宿主退一次 = 一次滑动退两层）。
-	for _, fn := range []string{
-		"function mvOnPop(", "function mvGuardArm(", "function mvGuardInit(", "function goUpLevel(",
+	if strings.Contains(jsBody("function mvOnPop("), "history.") {
+		t.Error("mvOnPop 里不许碰历史 —— 那时历史已经退了，再退一次会和宿主那一次叠加（一滑退两层）")
+	}
+
+	// ④ replaceState 只在 fixEntryURL（把首条条目改名成显式目录）
+	if n := strings.Count(app, "history.replaceState("); n != 1 {
+		t.Errorf("history.replaceState( 应恰好 1 处（fixEntryURL），实际 %d 处", n)
+	}
+	fixBody := jsBody("function fixEntryURL(")
+	if !strings.Contains(fixBody, "history.replaceState(") {
+		t.Fatal("★ fixEntryURL 必须用 replaceState —— 它只改当前条目的 URL，不新增条目")
+	}
+	if !strings.Contains(fixBody, "qsHadDir") {
+		t.Error("★ fixEntryURL 必须用 qsHadDir 保护：已经带 ?dir= 的页面（真导航落地）URL 就是真相，不许改写")
+	}
+	if strings.Contains(fixBody, "history.back(") || strings.Contains(fixBody, "history.pushState(") {
+		t.Error("★ fixEntryURL 里不许 back / pushState")
+	}
+
+	// ⑤ 守卫体系与 SPA 专用件必须彻底消失
+	for _, dead := range []string{
+		"mvGuard", "MV_GUARD_DEPTH", "mvTxAction", "mvSyncURL", "mvPushGuardOnce",
+		"dirViews", "saveDirView", "restoreDirView", "prefetchDir", "takePrefetch",
+		"cancelPendingGridRequests", "resumeCanceledThumbs", "mobileSpaNav",
 	} {
-		if strings.Contains(jsBody(fn), "history.back(") {
-			t.Errorf("%s 里不得出现 history.back( —— 那条路径上历史已经退了，"+
-				"再退一次会和宿主那一次叠加：一次返回退两层", fn)
+		if strings.Contains(app, dead) {
+			t.Errorf("★★ %s 属于「内部切换 + 历史守卫」那套，真导航后已无意义 —— 必须删净"+
+				"（两套机制并存时，谁也说不出哪条在生效）", dead)
 		}
-	}
-	if strings.Contains(app, "history.replaceState(") {
-		t.Error("app.js 里出现了 history.replaceState( —— 守卫机制只需要 pushState，别引入第二种写法")
-	}
-	if n := strings.Count(app, "'popstate'"); n != 1 {
-		t.Errorf("popstate 应恰好注册 1 处，实际 %d 处 —— 重复注册会让一次返回被处理多次", n)
 	}
 }
 
@@ -226,6 +252,10 @@ function buildRoot() { rooted++; }   // 保留：桌面档与降级路径仍用�
 function loadDir(p) { loaded.push(p); }
 var code =
   'function hostCall(m) { hostCalls.push(m); return { catch: function () {} }; }' +
+  // 2.4.18：goUpLevel 还会问 isCustomRoot(up)（上一层是不是已添加的文件夹）。
+  //   这里是"未开启该选项"的场景，把 cfg 桩成空列表即可。
+  'var cfg = { onlyRoots: false, roots: [] };' +
+  grab('isCustomRoot') + ';' +
   grab('normPath') + ';' + grab('dirName') + ';' +
   // 2.4.1：goUpLevel 现在用 isInsideAnyUserDir 判"是否还在用户目录之内"
   grab('isInsideAnyUserDir') + ';' + grab('goUpLevel') + ';' +
@@ -272,115 +302,6 @@ console.log('OK');
 	out, err := exec.Command(node, "-e", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("第一级无响应探针失败：%v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), "OK") {
-		t.Fatalf("探针未输出 OK：%s", out)
-	}
-}
-
-// Test2210GuardStopsHostBack 用 node 真跑守卫机制（mvGuardArm / mvOnPop / mvGuardInit）：
-//
-//	① 启动压**恰好一条**守卫、并接上 popstate；
-//	② 宿主发起的返回：补守卫、**永不主动退历史**、网格里什么都不做；
-//	③ 连来 5 次也不掉出去（每次都被补回）；
-//	④ 唯一例外：查看器开着时把它关掉（否则大图成死胡同）。
-func Test2210GuardStopsHostBack(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skipf("node 不可用：%v", err)
-	}
-	script := `
-var fs = require('fs');
-var appjs = fs.readFileSync('web/app.js', 'utf8');
-function grab(name) {
-  var i = appjs.indexOf('function ' + name + '(');
-  if (i < 0) { console.error('FAIL 源码里找不到 ' + name); process.exit(1); }
-  var depth = 0, j = appjs.indexOf('{', i);
-  for (var k = j; k < appjs.length; k++) {
-    if (appjs[k] === '{') depth++;
-    else if (appjs[k] === '}') { depth--; if (depth === 0) return appjs.slice(i, k + 1); }
-  }
-  console.error('FAIL ' + name + ' 括号不配平'); process.exit(1);
-}
-function eq(a, b, msg) {
-  if (a !== b) { console.error('FAIL ' + msg + ' | expect ' + JSON.stringify(b) + ' got ' + JSON.stringify(a)); process.exit(1); }
-}
-function ok(c, msg) { if (!c) { console.error('FAIL ' + msg); process.exit(1); } }
-
-// --- 假环境：真实记录 pushState 的内容、主动退历史的次数、被关查看器的次数 ---
-var pushed = [], backs = 0, closed = 0, listeners = {};
-var history = {
-  pushState: function (st) { pushed.push(st || {}); },
-  back: function () { backs++; },
-  replaceState: function () { console.error('FAIL 守卫机制不该用 replaceState'); process.exit(1); }
-};
-var window = { addEventListener: function (n, f) { listeners[n] = f; } };
-var viewer = {
-  hidden: true,
-  classList: { contains: function (c) { return c === 'hidden' ? viewer.hidden : false; } }
-};
-var up = 0, exits = 0;
-function closeViewer() { closed++; }
-function goUpLevel() { up++; }
-// 2.4.2：根层 popstate 也不再自绘 —— "是否退出"统一交给宿主原生弹窗
-function askExitApp() { exits++; }
-var state = { root: false, path: '/vol2/1000/图库' };
-// 2.3.2：mvOnPop 里的"自我回退"开关（closeViewer 主动退历史时置位）
-var mvSelfBack = false;
-
-var code =
-  grab('mvGuardArm') + ';' + grab('mvOnPop') + ';' + grab('mvGuardInit') + ';' +
-  'return { init: mvGuardInit, pop: mvOnPop,' +
-  '  snap: function () { return { pushed: pushed, backs: backs, closed: closed, up: up,' +
-  '    exits: exits, popListener: !!listeners.popstate }; } };';
-var G = new Function('PROFILE', 'viewer', 'closeViewer', 'history', 'window', 'state', 'goUpLevel',
-                     'mvSelfBack', 'askExitApp', code)(
-  'touch', viewer, closeViewer, history, window, state, goUpLevel, mvSelfBack, askExitApp);
-
-// ① 启动接线
-G.init();
-var s0 = G.snap();
-eq(s0.pushed.length, 1, '★ 启动必须压**恰好一条**守卫条目 —— 多了会让历史膨胀，少了就没有落点');
-eq(s0.pushed[0].mvGuard, 1, '守卫条目要带 mvGuard 标记（否则没法用 history.state 核查它在不在）');
-eq(s0.popListener, true, '★ 必须接上 popstate —— 否则宿主发起的返回没人补守卫，第二次就退到应用外');
-
-// ②③ 网格（子目录）里连来 5 次宿主返回 —— 2.3.0 起每次都应"回上一层目录"
-viewer.hidden = true;
-state.root = false; state.path = '/vol2/1000/图库';
-for (var i = 0; i < 5; i++) { listeners.popstate(); }
-var s1 = G.snap();
-eq(s1.pushed.length, 6, '★ 每一次返回都要把守卫补回去（1 条启动 + 5 次补 = 6）');
-eq(s1.backs, 0, '★★ 我们**永不主动 history.back()** —— 主动退一次会和宿主那次叠加，一次滑动退两层');
-eq(s1.closed, 0, '★ 网格里返回不该关查看器（那时它是关着的）');
-eq(s1.up, 5, '★ 2.3.0：子目录里每次返回都要**回上一层目录** —— ' +
-  '与"查看器 → 关查看器"统一成同一个出口（2.2.x 这里曾是"什么都不做"，导致网格返回完全失效）');
-
-// ③b 已在最上层（聚合根）：2.4.1 起**弹"是否退出"确认**（用户实测：宿主闸门不弹 ⇒ 页面自己弹）
-state.root = true; state.path = '';
-listeners.popstate();
-var s1b = G.snap();
-eq(s1b.up, 5, '★★ 已在最上层时返回不许再回上级');
-eq(s1b.exits, 0, '★ 已在聚合根层返回**不再自绘确认框** —— 交给宿主原生弹窗（syncExitTips）');
-eq(s1b.closed, 0, '★ 也不许关查看器（它没开）');
-eq(s1b.backs, 0, '★★ 更不许主动退历史');
-eq(s1b.pushed.length, 7, '补守卫照旧（守卫与"退到哪一层"是两件事，互不替代）');
-state.root = false; state.path = '/vol2/1000/图库';
-
-// ④ 唯一例外：查看器开着
-viewer.hidden = false;
-listeners.popstate();
-var s2 = G.snap();
-eq(s2.closed, 1, '★ 查看器开着时返回要把它关掉 —— 否则大图里没有任何出口（← 2.1.1 已删、手势 2.2.0 已删）');
-eq(s2.pushed.length, 8, '关查看器那一次也要补守卫（关查看器与补守卫是两件事，互不替代）');
-eq(s2.backs, 0, '关查看器也不许走 history.back()');
-
-ok(s2.pushed.every(function (p) { return p.mvGuard === 1; }), '压进历史的条目必须全部是守卫标记');
-
-console.log('OK');
-`
-	out, err := exec.Command(node, "-e", script).CombinedOutput()
-	if err != nil {
-		t.Fatalf("守卫机制探针失败：%v\n%s", err, out)
 	}
 	if !strings.Contains(string(out), "OK") {
 		t.Fatalf("探针未输出 OK：%s", out)

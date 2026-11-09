@@ -98,8 +98,14 @@ eq(names(resort(mk(['Dsc033-1.jpg', 'Dsc033-2.jpg', 'Dsc033-9.jpg', 'Dsc033-10.j
 eq(names(resort(mk(mix), 'name:desc')),
    ['Z.jpg', 'DSC06619.jpg', 'abc.jpg', '小吉的快乐野餐封面.jpg', '玛奇玛.jpg', '阿.jpg', '00069.png'],
    '降序必须生效');
-// 非 name/type 字段不重排（保持后端顺序）
-eq(names(resort(mk(['b', 'a']), 'size:asc')), ['b', 'a'], 'size 不重排');
+// 2.4.41：数值字段（size / mtime / btime）也必须能排 —— 以前这三种是"原样返回"，
+// 于是竖图流拿到的永远是旧顺序（用户报的「固定按修改时间降序」）。
+eq(names(resort([{name:'big',size:9},{name:'small',size:1}], 'size:asc')), ['small','big'], 'size 升序');
+eq(names(resort([{name:'big',size:9},{name:'small',size:1}], 'size:desc')), ['big','small'], 'size 降序');
+eq(names(resort([{name:'new',mtime:20},{name:'old',mtime:10}], 'mtime:asc')), ['old','new'], 'mtime 升序');
+eq(names(resort([{name:'new',mtime:20},{name:'old',mtime:10}], 'mtime:desc')), ['new','old'], 'mtime 降序');
+// 同键稳定：与后端 sort.SliceStable 一致（不许再按名称兜底）
+eq(names(resort([{name:'b',size:5},{name:'a',size:5}], 'size:asc')), ['b','a'], '同 size 保持原序');
 // type：按扩展名
 eq(names(resort(mk(['x.png', 'y.jpg', 'z.avif']), 'type:asc')), ['z.avif', 'y.jpg', 'x.png'],
    'type 按扩展名排');

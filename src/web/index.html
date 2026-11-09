@@ -16,6 +16,9 @@
   }
 })();
 </script>
+<!-- 内联关键背景色：换目录/返回都是**真页面导航**，新文档要等 style.css（同源缓存）才上色。
+     这一行让首次绘制就是主题底色，不会先闪一下白（深色主题下尤其明显）。 -->
+<style>html{background:#ffffff}html[data-theme="dark"]{background:#0e0f13}</style>
 <link rel="stylesheet" href="style.css?v=__MV_VERSION__">
 </head>
 <body>
@@ -42,7 +45,7 @@
       <option value="btime:desc">按创建时间</option>
     </select>
     <button class="tbtn" id="sortDirBtn" title="切换升序/降序">↓</button>
-    <button class="tbtn" id="btnRebuildThumbs" title="重建当前目录缩略图">↻</button>
+    <button class="tbtn" id="btnRebuildThumbs" title="重建当前目录（子文件夹封面 / 文件缩略图）">↻</button>
     <button class="tbtn" id="btnSettings" title="设置">⚙</button>
   </div>
 </header>
@@ -99,6 +102,74 @@
           <input type="checkbox" id="setThumbEnabled">
           <span class="switch-track"><span class="switch-knob"></span></span>
         </label>
+      </div>
+
+      <!-- 文件夹封面开关 -->
+      <div class="set-row">
+        <div class="set-label">
+          <div class="set-name">文件夹封面</div>
+          <div class="set-desc">网格里的文件夹显示随机抽取的图片封面（本层没有就下探子目录），关闭后恢复文件夹图标</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="setCover">
+          <span class="switch-track"><span class="switch-knob"></span></span>
+        </label>
+      </div>
+
+      <!-- 文件夹名称位置（2.4.20 起默认"压在封面底部 + 灰度自适应"，见 app.js 的 pickCoverTone） -->
+      <div class="set-row" id="rowCoverName">
+        <div class="set-label">
+          <div class="set-name">文件夹名称显示在封面下方</div>
+          <div class="set-desc">关闭（默认）时名字压在封面底部的一条半透明蒙层上，图片隐约透出，字色按封面灰度自动切黑/白；开启则改为封面下方独立一行（不压图，也不看灰度）</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="setCoverName">
+          <span class="switch-track"><span class="switch-knob"></span></span>
+        </label>
+      </div>
+
+      <!-- 手机端竖图连续浏览（2.4.29，仅触屏档显示：CSS 用 @media (pointer: coarse) 控制） -->
+      <div class="set-row" id="rowMobileFlow">
+        <div class="set-label">
+          <div class="set-name">手机端竖图连续浏览</div>
+          <div class="set-desc">开启（默认）后，手机上点开图片是按目录顺序<b>上下连续浏览</b>：图片铺满屏幕宽度、首尾相接，边看边按顺序预载后面几张。关闭则恢复左右滑动切换。只在手机（触屏）上生效，电脑不受影响</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="setMobileFlow">
+          <span class="switch-track"><span class="switch-knob"></span></span>
+        </label>
+      </div>
+
+      <!-- 只显示已添加的文件夹 -->
+      <div class="set-block">
+        <div class="root-head">
+          <div class="set-label">
+            <div class="set-name">只显示我添加的文件夹</div>
+            <div class="set-desc">开启后首页只列出下面这些文件夹；其它文件夹、存储空间与默认目录<b>既不显示也不会被读取</b></div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="setOnlyRoots">
+            <span class="switch-track"><span class="switch-knob"></span></span>
+          </label>
+        </div>
+        <div class="root-list" id="rootList"></div>
+        <div class="root-actions">
+          <button class="btn ghost mini" id="btnAddRoot">＋ 添加文件夹</button>
+          <span class="set-desc" id="rootHint"></span>
+        </div>
+        <!-- 目录选择器的宿主：点「添加文件夹」时面板就地展开在这里，
+             而不是跑到设置面板底部的"缩略图缓存"那块下面去。 -->
+        <div id="rootBrowserHost"></div>
+      </div>
+
+      <!-- 一键生成文件夹封面 -->
+      <div class="set-row" id="rowCoverPregen">
+        <div class="set-label">
+          <div class="set-name">一键生成文件夹封面</div>
+          <div class="set-desc">遍历当前目录（含子目录），把所有文件夹的封面提前生成并缓存，之后浏览不再等待；已生成的会自动跳过</div>
+          <div class="set-desc" id="coverPregenStatus" style="color:var(--text-dim);font-size:11px;margin-top:2px;"></div>
+        </div>
+        <button class="btn" id="btnCoverPregen" style="min-width:72px;">开始</button>
       </div>
 
       <!-- 主题 -->
@@ -333,15 +404,7 @@
             <button class="btn ghost" id="btnUseDefault">用默认</button>
           </div>
           <div class="dir-hint" id="dirHint"></div>
-
-          <div class="dir-browser hidden" id="dirBrowser">
-            <div class="db-head">
-              <button class="btn ghost mini" id="dbUp" title="上一级">← 上级</button>
-              <div class="db-path" id="dbPath"></div>
-              <button class="btn mini" id="dbPick">用此目录</button>
-            </div>
-            <div class="db-list" id="dbList"></div>
-          </div>
+          <div id="thumbBrowserHost"></div>
         </div>
 
         <!-- 尺寸 / 质量 -->
@@ -378,6 +441,23 @@
           </div>
           <div class="dir-hint" id="cfgPath"></div>
         </div>
+      </div>
+
+      <!-- 目录选择器：缩略图目录与「添加文件夹」**共用同一个面板**，
+           打开时由 openBrowser() 移到对应的宿主里（就地展开）：
+             · 「选择目录」    → #thumbBrowserHost（缩略图存放位置那块）
+             · 「添加文件夹」  → #rootBrowserHost（只显示我添加的文件夹那块）
+           早期版本把它固定放在设置主体末尾，点「添加文件夹」会滚到「缩略图缓存」
+           那块下面，用户以为跳错了地方 —— 就地展开没有这个歧义。
+           面板本身不能放在 #thumbOpts 里：关闭「生成缩略图」时那块会 display:none。 -->
+      <div class="dir-browser hidden" id="dirBrowser">
+        <div class="db-head">
+          <button class="btn ghost mini" id="dbUp" title="上一级">← 上级</button>
+          <div class="db-path" id="dbPath"></div>
+          <button class="btn mini" id="dbPick">用此目录</button>
+          <button class="btn ghost mini" id="dbClose" title="关闭">✕</button>
+        </div>
+        <div class="db-list" id="dbList"></div>
       </div>
 
       <!-- 赞助 -->

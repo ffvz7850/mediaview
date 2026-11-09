@@ -83,6 +83,14 @@ var lastListedDir atomic.Value // string
 //	· 某个存储空间没有用户目录就跳过（不让一个坏盘位毁掉整个首页）。
 func aggregateRoot(sortBy string) *ListResponse {
 	resp := &ListResponse{Path: "/", Parent: "", Dirs: []DirEntry{}, Files: []FileItem{}}
+
+	// 2.4.16：开启「只显示已添加的文件夹」时，首页**只**由这份列表构成 ——
+	// 不再扫描 /vol*/1000。这是"其它文件夹、磁盘既不显示也不加载"的直接落点：
+	// 连枚举各存储空间这一步都不做（不是查出来再过滤掉）。
+	if s := getSettings(); s.OnlyRoots {
+		return aggregateCustomRoots(s.Roots, sortBy)
+	}
+
 	for _, vol := range listVolDirs() {
 		home, err := defaultUserDir(vol)
 		if err != nil || !dirExists(home) {
@@ -110,6 +118,118 @@ func aggregateRoot(sortBy string) *ListResponse {
 	return resp
 }
 
+// aggregateCustomRoots 把「已添加的文件夹」**展开一层**作为首页。
+//
+// 为什么展开（用户要求）：早先首页把每个已添加的文件夹当成一个格子，还得再点一层
+// 才能看到内容。但用户添加的通常就是"图库根"，期望打开软件直接看到里面的分类文件夹
+// —— 与飞牛相册一致。所以首页 = 各已添加文件夹的**内容合并成一层**。
+//
+// 规则：
+//
+//	· 每个 root 用 listDir 读出内容，子目录与媒体文件一并并入首页；
+//	  隐藏目录（listDir 已跳）与系统目录（#recycle / @eaDir …）在这里再跳一次，
+//	  否则首页会冒出回收站格子；
+//	· 某个 root 展开后**什么都没有**（或读不出来）⇒ 回退显示它自己。
+//	  否则用户会以为"我添加的文件夹消失了"，也进不去确认它是空的；
+//	· 盘没挂载 / 目录被删 ⇒ 跳过（首页不该出现点不开的格子），
+//	  但配置仍然留着 —— 设置页会用 rootsInfo 标成「不存在」，挂回来自动恢复；
+//	· 同一个目录被重复配置、或多个 root 互相包含 ⇒ 按 path 去重；
+//	· 各 root 的内容合并后按**同一套排序规则**重排，否则会呈现"按文件夹分组"的观感
+//	  （A 的 2023、A 的 2024，然后 B 的 2023…），而不是真正的合并层。
+func aggregateCustomRoots(roots []string, sortBy string) *ListResponse {
+	resp := &ListResponse{Path: "/", Parent: "", Dirs: []DirEntry{}, Files: []FileItem{}}
+	sp := parseSort(sortBy)
+	seenDir := make(map[string]bool, 32)
+	seenFile := make(map[string]bool, 32)
+	seenRoot := make(map[string]bool, len(roots))
+
+	addSelf := func(r string, st os.FileInfo) {
+		key := strings.ToLower(filepath.Clean(r))
+		if seenDir[key] {
+			return
+		}
+		seenDir[key] = true
+		resp.Dirs = append(resp.Dirs, DirEntry{
+			Name:  filepath.Base(r),
+			Path:  r,
+			Size:  st.Size(),
+			Mtime: st.ModTime().UnixMilli(),
+		})
+	}
+
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		rkey := strings.ToLower(filepath.Clean(r))
+		if seenRoot[rkey] {
+			continue
+		}
+		seenRoot[rkey] = true
+
+		st, err := os.Stat(r)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		sub, lerr := listDir(r, sortBy)
+		if lerr != nil {
+			// 读不出来也让它能点进去看到底怎么了，而不是凭空消失
+			addSelf(r, st)
+			continue
+		}
+		added := 0
+		for _, d := range sub.Dirs {
+			if shouldHideOnRoot(d.Name) {
+				continue
+			}
+			k := strings.ToLower(filepath.Clean(d.Path))
+			if seenDir[k] {
+				continue
+			}
+			seenDir[k] = true
+			resp.Dirs = append(resp.Dirs, d)
+			added++
+		}
+		for _, f := range sub.Files {
+			k := strings.ToLower(filepath.Clean(f.Path))
+			if seenFile[k] {
+				continue
+			}
+			seenFile[k] = true
+			resp.Files = append(resp.Files, f)
+			added++
+		}
+		if added == 0 {
+			// 展开后是空的：显示它自己，否则用户找不到自己添加的文件夹
+			addSelf(r, st)
+		}
+	}
+
+	sort.SliceStable(resp.Dirs, func(i, j int) bool {
+		return resp.Dirs[i].sortKey().less(resp.Dirs[j].sortKey(), sp)
+	})
+	sort.SliceStable(resp.Files, func(i, j int) bool {
+		return resp.Files[i].sortKey().less(resp.Files[j].sortKey(), sp)
+	})
+	resp.Total = len(resp.Dirs) + len(resp.Files)
+	resp.Sort = sp.field
+	resp.SortDesc = sp.desc
+	return resp
+}
+
+// shouldHideOnRoot 首页展开时要不要跳过这个子目录。
+//
+// 只跳明确"不是用户内容"的：回收站、群晖缩略图目录、Windows 系统目录。
+// 隐藏目录（. 开头）listDir 已经跳过了，这里不重复判断。
+// 注意：这里只影响**首页**，点进 root 之后仍然照常能看到它们 ——
+// 用户真要去回收站翻东西时不该被挡住。
+func shouldHideOnRoot(name string) bool {
+	if name == "" || strings.HasPrefix(name, ".") {
+		return true
+	}
+	return coverSkipDirs[name]
+}
+
 func handleList(w http.ResponseWriter, r *http.Request) {
 	touchThumbActivity() // 用户正在浏览目录：后台预生成先让路
 	q := r.URL.Query()
@@ -118,7 +238,9 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, aggregateRoot(q.Get("sort")))
 		return
 	}
-	path, sc := resolveMediaPath(q.Get("path"))
+	// 外部打开（文件管理器双击）要能看同级：走 resolveMediaPathReq，
+	// 它是唯一知道"这次请求是不是宿主点名打开"的地方。
+	path, sc := resolveMediaPathReq(r, q.Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
 		return
@@ -258,7 +380,7 @@ func handleRaw(w http.ResponseWriter, r *http.Request) {
 	// 返回占位图（tryServeDeferredThumb），CPU 全部让给大图。
 	// /api/raw 自己走 scaledSem，与缩略图信号量相互独立，不会被这次暂停挡住。
 	noteForegroundPreview()
-	path, sc := resolveMediaPath(r.URL.Query().Get("path"))
+	path, sc := resolveMediaPathReq(r, r.URL.Query().Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
 		return
@@ -745,7 +867,7 @@ func serveScaledFile(w http.ResponseWriter, r *http.Request, out string, modTime
 
 func handleMeta(w http.ResponseWriter, r *http.Request) {
 	touchThumbActivity() // 用户正在浏览：后台预生成先让路
-	path, sc := resolveMediaPath(r.URL.Query().Get("path"))
+	path, sc := resolveMediaPathReq(r, r.URL.Query().Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
 		return

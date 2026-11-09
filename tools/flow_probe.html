@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>flow 探针</title>
+<!-- 直接复用真实样式，验证"无缝拼接/宽度约束"用的是线上那套 CSS -->
+<link rel="stylesheet" href="../src/web/style.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  #viewer { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<div id="viewer" class="viewer">
+  <div class="v-stage" id="vStage">
+    <div class="v-media-wrap" id="vMediaWrap"></div>
+    <div class="v-controls" id="vControls"></div>
+    <span class="v-counter-float" id="vCounterFloat"></span>
+  </div>
+</div>
+
+<script>
+  // 用 data: SVG 造"已知宽高比 + 纯色"的图：断言靠坐标，观感靠颜色（相邻两块颜色不同，
+  // 中间若有一条黑线就说明拼接有缝）。
+  // 每项自带 _wh，模拟后端的 /api/meta（只读文件头拿原始宽高）。
+  function mk(name, rw, rh, color) {
+    var w = 960, h = Math.round(960 * rh / rw);
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '">' +
+      '<rect width="100%" height="100%" fill="' + color + '"/>' +
+      '<text x="50%" y="50%" fill="#fff" font-size="80" font-family="sans-serif" ' +
+      'text-anchor="middle" dominant-baseline="middle">' + rw + ':' + rh + '</text></svg>';
+    return {
+      name: name, kind: 'image', mtime: 1,
+      path: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg),
+      _wh: [w, h]
+    };
+  }
+
+  var list = [
+    mk('p1', 3, 4, '#c0392b'),
+    mk('p2', 16, 9, '#27ae60'),
+    mk('p3', 1, 1, '#2980b9'),
+    mk('p4', 2, 3, '#8e44ad'),
+    mk('p5', 9, 16, '#d35400'),
+    mk('p6', 4, 3, '#16a085'),
+    mk('p7', 3, 4, '#7f8c8d'),
+    mk('p8', 3, 2, '#f39c12')
+  ];
+  // 前两张模拟"列表里已经带了尺寸"（视频就有），其余全部靠 ensureSize 异步补 —— 两条路都要验
+  list[0].w = list[0]._wh[0]; list[0].h = list[0]._wh[1];
+  list[1].w = list[1]._wh[0]; list[1].h = list[1]._wh[1];
+
+  // 探针用的 host：URL 就是 data URI 本身，其余照真实契约走
+  window.__mvFlowHost = {
+    rawURL: function (p) { return p; },
+    thumbURL: function (p) { return p; },
+    pickMaxdim: function () { return 2048; },
+    thumbSize: function () { return 320; },
+    // 模拟 /api/meta：异步回填原始宽高（真实环境是读文件头，几十毫秒）
+    ensureSize: function (item, cb) {
+      setTimeout(function () {
+        if (item && item._wh) { item.w = item._wh[0]; item.h = item._wh[1]; }
+        if (cb) cb();
+      }, 0);
+    }
+  };
+</script>
+<script src="../src/web/flow.js"></script>
+<script>
+  window.__probe = {
+    open: function (i) { return window.MVFlow.open(list, i || 0); },
+    metrics: function () {
+      var sc = document.querySelector('.vf-scroll');
+      if (!sc) return { error: 'no scroll' };
+      var els = [].slice.call(document.querySelectorAll('.vf-item'));
+      var rs = els.map(function (e) {
+        var r = e.getBoundingClientRect();
+        var im = e.querySelector('img.vf-full');
+        return { i: parseInt(e.dataset.i, 10), top: r.top, bottom: r.bottom, width: r.width, height: r.height,
+                 // 盒子比例 vs 图片自身比例：两者不等 = 图被裁/被拉伸（2.4.30 的回归点）
+                 boxRatio: r.height > 0 ? +(r.width / r.height).toFixed(4) : 0,
+                 imgRatio: (im && im.naturalWidth > 0) ? +(im.naturalWidth / im.naturalHeight).toFixed(4) : 0,
+                 fit: im ? getComputedStyle(im).objectFit : '' };
+      });
+      rs.sort(function (a, b) { return a.i - b.i; });
+      var gaps = [];
+      for (var k = 1; k < rs.length; k++) gaps.push(+(rs[k].top - rs[k - 1].bottom).toFixed(3));
+      return {
+        clientW: sc.clientWidth, scrollH: sc.scrollHeight,
+        vh: sc.clientHeight,
+        mounted: rs.length, indexes: rs.map(function (r) { return r.i; }),
+        widths: rs.map(function (r) { return +r.width.toFixed(2); }),
+        heights: rs.map(function (r) { return +r.height.toFixed(2); }),
+        boxRatios: rs.map(function (r) { return r.boxRatio; }),
+        imgRatios: rs.map(function (r) { return r.imgRatio; }),
+        fits: rs.map(function (r) { return r.fit; }),
+        gaps: gaps,
+        idx: window.MVFlow.index(),
+        targetTop: (function () {
+          var cur = window.MVFlow.index();
+          var t = document.querySelector('.vf-item[data-i="' + cur + '"]');
+          return t ? Math.round(t.getBoundingClientRect().top) : null;
+        })(),
+        // 2.4.44：当前张应该**居中**。正数 = 图中心偏下（px）。
+        // 首张/末张受几何限制只能贴边，所以断言里要按"能不能居中"分开判。
+        targetCenterOff: (function () {
+          var cur = window.MVFlow.index();
+          var t = document.querySelector('.vf-item[data-i="' + cur + '"]');
+          if (!t) return null;
+          var r = t.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+          return Math.round((r.top + r.height / 2) - (sr.top + sr.height / 2));
+        })(),
+        // 同上，给出"这张理论上能不能居中"（比视口矮才行）
+        targetCanCenter: (function () {
+          var cur = window.MVFlow.index();
+          var t = document.querySelector('.vf-item[data-i="' + cur + '"]');
+          if (!t) return false;
+          return t.getBoundingClientRect().height < sc.clientHeight - 1;
+        })(),
+        hud: (document.querySelector('.vf-count') || {}).textContent || '',
+        mountedSrcEmpty: els.filter(function (e) {
+          var im = e.querySelector('img.vf-full');
+          return im && !im.getAttribute('src');
+        }).length
+      };
+    },
+    scrollTo: function (y) {
+      var sc = document.querySelector('.vf-scroll');
+      sc.scrollTop = y;
+      return new Promise(function (res) {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { res(window.MVFlow.index()); });
+        });
+      });
+    },
+    // 2.4.41：close() 现在返回**被看那张的 path**（流内部会按当前排序重排，
+    //   原来的"下标进/下标出"已经不同一套坐标了）。探针仍按老口径回报下标。
+    close: function () {
+      var pth = window.MVFlow.close();
+      for (var i = 0; i < list.length; i++) { if (list[i].path === pth) return i; }
+      return -1;
+    },
+    totalHeight: function () {
+      var el = document.querySelector('.vf-scroll');
+      return el ? el.scrollHeight : -1;
+    }
+  };
+</script>
+</body>
+</html>

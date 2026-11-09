@@ -1644,7 +1644,7 @@ func handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	path, sc := resolveMediaPath(q.Get("path"))
+	path, sc := resolveMediaPathReq(r, q.Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
 		return
@@ -1712,9 +1712,39 @@ var placeholderThumbGIF = []byte{
 	0x00, 0x3B,
 }
 
+// clearShallowThumbFiles 只删 dir 目录下的**缩略图文件**（不进子目录）。
+//
+// 「重建按钮分流」（2.4.26）用：清当前层媒体文件的缩略图时绝不能递归 ——
+// 子目录的缩略图在 dir 的子目录里，留着它们，下层的内容一点不碰。
+// 缩略图目录/文件权限可能是 000（服务端生成时故意收紧），删之前先 chmod 放开。
+// 抽成纯函数（不碰 HTTP / 全局）是为了跨平台可测：Windows 上盘符冒号会让
+// filepath.Join(root, size, absRel) 折出非法路径，handler 层测不到删除效果。
+func clearShallowThumbFiles(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue // 子目录 = 下层内容的缩略图，不动
+		}
+		p := filepath.Join(dir, entry.Name())
+		if fi, err := os.Stat(p); err != nil || fi.IsDir() {
+			continue
+		}
+		_ = os.Chmod(p, 0o644)
+		if err := os.Remove(p); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // handleClearThumbCache 清除缩略图缓存。
-// POST /api/thumb/clear?path=<目录>  清除指定目录的缩略图（递归），并立即触发重新生成
-// POST /api/thumb/clear（无 path）  清除全部缩略图
+// POST /api/thumb/clear?path=<目录>            清除指定目录的缩略图（递归），并立即触发重新生成
+// POST /api/thumb/clear?path=<目录>&shallow=1  只清该目录**直接**媒体文件的缩略图（非递归，不碰下层）
+// POST /api/thumb/clear（无 path）             清除全部缩略图
 // 删除操作异步执行，立即返回响应，避免大目录 chmod+删除导致 HTTP 超时
 func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1726,6 +1756,9 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, map[string]any{"ok": false, "error": "thumb dir not set"})
 		return
 	}
+
+	// r 不能带进 goroutine（handler 返回后请求对象会被复用），先在外面取干净
+	shallow := r.URL.Query().Get("shallow") == "1"
 
 	targetPath := r.URL.Query().Get("path")
 	if targetPath != "" {
@@ -1806,6 +1839,13 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 			if !info.IsDir() {
 				continue
 			}
+			if shallow {
+				// 非递归：只删当前层的缩略图文件，子目录（下层内容）原样保留
+				n := clearShallowThumbFiles(dir)
+				deleted += int64(n)
+				log.Printf("clear(shallow): removed %d files under %s", n, dir)
+				continue
+			}
 			// 统计文件数
 			filepath.Walk(dir, func(_ string, fi os.FileInfo, err error) error {
 				if err == nil && !fi.IsDir() {
@@ -1836,6 +1876,16 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		log.Printf("clear: done, deleted %d files for %s", deleted, absPath)
+
+		// 该目录的文件夹封面也要跟着失效：否则「清缓存」后目录内容没变时，
+		// 服务端仍会复用旧封面（封面是"固定不重抽"的，只能靠这里主动删）。
+		// shallow 模式例外：只清了当前层缩略图，封面（独立 JPEG 缓存）完好无损，
+		// 用户"重建图片缩略图"也没要求动封面 —— 重抽一次白费 4 张缩略图。
+		if !shallow {
+			if dc := purgeDirCover(root, absPath); dc > 0 {
+				log.Printf("clear: removed %d dir covers for %s", dc, absPath)
+			}
+		}
 
 		// 清除后重建当前目录的缩略图（后台预生成关闭时这里一个都不投）
 		time.Sleep(200 * time.Millisecond)

@@ -92,28 +92,29 @@ console.log('OK');
 // Test2220SingleModeJudgeHasSingleSource 静态钉住两件事：
 //
 //	① 单图模式的判据**只有一处**（顶层按 URL 定）—— 两处写迟早分叉；
-//	② 它的定义必须**早于**守卫接线 —— 否则接线时读到 undefined，
-//	   单图窗口照样会把守卫压上（纯看条件表达式看不出来的时序缺陷）。
+//	② 它的定义必须**早于**历史接线 —— 否则接线时读到 undefined，
+//	   单图窗口照样会挂上 popstate（纯看条件表达式看不出来的时序缺陷）。
 func Test2220SingleModeJudgeHasSingleSource(t *testing.T) {
 	app := stripLineComments(mustReadWebFile(t, "app.js"))
 
 	if n := strings.Count(app, "var singleMode = false;"); n != 1 {
 		t.Errorf("`var singleMode = false;` 应恰好 1 处（顶层），实际 %d 处 —— "+
-			"守卫压不压完全取决于它，判据分两处写迟早会分叉", n)
+			"历史接线挂不挂完全取决于它，判据分两处写迟早会分叉", n)
 	}
 	if strings.Contains(app, "singleMode = true;") {
 		t.Error("还残留 `singleMode = true;` —— 单图模式的判据必须只有一处（顶层按 URL 定），" +
 			"boot() 里不该再赋值")
 	}
 
-	wiring := "if (PROFILE === 'touch' && !singleMode) mvGuardInit();"
+	// 2.4.40：守卫体系已删，唯一的历史接线变成查看器的 popstate 监听。
+	wiring := "if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);"
 	iDef := strings.Index(app, "var singleMode = false;")
 	iWire := strings.Index(app, wiring)
 	if iDef < 0 || iWire < 0 {
-		t.Fatalf("找不到判据定义或守卫接线（iDef=%d iWire=%d）", iDef, iWire)
+		t.Fatalf("找不到判据定义或历史接线（iDef=%d iWire=%d）", iDef, iWire)
 	}
 	if iDef > iWire {
-		t.Error("★ `singleMode` 的定义必须**早于**守卫接线 —— 否则接线时读到的是 undefined，" +
-			"单图窗口照样会压上守卫（时序缺陷，光看条件表达式看不出来）")
+		t.Error("★ `singleMode` 的定义必须**早于**历史接线 —— 否则接线时读到的是 undefined，" +
+			"单图窗口照样会挂上 popstate（时序缺陷，光看条件表达式看不出来）")
 	}
 }

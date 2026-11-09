@@ -14,13 +14,18 @@
   function bumpThumbCacheBust() {
     thumbCacheBust++;
     try { localStorage.setItem('mediaview_thumb_bust', String(thumbCacheBust)); } catch (e) {}
+    // 换 URL ⇒ 封面会重新合成（缝色/画质/尺寸都可能变），灰度结论也一并作废
+    coverToneCache = {};
+    // 2.4.35：跨会话的"加载过"记录同理作废 —— 否则清缓存后仍会直接给旧 URL 的 src
+    coverSeen = {}; coverSeenOrder = [];
+    try { localStorage.removeItem('mediaview_cover_seen'); } catch (e) {}
   }
   function thumbURL(p, size, mtime) {
     // 带上画质：服务端的缓存标识含画质（改画质会重新生成），URL 也必须跟着变，
     // 否则浏览器会继续用 immutable(一年) 的旧图，用户以为设置没生效。
     return API + '/thumb?path=' + enc(p) + '&size=' + (size || 320) +
       '&q=' + (cfg.thumbQuality || 80) +
-      '&_t=' + (mtime || 0) + '&_v=' + thumbCacheBust;
+      '&_t=' + (mtime || 0) + '&_v=' + thumbCacheBust + externalTag();
   }
   // A7：带原图版本号（mtime）→ 服务端才能用长缓存。
   // 没有版本号时只能用 no-cache（否则覆盖同名文件后浏览器 24h 内仍取旧图）；
@@ -36,7 +41,22 @@
     // `Cache-Control: immutable, max-age=1年`，若 URL 不变，用户改了
     // 「大图画质 / lowres 档位」后浏览器根本不会重取，改了等于没改。
     url += '&s=' + rawSettingsTag();
-    return url;
+    return url + externalTag();
+  }
+  // 2.4.42：**外部打开**（飞牛文件管理器双击 → 打开方式 → 本应用）的标记。
+  //
+  // 「只显示我添加的文件夹」约束的是**本应用自己的浏览范围**（首页 / 网格 / 面包屑）。
+  // 宿主把某个文件点名交给我们打开时，用户并没有在应用里浏览 —— 那是一次
+  // **单文件级、明确的**指令。若仍按可见范围卡它，表现就是"文件管理器里除了
+  // 我添加的那几个文件夹，别的目录双击图片/视频都打不开"。
+  //
+  // 服务端见到 external=1 只**少收那一层**：存储空间白名单、绝对路径、链接解析
+  // 复检全都还在（见 config.go 的 resolveMediaPathReq）。
+  // 只有单文件模式会带它 —— 网格/首页的请求永远不带，所以可见范围本身没变。
+  function externalTag() {
+    // 顶层 `var singleMode` 在 IIFE 执行时就已经定好（早于任何 URL 构造），
+    // 这里的 typeof 只是为了在"函数被单独抠出去跑"的测试环境里不炸。
+    return (typeof singleMode !== 'undefined' && singleMode) ? '&external=1' : '';
   }
   // 影响 /api/raw 产物的设置指纹（值变了 URL 就变 → 浏览器重新取）
   function rawSettingsTag() {
@@ -44,7 +64,195 @@
   }
   function enc(s) { return encodeURIComponent(s); }
 
-  function metaURL(p) { return API + '/meta?path=' + enc(p); }
+  // 本次会话里「已经加载过封面」的目录（key = dir|mtime）。
+  // 用途：再次进入同一目录时直接给 src（浏览器缓存必命中），跳过淡入 —— 否则
+  // 每次进/退目录，封面都要从 📁 重新淡入一遍，视觉上就是用户说的"闪一下"。
+  var coverDidLoad = {};
+  // 2.4.35：跨会话记住"这个封面曾经正常加载过"（key = path|mtime，与 coverDidLoad 同一套）。
+  //
+  // 为什么必须持久化：冷启动（重开应用 / 宿主把页面重载）时 coverDidLoad 是空的，
+  // 于是每个文件夹封面都要重新排一次并发队列（同时只放 4 个）—— 屏幕上就是
+  // "📁 → 一张张慢慢冒出来"，也就是用户说的"封面滑动加载闪烁"。
+  // 记住之后，首屏直接给 src：命中浏览器 HTTP 缓存时 1~2 帧就出图，
+  // 既不排队、也不露 📁。key 里带 mtime ⇒ 目录内容一变（封面会重合成）自然失效。
+  var coverSeen = {};        // ckey -> 1
+  var coverSeenOrder = [];   // 插入顺序（超上限时从最老的丢）
+  var COVER_SEEN_MAX = 600;
+  try {
+    var _cs = JSON.parse(localStorage.getItem('mediaview_cover_seen') || 'null');
+    if (_cs && _cs.order && _cs.order.length) {
+      coverSeenOrder = _cs.order.slice(-COVER_SEEN_MAX);
+      for (var _i = 0; _i < coverSeenOrder.length; _i++) coverSeen[coverSeenOrder[_i]] = 1;
+    }
+  } catch (e) { coverSeen = {}; coverSeenOrder = []; }
+
+  var coverSeenTimer = 0;
+  function noteCoverSeen(ckey) {
+    if (!ckey || coverSeen[ckey]) return;
+    coverSeen[ckey] = 1;
+    coverSeenOrder.push(ckey);
+    while (coverSeenOrder.length > COVER_SEEN_MAX) {
+      var drop = coverSeenOrder.shift();
+      if (drop) delete coverSeen[drop];
+    }
+    // 合并写：一屏二十个封面只落一次盘，别每张图都碰 localStorage
+    if (coverSeenTimer) return;
+    coverSeenTimer = setTimeout(function () {
+      coverSeenTimer = 0;
+      try { localStorage.setItem('mediaview_cover_seen', JSON.stringify({ order: coverSeenOrder })); } catch (e) {}
+    }, 800);
+  }
+
+  // ---------- 2.4.38：封面主色占位 ----------
+  //
+  // 第一次进某个目录、封面还没在 HTTP 缓存里时，格子只能露出「📁 + 名称」，
+  // 一屏二十个 📁 然后挨个被封面替换 —— 这就是用户说的"打开文件夹闪封面"。
+  // 解决不是让封面更快，而是**先给每个格子一个接近封面的颜色**：
+  // 上次封面解码后取一张 12×8 的平均色存下来，下次进目录立刻铺在格子底下，
+  // 封面到位时只做一次很短的淡入 —— 视觉上是"暗块慢慢变清晰"，而不是"📁 墙集体跳出"。
+  //
+  // 只存颜色字符串（一个格子约 40 字节），上限 500 个 ≈ 20KB，和 cover_seen 同一套 LRU。
+  var coverColorCache = {};   // ckey -> 'rgb(r,g,b)'
+  var coverColorOrder = [];
+  var COVER_COLOR_MAX = 500;
+  try {
+    var _cc = JSON.parse(localStorage.getItem('mediaview_cover_color') || 'null');
+    if (_cc && _cc.order && _cc.m) {
+      coverColorOrder = _cc.order.slice(-COVER_COLOR_MAX);
+      for (var _ci = 0; _ci < coverColorOrder.length; _ci++) {
+        if (_cc.m[coverColorOrder[_ci]]) coverColorCache[coverColorOrder[_ci]] = _cc.m[coverColorOrder[_ci]];
+      }
+    }
+  } catch (e) { coverColorCache = {}; coverColorOrder = []; }
+  var coverColorTimer = 0;
+  function noteCoverColor(ckey, color) {
+    if (!ckey || !color) return;
+    if (coverColorCache[ckey] === color) return;
+    if (!coverColorCache[ckey]) coverColorOrder.push(ckey);
+    coverColorCache[ckey] = color;
+    while (coverColorOrder.length > COVER_COLOR_MAX) {
+      var drop = coverColorOrder.shift();
+      if (drop) delete coverColorCache[drop];
+    }
+    if (coverColorTimer) return;
+    coverColorTimer = setTimeout(function () {
+      coverColorTimer = 0;
+      try {
+        var m = {};
+        for (var i = 0; i < coverColorOrder.length; i++) {
+          var k = coverColorOrder[i];
+          if (coverColorCache[k]) m[k] = coverColorCache[k];
+        }
+        localStorage.setItem('mediaview_cover_color', JSON.stringify({ order: coverColorOrder, m: m }));
+      } catch (e) { /* 满/被禁：只是丢占位，不影响正确性 */ }
+    }, 800);
+  }
+  // 取整张封面的平均色（不是底部 30% —— 占位块是整格铺底，要的是整体印象）。
+  function sampleCoverColor(img) {
+    try {
+      var cv = document.createElement('canvas');
+      cv.width = 12; cv.height = 8;
+      var cx = cv.getContext('2d');
+      if (!cx) return '';
+      var iw = img.naturalWidth || img.width;
+      var ih = img.naturalHeight || img.height;
+      if (!iw || !ih) return '';
+      cx.drawImage(img, 0, 0, iw, ih, 0, 0, 12, 8);
+      var d = cx.getImageData(0, 0, 12, 8).data;
+      var r = 0, g = 0, b = 0, n = 0;
+      for (var i = 0; i < d.length; i += 4) {
+        if (!d[i + 3]) continue;   // 透明像素不参与（否则会被拉黑）
+        r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+      }
+      if (!n) return '';
+      return 'rgb(' + Math.round(r / n) + ',' + Math.round(g / n) + ',' + Math.round(b / n) + ')';
+    } catch (e) { return ''; }
+  }
+
+  // ---------- 封面名称配色的灰度自适应（2.4.20）----------
+  //
+  // 名称压在封面底部的一条**半透明**蒙层上（图片会透出来），所以文字颜色不能写死：
+  //   图偏暗 ⇒ 白字 + 深色蒙层；图偏亮 ⇒ 黑字 + 浅色蒙层。
+  //
+  // 判据取「文字背后那一块图」（底部 30%）的平均灰度，不是整张图：
+  // "上半是天空、下半是剪影"这类构图，用整张的平均会把颜色选反。
+  var coverToneCache = {};   // key 与 coverDidLoad 同一套（dir|mtime）
+
+  // pickCoverTone 决定用哪套配色。
+  //   'bright' ⇒ 图偏亮 ⇒ 黑字 + **不铺底**（只靠白色柔光托起来）
+  //   'dark'   ⇒ 图偏暗 ⇒ 白字 + 深色半透明渐变
+  //
+  // 为什么门槛是 190 而不是 140：亮图那套没有底色、只靠柔光 —— 门槛必须"真的够亮"，
+  // 否则中间偏亮的封面上黑字会发虚。140~190 这段继续走白字+深条（用户认可的观感）。
+  //
+  // 为什么还要看 minCol（底部 24 列里最暗那一列的均值）：黑字没有底色可依，
+  // "整体很亮、但文字压着的某一段是深色细节"（浅色海滩上的礁石、白云缝里的山脊）
+  // 会直接糊掉。取最暗那一列兜底 —— 只要有一小段不够亮，就退回白字+深条。
+  // 单参数调用时把 minCol 视作 mean（等价于只看整体亮度）。
+  function pickCoverTone(mean, minCol) {
+    if (minCol == null) minCol = mean;
+    // 取整再比：Rec.601 的三个权重相加在浮点里是 0.9999999999999999，
+    // 纯灰 190 会算成 189.99999…，卡在阈值上被判成"暗" —— 边界值必须稳定。
+    return (Math.round(mean) >= 190 && Math.round(minCol) >= 150) ? 'bright' : 'dark';
+  }
+
+  // sampleCoverTone 把封面底部 30% 画到一张 24×8 的小画布上取平均灰度。
+  // 任何一步失败都返回 ''（调用方保持 CSS 默认的"深色蒙层 + 白字"），
+  // 绝不能让"算不出来"变成"文字看不见"。
+  function sampleCoverTone(img) {
+    try {
+      var cv = document.createElement('canvas');
+      cv.width = 24; cv.height = 8;
+      var cx = cv.getContext('2d');
+      if (!cx) return '';                      // 没有 canvas（极老浏览器 / jsdom）
+      var iw = img.naturalWidth || img.width;
+      var ih = img.naturalHeight || img.height;
+      if (!iw || !ih) return '';
+      var sh = Math.max(1, Math.round(ih * 0.3));   // 只取底部 30%
+      cx.drawImage(img, 0, ih - sh, iw, sh, 0, 0, 24, 8);
+      // 画布是 24 列 × 8 行（getImageData 是**行优先**：offset = (y*24+x)*4）。
+      // 既算整体均值，也算"每一列均值"里最暗的那一列 —— 名称横着铺满一行，
+      // 最暗的那一列才是真正的短板（见 pickCoverTone 的说明）。
+      var d = cx.getImageData(0, 0, 24, 8).data;
+      var W = 24, H = 8, sum = 0, n = 0, minCol = 999;
+      for (var x = 0; x < W; x++) {
+        var colSum = 0;
+        for (var y = 0; y < H; y++) {
+          var o = (y * W + x) * 4;
+          // Rec.601 亮度权重：直接用 RGB 算术平均会把纯红/纯蓝判反
+          var lum = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+          colSum += lum; sum += lum; n++;
+        }
+        if (colSum / H < minCol) minCol = colSum / H;
+      }
+      if (!n) return '';
+      return pickCoverTone(sum / n, minCol);
+    } catch (e) {
+      return '';   // 画布被污染（跨域图）等：静默降级
+    }
+  }
+
+  // applyCoverTone 给封面加 .mv-tone-bright / .mv-tone-dark，配色全交给 CSS。
+  // img 传 null 表示"只查缓存"：封面本身已在浏览器缓存里，不必再画一次。
+  function applyCoverTone(cover, ckey, img) {
+    var tone = coverToneCache[ckey];
+    if (!tone && img) {
+      tone = sampleCoverTone(img);
+      if (tone) coverToneCache[ckey] = tone;
+    }
+    if (!tone) return;
+    cover.classList.remove('mv-tone-bright', 'mv-tone-dark');
+    cover.classList.add('mv-tone-' + tone);
+  }
+
+  // 文件夹封面 URL：与 thumbURL 同构（含 _t/_v），清缓存/换目录都跟着失效。
+  // 缝色是服务端固定色（2.4.26 起），与主题、请求参数无关 —— 缓存键只含 path/size。
+  function coverURL(p, size, mtime) {
+    return API + '/dircov?path=' + enc(p) + '&size=' + (size || 320) +
+      '&_t=' + (mtime || 0) + '&_v=' + thumbCacheBust;
+  }
+
+  function metaURL(p) { return API + '/meta?path=' + enc(p) + externalTag(); }
 
   // 预取「原图尺寸」——这是 1:1 能否一次算到位的前提。
   //
@@ -56,8 +264,16 @@
   //     等原图进来再重算一次 → 视觉上的「二次放大」。
   // 所以在**打开/切换图片时**就把尺寸问回来（后端只读文件头，很便宜），
   // 用户看图这几秒足够返回，点 1:1 时 item.w 已经在了 → 一次算到位、锁死、不再重算。
-  function ensureItemSize(item) {
-    if (!item || item.w || item._szPending) return;
+  // 2.4.30：加可选回调（cb）—— 竖图流要拿这个尺寸当"不等图片到达就能算高度"的依据。
+  // 之前只有大图查看器用（它自己轮询 item.w），所以没有回调需求；
+  // 现在 flow 也走同一条 /api/meta，**不许**再像 2.4.29 那样拿缩略图当"比例探针"
+  // （那是另起一套取图，用户明确否掉了）。
+  // 同一个 item 上多个调用方：已在途就挂到 _szCbs 上，回来一起通知。
+  function ensureItemSize(item, cb) {
+    if (!item) return;
+    if (item.w && item.h) { if (cb) { try { cb(); } catch (e) {} } return; }
+    if (cb) { (item._szCbs || (item._szCbs = [])).push(cb); }
+    if (item._szPending) return;
     item._szPending = true;
     fetch(metaURL(item.path)).then(function (r) { return r.json(); }).then(function (mm) {
       var w = mm && (mm.w || mm.width);
@@ -72,7 +288,12 @@
           applyTransform();
         }
       }
-    }).catch(function () {}).then(function () { item._szPending = false; });
+    }).catch(function () {}).then(function () {
+      item._szPending = false;
+      var cbs = item._szCbs || [];
+      item._szCbs = null;
+      for (var i = 0; i < cbs.length; i++) { try { cbs[i](); } catch (e) {} }
+    });
   }
 
   // 浏览用的预缩预算。不能写死常量：写死 2048 只对视口长边 × dpr ≤ 2048 的屏幕刚好，
@@ -104,6 +325,16 @@
   // 默认"开"，与后端默认一致；加载失败也保持开，避免误伤原有体验。
   var cfg = {
     thumbEnabled: true,
+    coverEnabled: true,
+    // 2.4.29：手机端默认走「竖图连续浏览」（用户拍板）。桌面档不看这个开关。
+    mobileFlowView: true,
+    // 2.4.35：手机端换目录默认走**内部切换**（零重载）。关掉则退回整页导航。
+    // 2.4.20：默认（关）⇒ 名称压在封面底部，默认按"图偏暗"配色，等 onload 再按灰度纠正
+    coverNameBelow: false,
+    // 2.4.16：只显示用户添加的文件夹（范围判定在服务端生效，这里只驱动界面）
+    onlyRoots: false,
+    roots: [],
+    rootsInfo: [],
     thumbDir: '',
     thumbSize: 320,
     thumbQuality: 80,
@@ -287,7 +518,7 @@
     root: false,
   };
   var cellPool = {};   // data-idx -> element
-  var rafPending = false;
+  var rafId = 0;       // 已排队的那一帧（滚动/缩放时的渲染合并）
 
   // ================= 输入能力分档（INPUT PROFILE）=================
   // 目的：手机上的手势增强**只对触屏生效**，桌面（鼠标）路径一行行为都不变。
@@ -318,6 +549,40 @@
     touchScript.src = 'touch.js?v=__MV_VERSION__';
     touchScript.defer = true;
     document.head.appendChild(touchScript);
+    // 2.4.29：竖图连续浏览模块，同样只在触屏档加载（桌面连字节都不下）。
+    var flowScript = document.createElement('script');
+    flowScript.src = 'flow.js?v=__MV_VERSION__';
+    flowScript.defer = true;
+    document.head.appendChild(flowScript);
+
+    // 2.4.29：flow 模块的 host 契约。
+    // 只给"取值"和"回网格定位"两件事，不把 v / track / swipe 这些内部状态交出去 ——
+    // flow.js 因此可以完全不依赖本文件的实现细节（另起炉灶的前提）。
+    // URL 构造复用同一套函数 ⇒ 画质/清晰度/lowres/缩略图尺寸这些设置自动跟着走，
+    // 不会出现"大图按设置、流按另一套"的分裂。
+    window.__mvFlowHost = {
+      rawURL: function (p, maxdim, mtime) { return rawURL(p, maxdim, mtime); },
+      // thumbURL 只给**视频封面帧**用（视频没有静态大图可取）；
+      // 图片一律不许走它 —— 见 flow.js 里"图片分支只用 rawURL"的说明。
+      thumbURL: function (p, size, mtime) { return thumbURL(p, size, mtime); },
+      pickMaxdim: function () { return pickMaxdim(); },
+      thumbSize: function () { return cfg.thumbSize || 320; },
+      // 2.4.30：宽高走 /api/meta，与大图查看器**同一个函数**（ensureItemSize）。
+      // 这样"比例"不再依赖缩略图，画质/解码也全是大图那一条链路。
+      ensureSize: function (item, cb) { ensureItemSize(item, cb); },
+      toast: function (m) { try { toast(m); } catch (e) {} },
+      gridFocus: function (idx) { try { scrollToItem(idx, true); } catch (e) {} },
+      // 2.4.41：竖图流打开时**自己按当前规则排一遍** —— 它拿到的数组可能来自
+      //   旧排序的 state.items 或旧快照（见 resortLikeFnOs 的说明）。
+      //   比较器只此一份，流里不重复实现。
+      sortList: function (list, sort) { return resortLikeFnOs(list, sort); },
+      // "当前规则"直接取 state.sort —— 它就是工具栏上的值，也正是网格这次请求实际用的值
+      //   （网格档 resolveSortForDir 恒返回 state.sort）。
+      //   不用 state.currentSort：那是"上一次请求的产物"，语义上绕了一层，
+      //   而且列表还在飞的时候它代表的是**旧**请求。
+      currentSort: function () { return state.sort; }
+    };
+    try { window.dispatchEvent(new Event('mv-flow-host')); } catch (e) {}
   }
 
   // ---------- Sort helpers ----------
@@ -389,29 +654,61 @@
 
   // 按飞牛规则重排一份列表（元素需带 name 字段）。sort 形如 'name:asc'/'type:desc'。
   // 同键时保持传入顺序（后端给的就是飞牛在字段相等时用的物理顺序）。
+  // 按飞牛规则重排 —— **全项目唯一的比较器**（5 个字段 × 升降序，2.4.41）。
+  //
+  // 为什么前端还要有一份（后端 /api/list 已经按同一规则排好了）：
+  //   因为前端经常会拿到一份**顺序不可信**的数组 —— 竖图流打开时用的就是
+  //   `state.items`，而它可能是"改排序之前的"（列表还没回来）或"快照里的旧顺序"
+  //   （手机换目录是整页导航，快照先铺）。只有"能按规则再排一遍"才治得住这两种窗口。
+  //
+  // 语义必须与后端 sortKey.less() 对齐：
+  //   · name / type 走 ICU（zh + numeric，见 zhCollator）；
+  //   · size / mtime / btime 是数值差；
+  //   · 同键**保持原顺序**（稳定），与后端的 sort.SliceStable 一致 ——
+  //     这里**不加**名称兜底：加了会让网格与竖图流从同一个起点排出两个顺序。
   function resortLikeFnOs(list, sort) {
     if (!list || list.length < 2) return list;
     var p = sortParts(sort || '');
-    if (p.field !== 'name' && p.field !== 'type') return list;
-    var col = zhCollator();
-    if (!col) return list; // 环境不支持 Intl → 保留后端顺序，别乱动
     var sign = p.desc ? -1 : 1;
-    var keyOf;
-    if (p.field === 'type') {
-      keyOf = function (x) {
-        var n = String((x && x.name) || '');
-        var i = n.lastIndexOf('.');
-        return i > 0 ? n.slice(i + 1).toLowerCase() : '';
-      };
+    var field = p.field;
+    var col = null, keyOf;
+    if (field === 'name' || field === 'type') {
+      col = zhCollator();
+      if (!col) return list; // 环境不支持 Intl → 保留后端顺序，别乱动
+      if (field === 'type') {
+        keyOf = function (x) {
+          var n = String((x && x.name) || '');
+          var i = n.lastIndexOf('.');
+          return i > 0 ? n.slice(i + 1).toLowerCase() : '';
+        };
+      } else {
+        keyOf = function (x) { return String((x && x.name) || ''); };
+      }
+    } else if (field === 'size' || field === 'mtime' || field === 'btime') {
+      // btime 是"按创建时间排序时才去 statx 取一次"的（后端 scanner.go 的 needBtime）。
+      // 所以「刚改成按创建时间、列表还没回来」时，手上这份列表多数项没有 btime：
+      // 全当 0 排会变成一坨乱序，比"暂时保持旧序"更难看 ⇒ 有效值不足一半就跳过，
+      // 等真实的列表回来自然会排对（不为这一下多打一个请求）。
+      if (field === 'btime') {
+        var valid = 0;
+        for (var q = 0; q < list.length; q++) if ((list[q] && list[q].btime) > 0) valid++;
+        if (valid * 2 < list.length) return list;
+      }
+      keyOf = (function (f) { return function (x) { return Number((x && x[f]) || 0); }; })(field);
     } else {
-      keyOf = function (x) { return String((x && x.name) || ''); };
+      return list;
     }
     var idx = new Array(list.length);
     for (var i = 0; i < list.length; i++) idx[i] = i;
     idx.sort(function (a, b) {
-      var c = col.compare(keyOf(list[a]), keyOf(list[b]));
-      if (c !== 0) return c * sign;
-      return a - b; // 稳定：同键保持后端给的物理顺序
+      if (col) {
+        var c = col.compare(keyOf(list[a]), keyOf(list[b]));
+        if (c !== 0) return c * sign;
+      } else {
+        var d = keyOf(list[a]) - keyOf(list[b]);
+        if (d !== 0) return d * sign;
+      }
+      return a - b; // 稳定：同键保持原顺序
     });
     var out = new Array(list.length);
     for (var k = 0; k < list.length; k++) out[k] = list[idx[k]];
@@ -570,10 +867,58 @@
     return h > 0 ? h + ':' + p(m) + ':' + p(s) : m + ':' + p(s);
   }
 
+  // ---------- 加载指示器（延迟显示，消除"转圈闪一下"）----------
+  //
+  // 2.4.15：进/退目录时转圈只闪一下 —— 因为本地 list 请求常在 100ms 内返回，
+  // 指示器"显示→立即隐藏"在视觉上就是一次闪烁。改成**超过 180ms 才显示**：
+  // 快请求根本看不到转圈；真卡住时仍然会显示，用户照样知道在等。
+  var loadingTimer = null;
+  function showLoadingSoon() {
+    if (loadingTimer) clearTimeout(loadingTimer);
+    // 2.4.31：180 → 400ms。NAS 上「进/退目录」常在 200~350ms 返回，180ms 的阈值
+    //   会让转圈**闪一下又消失**（比不显示更烦）。400ms 之后才算"真的慢"。
+    loadingTimer = setTimeout(function () {
+      loadingTimer = null;
+      loadingEl.classList.remove('hidden');
+    }, 400);
+  }
+  function hideLoadingNow() {
+    if (loadingTimer) { clearTimeout(loadingTimer); loadingTimer = null; }
+    loadingEl.classList.add('hidden');
+  }
+
+  // 首页空状态要说清"为什么空"：开了「只显示我添加的文件夹」却一个都没加（或都不可用）时，
+  // 如果只显示通用的"此文件夹没有图片或视频"，用户根本不知道该去设置里处理 ——
+  // 会以为应用坏了。
+  function applyRootEmptyHint() {
+    if (!state.root || !cfg.onlyRoots || state.items.length > 0) return;
+    if (!(cfg.roots || []).length) {
+      emptyText.innerHTML = '还没有添加任何文件夹。<br>请到设置 →「只显示我添加的文件夹」里添加。';
+    } else {
+      emptyText.innerHTML = '已添加的文件夹当前都不可用（磁盘未挂载或被删除）。<br>请到设置里检查这份列表。';
+    }
+  }
+
   // ---------- Root (storage spaces) ----------
   function buildRoot() {
     state.root = true; state.path = null;
-    loadingEl.classList.remove('hidden');
+    showLoadingSoon();
+    // 2.4.40：根层也走**快照先行**。
+    //   从第一层文件夹按返回，落到的就是这一页 —— 它是返回路径上最常出现的页面，
+    //   "等 /api/list 才出内容"就是用户看到的那一下加载。快照命中就直接铺，
+    //   接口回来一致则一个字节都不改。
+    var snap = loadSnap('/', state.sort);
+    var snapApplied = false;
+    if (snap && !sameItems(state.items, snap.items)) {
+      state.items = snap.items;
+      state.files = snap.files || [];
+      renderCrumb();
+      applyItems(null, snap.top || 0);
+      snapApplied = true;
+      hideLoadingNow();
+    } else if (snap) {
+      hideLoadingNow();
+    }
     // 一次拿到真实盘位列表：原来是硬编码 /vol1..10（盘位更多的机器看不到后面的存储空间），
     // 而且每一轮还先发一个返回值完全没用的 /api/health —— 首屏白白多打 10 个请求。
         // 2.4.0：首页 = **聚合文件夹层**（所有存储空间用户目录下的文件夹合并成一层）。
@@ -582,24 +927,41 @@
     //   `?path=/` 是后端约定的"聚合根"，返回的每条 dirs 都带**真实绝对路径**，
     //   所以点进去走的还是原来的目录逻辑，前端无需额外状态。
     fetchJSON(API + '/list?path=' + enc('/') + '&sort=' + enc(state.sort)).then(function (d) {
-      loadingEl.classList.add('hidden');
+      hideLoadingNow();
       // ⚠️ 必须**转成 {kind:'dir'}**：后端返回的是 DirEntry（只有 name/path/size/mtime），
       //   而渲染靠 `item.kind === 'dir'` 决定"画文件夹图标"还是"去取缩略图"。
       //   少了这一步，首页的文件夹会被当成文件渲染（格子空白、还白跑缩略图请求）。
       //   loadDir 里一直有这一步，首页聚合时漏了 —— 真 Edge 实测抓出来的。
-      state.items = ((d && d.dirs) || []).map(function (x) {
+      var rootDirs = ((d && d.dirs) || []).map(function (x) {
         return { kind: 'dir', name: x.name, path: x.path };
       });
-      state.files = [];
+      // 2.4.18：首页也要接住 files，并且和 loadDir 一样用同一套排序。
+      //   展开一层后，已添加文件夹里的**散图**会随 dirs 一起返回：
+      //     · 显示由 state.items 负责（dirs + files 都在里面）；
+      //     · state.files 是"这个目录的文件集合"，供后台预生成与
+      //       设置页的「立即生成本目录缩略图」使用。
+      //   两处都要填，否则首页的散图不会被预生成（第一次翻到时才现做，慢一拍）。
+      var rootFiles = (d && d.files) || [];
+      var rootSort = (d && d.sort) || state.sort;
+      rootDirs = resortLikeFnOs(rootDirs, rootSort);
+      rootFiles = resortLikeFnOs(rootFiles, rootSort);
+      var nextItems = rootDirs.concat(rootFiles);
+      var unchanged = sameItems(state.items, nextItems);
+      var keepTop = snapApplied ? scroller.scrollTop : 0;
+      state.items = nextItems;
+      state.files = rootFiles;
+      saveSnap('/', nextItems, rootFiles, keepTop, rootSort);
       renderCrumb();
-      layout();
+      if (!unchanged) applyItems(null, keepTop);
+      applyRootEmptyHint();      // 2.4.16：首页空状态要说清"为什么空"
       syncExitTips();            // 2.4.0：到根层 ⇒ 挂上"是否退出"的确认
     }).catch(function () {
-      loadingEl.classList.add('hidden');
+      hideLoadingNow();
       state.items = [];
       state.files = [];
       renderCrumb();
       layout();
+      applyRootEmptyHint();
     });
   }
 
@@ -607,88 +969,179 @@
   // 目录加载序号：快速连点两个目录时先发的请求可能后返回 ——
   // 没有这个守卫就会出现「面包屑是后点的目录、网格却是先点目录的内容」。
   var loadSeq = 0;
-  // ── 2.3.1：触屏档的"换目录"走**真 URL 导航**（从 2.1.12 移植） ──────────────
+  // ---------- 换目录：真页面导航 ----------
   //
-  // 为什么（2.1.x 线的实测结论）：
-  //   · 宿主的**页面栈只有一层** —— 它看不见我们内部的目录切换，
-  //     也**不感知我们的 pushState**（2.1.9-probe：hist 涨到 11，手感毫无改善）；
-  //   · 于是网格里"回上一层"在宿主看来就是"离开应用" ⇒ 容易直接退出；
-  //   · 让"进目录"变成**真的页面导航**，宿主才会跟着记账，返回手势就变成"退回上一页"。
+  // 每一层目录都是一个**真实的页面条目**（`?dir=<绝对路径>`），由浏览器/宿主自己记账。
+  // 于是"返回"只有一种语义：回到上一层那个页面 —— 不需要在历史里布置守卫，
+  // 也不需要猜宿主一次手势到底退了几格。这是最朴素、也最难出错的方案。
   //
-  // ⚠️ 参数名必须是 `dir`：`?path=` 已被"单文件模式"占用
-  //    （boot 里 var single = qs.get('path') 会把目录当成文件去 openSingle）。
-  // ⚠️ 代价：进目录会重新加载页面（约 0.5~2 秒）。所以**只对触屏档**启用；
-  //    桌面档（PROFILE==='mouse'）保持原来的内部切换，一点变化都没有。
+  // 代价只有一条：每次换目录都是一次文档加载，首屏本来要等 /api/list。
+  // 对策是**目录快照**（见下面 2.4.31 那段）：离开前把 items 与滚动位置写进
+  // sessionStorage，新页面 boot 时**不等任何接口**先把画面铺出来，真实列表回来
+  // 一致就一个字节都不改 —— 这就是"返回不闪"的全部机制。
+  //
+  // ⚠️ 参数名必须是 `dir`：`?path=` 已被"单文件模式"占用。
   function navigateTo(path) {
-    if (PROFILE === 'touch') {
-      try {
-        // 2.4.1：用 **replace** 而不是 href —— href 每进一层都往历史里压一条真实 URL，
-        //   而守卫条目删不掉已有条目，于是"退到聚合根后继续返回"会恢复旧的
-        //   /vol{n}/1000/xxx 整页（用户实测："到聚合根还应该停止，现在还能退回去"）。
-        //   replace 替换当前条目 ⇒ 整个会话始终只有「1 条页面 + 1 条守卫」，
-        //   返回完全由守卫 + mvOnPop 接管，历史不再累积。
-        location.replace(GW + '/?dir=' + encodeURIComponent(path));
-        return;
-      } catch (e) { /* 极端环境导航失败 ⇒ 退化成内部切换，不能卡住用户 */ }
-    }
-    loadDir(path);
+    rememberScroll();   // 离开前记住"看到第几屏"，返回时停在原处
+    location.href = GW + '/?dir=' + encodeURIComponent(path);
   }
 
-  // 回"存储空间列表"（最上层）。必须显式带 ?dir=/，
-  // 否则 boot 会走 last 分支、从 localStorage 跳回上次访问的目录。
+  // 回"存储空间列表"（最上层）。显式带 ?dir=/ —— 否则 boot 会把它当成
+  // "没有指定目录"而走到首页逻辑（那里可能又落回上次目录）。
   function navigateRoot() {
-    if (PROFILE === 'touch') {
-      try {
-        location.replace(GW + '/?dir=/');   // 2.4.1：同 navigateTo，不压历史
+    rememberScroll();
+    location.href = GW + '/?dir=/';
+  }
+
+  // ---------- 2.4.31：目录快照（跨页秒开 / 来回切目录不闪）----------
+  //
+  // 问题：换目录是**整页导航**（见 navigateTo 的说明 —— 那是让宿主/浏览器自己记账、
+  //   返回能逐层退的代价）。整页重载后首屏必然要等 /api/list 才有内容，
+  //   这段时间就是用户看到的"进/退文件夹闪一下"。
+  //
+  // 做法：把最近几个目录的 items 存进 sessionStorage（同标签页、关掉即清）。
+  //   新页面 loadDir 时**先**用快照画出来（通常 <1 帧就到位），真实列表回来后再比对：
+  //   完全一致 ⇒ 一个字都不改（DOM/缩略图/滚动位置全都不动）→ 真正的零闪烁。
+  //
+  // 为什么用 sessionStorage 而不是 localStorage：这是"这次浏览的来回切换"，
+  //   换设备/关标签页就该忘掉；也避免长期占着几 MB。
+  var SNAP_MAX_AGE = 10 * 60 * 1000;   // 10 分钟前的快照不用（文件可能已变，代价是退化成正常加载）
+  var SNAP_MAX_DIRS = 6;               // 最多记几个目录
+  var SNAP_MAX_ITEMS = 800;            // 单个目录超过这么多项就不存（体积/序列化成本）
+  var SNAP_MAX_BYTES = 700000;         // 单条上限（sessionStorage 总共约 5MB）
+
+  // sort 参数 = "现在要用的排序"。快照里记的不是这个排序 ⇒ **当没有**。
+  //   代价（明确接受）：改过排序后第一次回到旧目录不再秒开，要等 /api/list；
+  //   换来的是"顺序永远不会错"，以及竖图流不会拿到旧顺序的数组。
+  function loadSnap(p, sort) {
+    try {
+      var raw = sessionStorage.getItem('mv_snap:' + p);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || !o.at || (Date.now() - o.at) > SNAP_MAX_AGE) return null;
+      if (!o.items || !o.items.length) return null;
+      if (sort && o.sort && o.sort !== sort) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+
+  function saveSnap(p, items, files, top, sort) {
+    try {
+      var key = 'mv_snap:' + p;
+      if (!items || !items.length || items.length > SNAP_MAX_ITEMS) {
+        sessionStorage.removeItem(key);
         return;
-      } catch (e) {}
+      }
+      // 2.4.38：连**滚动位置**一起记 —— 返回上一级时停在原处，是"顺滑"的一半。
+      //   （只记 items 的话，回去永远从顶部开始，"我明明看到第 40 张"那种感觉就没了。）
+      // 2.4.41：连**排序规则**一起记 —— 否则改了排序后，旧快照会把旧顺序先铺上来
+      //   （竖图流再从它里面取列表，就成了"永远按修改时间降序"的观感）。
+      var s = JSON.stringify({
+        at: Date.now(), items: items, files: files || [], top: top || 0,
+        sort: sort || ''
+      });
+      if (s.length > SNAP_MAX_BYTES) { sessionStorage.removeItem(key); return; }
+      sessionStorage.setItem(key, s);
+      // 维护一个"最近目录"索引，超出就删最老的（避免 sessionStorage 被撑爆）
+      var idx = [];
+      try { idx = JSON.parse(sessionStorage.getItem('mv_snap_index') || '[]') || []; } catch (e) { idx = []; }
+      idx = idx.filter(function (x) { return x !== p; });
+      idx.unshift(p);
+      while (idx.length > SNAP_MAX_DIRS) {
+        var drop = idx.pop();
+        try { sessionStorage.removeItem('mv_snap:' + drop); } catch (e) {}
+      }
+      sessionStorage.setItem('mv_snap_index', JSON.stringify(idx));
+    } catch (e) { /* 隐私模式/配额满：不影响正确性，只是退化成正常加载 */ }
+  }
+
+  // 离开目录前把滚动位置写回它自己的快照。
+  // 调用时机在 loadDir 开头 —— 那一刻 state.path 还是**旧目录**，正好把"我刚看到第几张"记下来。
+  function rememberScroll() {
+    // 根层用 '/' 当快照键（buildRoot 也走快照，见那里的说明）
+    var p = state.root ? '/' : state.path;
+    if (!p) return;
+    try {
+      var key = 'mv_snap:' + p;
+      var raw = sessionStorage.getItem(key);
+      if (!raw) return;
+      var o = JSON.parse(raw);
+      if (!o || !o.items) return;
+      o.top = scroller.scrollTop || 0;
+      sessionStorage.setItem(key, JSON.stringify(o));
+    } catch (e) { /* 快照不可用：只是回到顶部，不影响正确性 */ }
+  }
+
+  // sameItems 两份列表是否"看起来完全一样"（路径 + mtime + size 挨个比）。
+  // 一致 ⇒ 不需要重建格子（这是"快照先行"能变成零闪烁的关键：不一致才重建）。
+  function sameItems(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].path !== b[i].path) return false;
+      if ((a[i].mtime || 0) !== (b[i].mtime || 0)) return false;
+      if ((a[i].size || 0) !== (b[i].size || 0)) return false;
     }
-    buildRoot();
+    return true;
   }
 
   function loadDir(path) {
-    // 先释放浏览器连接池再发 /api/list：网格里在飞的缩略图会占满同源 6 条连接，
-    // 不取消的话这个 list 请求要排队等好几个缩略图生成周期（详见函数注释）。
-    cancelPendingGridRequests();
+    var mySeq = ++loadSeq;   // 快速连点时先发的请求可能后返回 —— 只认最新的那一次
     state.root = false;
     state.path = path;
-    syncExitTips();   // 2.4.2：离开聚合根 ⇒ 撤掉宿主的退出确认（此后返回是「退一层」）
-    loadingEl.classList.remove('hidden');
+    syncExitTips();          // 离开聚合根 ⇒ 撤掉宿主的退出确认（此后返回是「退一层」）
+    showLoadingSoon();
     emptyEl.classList.add('hidden');
-    var mySeq = ++loadSeq;
-    // 先确定排序（可能要去读文件管理器的偏好），再发列表请求：
-    // 列表顺序决定了大图切换顺序、大图预加载取「后面 N 张」、缩略图预生成取「前 N 张」，
-    // 顺序错了这三样全跟着错。
-    var usedSort = null;
+    // 2.4.31：**不等 settings、不等 /api/list**，先把快照铺上。
+    //   快照里只有 items（网格内容），布局只用到 cellMode（localStorage）和容器宽度 ——
+    //   都不依赖接口。所以"回到刚看过的目录"可以做到接口还没回、画面已经在。
+    var snap = loadSnap(path, state.sort);
+    var snapApplied = false;
+    if (snap && !sameItems(state.items, snap.items)) {
+      state.items = snap.items;
+      state.files = snap.files || [];
+      renderCrumb();
+      applyItems(null, snap.top || 0);   // 连"看到第几屏"一起还原
+      snapApplied = true;
+      hideLoadingNow();
+    } else if (snap) {
+      hideLoadingNow();   // boot 已经铺过同一份内容，不再重复布局（重复布局本身就是闪一下）
+    }
+    // 先确定排序（可能要读文件管理器的偏好），再发列表请求：列表顺序决定了大图切换
+    // 顺序、预加载取哪几张、后台预生成的顺序，顺序错了这三样全跟着错。
     resolveSortForDir(path).then(function (sortStrParam) {
       if (mySeq !== loadSeq) return;
-      usedSort = sortStrParam;
-      // 记下「网格实际用的排序」：窗口内点开图片时（openViewerWindow）必须复用它，
-      // 否则那边会退到 state.sort —— 两边取的排序来源不同（一个读文件管理器偏好、
-      // 一个用本地值），顺序就会不一致：网格第 1 张在大图里变成第 10 张。
-      state.currentSort = usedSort;
+      // 记下「网格实际用的排序」：窗口内点开图片时必须复用它，否则两边顺序会不一致。
+      state.currentSort = sortStrParam;
       return fetchJSON(API + '/list?path=' + enc(path) + '&sort=' + enc(sortStrParam));
     }).then(function (d) {
-      if (mySeq !== loadSeq) return; // 已有更新的目录请求，丢弃这次结果
-      loadingEl.classList.add('hidden');
+      if (!d || mySeq !== loadSeq) return;
+      hideLoadingNow();
       var dirs = d.dirs.map(function (x) { return { kind: 'dir', name: x.name, path: x.path }; });
       var files = d.files;
-      // 1.8.190：按飞牛规则重排（后端是字节序，会把汉字排到最后）。
-      // 必须用**本次实际请求的排序**（usedSort 带方向），否则降序会被排成升序。
-      var effSort = usedSort || (d && d.sort) || state.sort;
+      // 1.8.190：按飞牛规则重排（后端是字节序，会把汉字排到最后）。必须用**本次实际
+      // 请求的排序**（带方向），否则降序会被排成升序。
+      var effSort = state.currentSort || (d && d.sort) || state.sort;
       dirs = resortLikeFnOs(dirs, effSort);
       files = resortLikeFnOs(files, effSort);
-      state.items = dirs.concat(files);
+      var nextItems = dirs.concat(files);
+      // 与屏上的完全一致 ⇒ **一个字都不改**（快照命中走的就是这条路：格子、缩略图、
+      // 滚动位置全部原样保留 —— 这才是"不闪"）。
+      var unchanged = sameItems(state.items, nextItems);
+      // 快照先铺过 ⇒ 用户可能已经在看、甚至滚了几屏。真实列表回来必须停在原地，
+      // 否则"刚滑到第 30 张，列表一回来被弹回顶部"比闪烁更难受。
+      var keepTop = snapApplied ? scroller.scrollTop : 0;
+      state.items = nextItems;
       state.files = files;
+      saveSnap(path, nextItems, files, keepTop, effSort);
       renderCrumb();
-      layout();
-      // 2.0.0：用**重排后**的顺序驱动后台预生成（预生成顺序 == 显示顺序）。
-      // 关闭「后台预生成」时不发请求（后端也会兜底返回 0）。
+      // 变了也只做**增量**替换（见 applyItems）：只有真换了内容的格子才动，
+      // 其余 DOM 一个字节都不改，浏览器只 paint 最终状态。
+      if (!unchanged) applyItems(null, keepTop);
       if ((cfg.preloadConcurrency || 0) > 0) postPregen(state.files);
       try { localStorage.setItem('mediaview_last', path); } catch (e) {}
     }).catch(function (e) {
       if (mySeq !== loadSeq) return;
-      loadingEl.classList.add('hidden');
+      hideLoadingNow();
       // 清掉上一个目录的内容：否则旧格子会压在空状态下面继续占位、继续发缩略图请求
       state.items = []; state.files = [];
       for (var k in cellPool) {
@@ -725,6 +1178,10 @@
     //   现在判据换成"上一层是否还在某个存储空间用户目录之内"：出了就不再往上，
     //   直接回聚合根，且**不再产生中间页面**。
     if (!up || up === '/') { navigateRoot(); return; }
+    // 2.4.18：上一层正好是「已添加的文件夹」⇒ 直接回首页。
+    //   否则会退到那个文件夹本身（它的原始列表，含 #recycle 等），而首页已经是
+    //   它的内容层 —— 用户会觉得"怎么又冒出这个文件夹"。
+    if (isCustomRoot(up)) { navigateRoot(); return; }
     if (!isInsideAnyUserDir(up)) { navigateRoot(); return; }
     navigateTo(up);
   }
@@ -749,87 +1206,6 @@
   // ⚠️ 判据只此一处：boot() 里不再重复赋值（同一条判据分两处写，迟早会分叉）。
   var singleMode = false;
   try { singleMode = !!new URLSearchParams(location.search).get('path'); } catch (e) {}
-
-  // ---------- 宿主返回的「守卫条目」：让系统的滑动返回退不出去 ----------
-  // 手机端的返回手势 / 返回键由**宿主原生层**处理，页面拿不到它的回调、也拦不住它 ——
-  // 但它的落地形式是"让 WebView 退一格历史"。这恰好给了我们一个着力点：
-  // **只要历史里始终有一条属于本应用的条目，它就永远退不到应用之外去。**
-  //
-  // 机制就两条：
-  //   ① 启动时压一条守卫条目（pushState）—— 给"别人发起的返回"准备一个落点；
-  //   ② popstate 里**立刻把守卫补回去**，除此之外什么都不做 —— 这就是"滑动无反应"。
-  // 于是无论滑多少次，历史指针都只在"当前条目 ↔ 守卫条目"之间来回，页面不会被卸载。
-  //
-  // ⚠️ 三条纪律（前几轮实测换来的，别再改回去）：
-  //   · **我们永远不主动 history.back()** —— 主动退历史会与宿主发起的那一次叠加，
-  //     一次滑动退两层（2.1.3 的实测教训）。这里只有 pushState，一次都没有 back。
-  //   · **只在触屏档压** —— 桌面有自己的关闭按钮，不该被改动（手机与桌面不搅和）。
-  //   · 压不上（极端沙箱环境）就静默退化：那只是回到"宿主可能把页面退出去"的旧状态，
-  //     绝不会让页面本身出错。
-  //
-  // ⚠️ 这里不再讨论"要不要挂宿主的 setExitPageTips" —— 2.4.2 起用户明确要求用它
-  //   （手势返回只有宿主原生框能拦到），实现见 syncExitTips。当年的分析留档如下：
-  //   它的语义是"**用户离开应用页面时**显示的确认提示"—— 只能"问一句"，不能"拦住"；
-  //   而用户要的是**滑动无反应**，所有弹窗（含宿主的）都属于"有反应"，方向相反。
-  //   何况实测那台设备上它并没有生效（否则滑动会弹框，而不是直接退出）。
-  //   ⇒ 能"拦住"的只有这条守卫条目。
-  // ⚠️ 不记"守卫压没压上"这种状态量：我们没有"敢不敢动历史"的分支（永不主动 back），
-  //    记了就是一个只写不读的死变量。真需要核查守卫在不在，看 `history.state.mvGuard`
-  //    就行 —— 那是**真实历史状态**，比我们自己的记录可信（探针就是这么验的）。
-  function mvGuardArm() {
-    try {
-      history.pushState({ mvGuard: 1 }, '');
-    } catch (e) {
-      // 极端沙箱环境压不上：静默退化（回到"宿主可能把页面退出去"的旧状态），
-      // 绝不因此让页面本身出错。
-    }
-  }
-
-  // 系统 / 宿主的返回都落在这里。**只补守卫；唯一的例外是大图查看器**。
-  //
-  // 为什么只对大图破例（这是本节最需要想清楚的一处）：
-  //   · 用户要的是**网格里滑动无反应**（"在文件夹滑动返回会直接退出"）—— 那里有左上角
-  //     箭头可以逐级退，所以"吃掉返回"不会把人困住；
-  //   · 但**大图里页面内没有任何返回出口**（2.1.1 起按用户要求删掉了大图的 ← 按钮，
-  //     手势也在 2.2.0 删了）。若把返回也吃掉，大图就成了死胡同 —— 只能退出整个应用
-  //     再重新进来。用户此前明确接受过"大图 → 网格"这个行为（他抱怨的是
-  //     "到了网格继续滑就退出应用"）。所以这里保留它。
-  //   其余（网格 / 子目录 / 第一级）一律**什么都不做**。
-  //
-  // ⚠️ 特意写成**具名函数**再注册，而不是内联匿名回调：匿名回调没法从测试里取出来
-  //    真跑，测试就只能"手抄一份逻辑"，于是改源码它照样绿 —— 那是自证式测试。
-  // 2.3.0：这次关查看器是不是"返回"触发的（是 ⇒ 历史已经退了，不要再补 back）
-  var mvViewerFromPop = false;
-  // 2.3.2：**我们自己**发起的 history.back()（closeViewer 收自己压的那条）。
-  //   它的 popstate 会被 mvOnPop 收到，但那时查看器已经关了 —— 如果不打标记，
-  //   mvOnPop 就会接着走"子目录回上级"，于是"点一次箭头 = 关查看器 + 退一层目录"
-  //   （真 Edge 实测：URL 从 ?dir=/vol1 直接变成 ?dir=/）。
-  var mvSelfBack = false;
-
-  function mvOnPop() {
-    mvGuardArm();
-    // 2.3.2：这一次 popstate 是 closeViewer 主动退历史引起的 —— 它已经把关查看器这件事做完了，
-    //   这里**只能补守卫、不能再退层**，否则一次点击会退两层（关查看器 + 回上级目录）。
-    if (mvSelfBack) { mvSelfBack = false; return; }
-    if (!viewer.classList.contains('hidden')) {
-      mvViewerFromPop = true;
-      try { closeViewer(); } finally { mvViewerFromPop = false; }
-      return;
-    }
-    // 2.3.0：**网格里返回 = 回上一层目录**。
-    //   2.2.x 这里曾是"什么都不做"（当时为了做到"滑动无反应"），但那让网格里的返回
-    //   完全失效 —— 用户在子目录里按返回，页面不动，只能靠左上角箭头。
-    //   现在与"查看器返回 = 关查看器"统一成**同一个出口**：
-    //     查看器开着 → 关查看器
-    //     子目录     → 回上一层目录
-    //     已在最上层 → 什么都不做（保持"滑动无反应"，不退出应用）
-    if (!state.root && state.path) { goUpLevel(); return; }
-    // 2.4.1：**已在聚合根层** ⇒ 问一句"是否退出"（宿主闸门实测不生效，改为页面自己弹）。
-    //   点「留下」会补回守卫，用户原地不动；点「退出」走 hostCall('close')。
-    // 2.4.2：已在聚合根层 —— **什么都不做**，把"是否退出"交给宿主原生弹窗
-    //   （syncExitTips 已在进根层时把它挂上）。这里若补守卫即可，不再自绘任何框。
-    return;
-  }
 
   // 2.4.0：**离开确认闸门** —— 只在"聚合根层"挂上（仅手机版）。
   //
@@ -903,40 +1279,90 @@
     } catch (e) { /* 能力缺失 / 调用失败都不影响页面本身 */ }
   }
 
-  // 启动接线：压守卫 + 接上 popstate。
-  // ⚠️ 单独包成具名函数（而不是让下面的 if 直接写两行）是为了**可测**：
-  //    测试能把这个函数抠出来真跑，验"压了几条、接没接上"；
-  //    若写成 if 里的裸两行，测试就只能手抄——那就是自证式测试。
-  function mvGuardInit() {
-    mvGuardArm();
-    window.addEventListener('popstate', mvOnPop);
+  // ---------- 查看器自己的一层历史 ----------
+  //
+  // 网格层与层之间**不需要**任何历史操作 —— 每层都是一个真实页面（见 navigateTo）。
+  // 唯一需要记账的是**大图查看器**：它只是叠在网格上的一层遮罩、不是页面，
+  // 所以打开时压一条历史，让"返回"先落在这里（= 关掉查看器），而不是退到上一层目录。
+  //
+  // 规则只有两条：
+  //   · 打开时 pushState({ mvViewer: 1 }) —— 全项目唯一一处 pushState；
+  //   · popstate 里若查看器还开着 ⇒ 关掉它（历史已经退了，这里不用再动历史）。
+  // 主动关闭（✕ / 点背景 / Esc）时由 closeViewer 把这条历史收回去，见那里的说明。
+  var mvViewerFromPop = false;
+
+  function mvOnPop() {
+    if (viewer.classList.contains('hidden')) return;   // 不是查看器这一层：什么都不做
+    mvViewerFromPop = true;
+    try { closeViewer(); } finally { mvViewerFromPop = false; }
   }
 
-  // ⚠️ `!singleMode` 这一条不能少：独立看图窗口里压守卫，会把"返回=关掉这个窗口"
-  //    变成"返回=退到历史里上一条"，宿主再按它自己的规则收尾 —— 这是不可控的一段。
-  if (PROFILE === 'touch' && !singleMode) mvGuardInit();
+  if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);
 
-  // ⛔ 这里曾有 syncExitTips()（2.2.0）：把宿主的「离开页面确认」**只在第一级**挂上，
-  //    其余时刻清除。2.2.1 按用户要求整体撤掉，理由见上面「守卫条目」那段的最后一段：
-  //    用户要的是**滑动无反应**，任何弹窗都属于"有反应"；而且它实测在那台设备上没生效。
-  //    如果将来又想加回来，注意那条铁律：**必须跟状态走**（常挂的后果是每次返回都弹框、
-  //    把"回上一层"整个吞掉 —— 这是 2.1.4 实测踩过的坑）。
+  // ⛔ 这里曾有整条「守卫条目」体系（2.3.0 ~ 2.4.39）：启动时压 1~3 条 pushState /
+  //    hash 条目，popstate 里补满，用来把宿主的滑动返回"吃掉"。它要解决的问题
+  //    （网格里滑动就退出应用）**只存在于内部切换（SPA）**：那时整个会话只有一条
+  //    历史，返回必然落到应用之外。改成真页面导航之后，每一层目录本身就是一条历史，
+  //    宿主怎么数都不会数到"没有可退的了" —— 前提不存在了，机制也就整块删掉了。
+  //    （留档：2.4.33 ~ 2.4.39 七版都在这一层加补丁，无一奏效，原因见交接报告。）
 
   // ---------- Breadcrumb ----------
+  // 当前路径在某个「已添加的文件夹」之下时，返回它的相对段。
+  // 返回 null 表示"不在任何已添加文件夹之下"（走完整分段）。
+  //
+  // 为什么需要：展开模式下进了 root 的子目录，若仍按绝对路径分段，面包屑会变成
+  // 「我的文件夹 / vol1 / 1000 / 照片库 / 2024」—— 前几段纯噪音。
+  function relSegsUnderRoot(p) {
+    if (!cfg.onlyRoots || !cfg.roots || !cfg.roots.length) return null;
+    var np = normPath(p);
+    if (!np) return null;
+    for (var i = 0; i < cfg.roots.length; i++) {
+      var r = normPath(cfg.roots[i]);
+      if (!r) continue;
+      if (np === r) return { base: r, segs: [] };          // 就在根上
+      if (np.indexOf(r + '/') === 0) {
+        return { base: r, segs: np.slice(r.length + 1).split('/').filter(Boolean) };
+      }
+    }
+    return null;
+  }
+
+  function isCustomRoot(p) {
+    if (!cfg.onlyRoots || !cfg.roots || !cfg.roots.length) return false;
+    var np = normPath(p);
+    for (var i = 0; i < cfg.roots.length; i++) {
+      if (normPath(cfg.roots[i]) === np) return true;
+    }
+    return false;
+  }
+
   function renderCrumb() {
     crumbEl.innerHTML = '';
-    var home = makeCrumb('存储空间', null, false);
+    // 开启「只显示我添加的文件夹」后，首段的语义已经不是"存储空间"了
+    var home = makeCrumb(cfg.onlyRoots ? '我的文件夹' : '存储空间', null, false);
     crumbEl.appendChild(home);
-    if (state.path) {
-      var parts = state.path.split('/').filter(Boolean);
-      var acc = '';
-      parts.forEach(function (seg, i) {
-        crumbEl.appendChild(makeSep());
-        acc += '/' + seg;
-        var cur = i === parts.length - 1;
-        crumbEl.appendChild(makeCrumb(seg, acc, cur));
-      });
+    if (!state.path) return;
+
+    var rel = relSegsUnderRoot(state.path);
+    var acc, segs;
+    if (rel) {
+      acc = rel.base;
+      segs = rel.segs;
+      // 正好停在已添加文件夹本身（首页已展开，通常到不了这里；真到了就只显示首段）
+      if (!segs.length) return;
+    } else {
+      // 普通模式：按绝对路径完整分段。用 normPath 再逐段拼，避免手工加 '/'
+      // 把 Windows 盘符（D://a）拼成 /D:/a。
+      segs = normPath(state.path).split('/').filter(Boolean);
+      acc = '';
+      if (normPath(state.path).charAt(0) === '/') acc = '/';
     }
+    segs.forEach(function (seg, i) {
+      crumbEl.appendChild(makeSep());
+      acc = (acc === '/' ? '/' : acc + '/') + seg;
+      var cur = i === segs.length - 1;
+      crumbEl.appendChild(makeCrumb(seg, acc, cur));
+    });
   }
   function makeCrumb(label, path, current) {
     var d = document.createElement('div');
@@ -966,7 +1392,28 @@
   // 只有切换目录/重建列表才把位置归零 —— 否则拖一下窗口、点一下图标大小，
   // 用户辛苦滚到的地方就被弹回顶部了。
   function layout(keepScroll) {
-    var keepTop = keepScroll ? scroller.scrollTop : 0;
+    applyItems(state.items, keepScroll ? scroller.scrollTop : 0);
+  }
+
+  // 单元格的"内容指纹"。同一格（同一 idx）里指纹不变 ⇒ **一个 DOM 字节都不动**。
+  //
+  // ⚠️ 刻意**不含 mtime**：/api/list 每次回来的 mtime 精度可能不同（秒 vs 毫秒），
+  //   而且"文件被覆盖但大小不变"极少见。把 mtime 算进来会让"同一个目录、内容没变"
+  //   被判成"全变了"，于是每次刷新都整屏重建 —— 那正是 2.4.37 之前"打开闪一下"的来源。
+  //   代价：原地覆盖成同尺寸新内容时缩略图会晚一步更新（可接受，清缓存可解）。
+  function cellKey(it) {
+    return (it.kind || '') + '|' + (it.name || '') + '|' + (it.size || 0);
+  }
+
+  // 把 state.items 应用到网格上。**不再清空 cellPool** —— renderVisible 会按
+  // `data-mv-path` / `data-mv-key` 判断"复用 / 就地刷新 / 单格替换"。
+  //
+  // 这是"文件夹打开、返回不闪"的核心：以前 layout() 第一件事是把所有格子 removeChild，
+  // 然后同步重建 20+ 个 <img>（src 从 1×1 占位重新开始）—— 即使 HTTP 缓存命中，
+  // 也要重新解码、重新 paint。整屏内容在同一帧里"全部消失再全部出现"，
+  // 用户看到的就是闪一下。现在只有**真的换了一张图**的那个格子才会被替换。
+  function applyItems(next, keepTop) {
+    if (next) state.items = next;
     computeCols();
     var n = state.items.length;
     var rows = Math.ceil(n / state.cols);
@@ -979,19 +1426,23 @@
     } else {
       emptyEl.classList.add('hidden');
     }
-    scroller.scrollTop = keepTop;
-    // clear pool on fresh layout
-    for (var k in cellPool) {
-      var el = cellPool[k]; el.parentNode && el.parentNode.removeChild(el);
-      delete cellPool[k];
-    }
-    requestRender();
+    scroller.scrollTop = keepTop || 0;
+    // ⚠️ 这里必须**同步**重建，不能排到 rAF（2.4.31 实测的"换目录闪一下"）：
+    //    applyItems 通常在 fetch 的 .then（微任务）里跑，删完 DOM 后如果只 requestRender()，
+    //    重建要等**下一帧**的 rAF —— 中间这一帧就是"格子全没了"的空画面。
+    //    同步跑完，删除与重建落在同一个任务里，浏览器只 paint 最终状态。
+    //    （扫描/滚动那种高频路径仍走 requestRender 合并，别改成同步。）
+    renderNow();
   }
 
   function requestRender() {
-    if (rafPending) return;
-    rafPending = true;
-    requestAnimationFrame(function () { rafPending = false; renderVisible(); });
+    if (rafId) return;
+    rafId = requestAnimationFrame(function () { rafId = 0; renderVisible(); });
+  }
+  // renderNow 立刻重建（并撤掉已排队的那一帧，避免重复跑一遍）
+  function renderNow() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    renderVisible();
   }
 
   function renderVisible() {
@@ -1034,13 +1485,117 @@
         el = createCell(item, idx, eager);
         cellPool[idx] = el;
         content.appendChild(el);
+      } else if (el.dataset.mvPath !== item.path || el.dataset.mvKind !== (item.kind || '')) {
+        // 这一格换了**另一张图 / 另一个文件夹**：只替换这一格，其余格子原样不动。
+        //   换目录时几乎所有格都会走到这里（内容确实全变了），但因为是**同步逐格替换**，
+        //   浏览器只 paint 最终状态 —— 不会出现"先全空、再一张张冒"的空帧。
+        var fresh = createCell(item, idx, eager);
+        cellPool[idx] = fresh;
+        if (el.parentNode) el.parentNode.replaceChild(fresh, el);
+        else content.appendChild(fresh);
+        el = fresh;
       } else {
+        // 同一张图：指纹变了就只更新缩略图 URL（DOM 结构不动）
+        var key = cellKey(item);
+        if (el.dataset.mvKey !== key) {
+          el.dataset.mvKey = key;
+          refreshCellThumb(el, item);
+        }
         loadCellImage(el, eager); // 滚进可见区后才补发请求
       }
       el.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
       el.style.width = state.cell + 'px';
       el.style.height = state.cell + 'px';
     }
+  }
+
+  // 就地更新某一格的缩略图地址（不重建 DOM）。只在"同一 path、但内容指纹变了"时调用。
+  // 目的：文件被替换时缩略图能跟上，同时**不牺牲 DOM 复用**（重建会让整格闪一下）。
+  function refreshCellThumb(el, item) {
+    var img = el.querySelector && el.querySelector('img.cell-thumb');
+    if (!img) return;
+    var want = item.kind === 'dir'
+      ? coverURL(item.path, cfg.thumbSize || 320, item.mtime)
+      : thumbURL(item.path, cfg.thumbSize || 320, item.mtime);
+    if (img.getAttribute('data-src') === want) return;
+    img.setAttribute('data-src', want);
+    delete img.dataset.mvReq;   // 让 loadCellImage 重新排队
+    delete img.dataset.mvFailed;
+    delete img.dataset.mvRetried;
+  }
+
+  // scrollToItem 把网格滚到第 idx 项并闪一下（2.4.29：从竖图流退出时"回到你看的那张"）。
+  //
+  // 为什么不用 element.scrollIntoView：格子是 position:absolute + translate3d 虚拟滚动，
+  // 目标格子可能**还没被创建**（在窗口外），scrollIntoView 找不到元素就什么也不做。
+  // 这里按行号直接算 scrollTop，再让 renderVisible 把那一行建出来。
+  //
+  // 2.4.43：**已经在屏上的，一格都不要动。**
+  //   原来无论目标在哪，都把那一行摆到"视口上方 1/4 处"（本意是滑了很远回来还能看到上下文）。
+  //   但目标本来就在屏幕里时，这个"1/4"会把整屏内容硬推一下 —— 手机一屏两列八张（四行），
+  //   点任意一张回来，点的那张都会挪到"第二排那个位置"，等于把用户刚看过的画面搬走。
+  //   现在按"离得多远"分三档，越近动得越少：
+  //     ① 完整可见（含一圈 pad）→ 完全不动，只闪一下；
+  //     ② 只露出一部分（被上下边裁掉）→ 最小滚动，刚好整行露出来；
+  //     ③ 完全不在视口里（真的滑了很远）→ 仍放到 1/4 处，保留上下文（原行为）。
+  function scrollToItem(idx, flash) {
+    var n = state.items.length;
+    if (!n || idx < 0) return;
+    if (idx >= n) idx = n - 1;
+    var cols = state.cols || 1;
+    var cell = state.cell + state.gap;
+    var row = Math.floor(idx / cols);
+    var rowTop = row * cell;
+    var rowH = state.cell;
+    var vh = scroller.clientHeight;
+    var top = scroller.scrollTop;
+    // 判"是否完整可见"必须**不带 pad**：只要这一整行在屏上就一格都不动。
+    // pad 只用于"已经确定要滚"时留一点呼吸空间（太小会贴边，太大又变成一动就跳）。
+    var pad = Math.min(24, Math.floor(rowH / 8));
+    // ① 完整可见 ⇒ 什么都不做（连 scrollTop 都不赋值：赋值本身在某些内核里也会触发 scroll 事件）
+    var visible = rowTop >= top && (rowTop + rowH) <= (top + vh);
+    if (!visible) {
+      var want;
+      if ((rowTop + rowH) > top && rowTop < (top + vh)) {
+        // ② 露了一部分：最小滚动（上方被裁 ⇒ 顶到 pad；下方被裁 ⇒ 底到 pad）
+        want = rowTop < top ? (rowTop - pad) : (rowTop + rowH + pad - vh);
+      } else {
+        // ③ 完全在屏外：放到 1/4 处
+        want = rowTop - Math.floor(vh / 4);
+      }
+      scroller.scrollTop = Math.max(0, want);
+      requestRender();
+    }
+    if (!flash) return;
+    // 等一帧让 renderVisible 把格子建出来，再挂高亮
+    requestAnimationFrame(function () {
+      var el = cellPool[idx];
+      if (!el) {
+        requestRender();
+        requestAnimationFrame(function () { flashCell(idx); });
+        return;
+      }
+      flashCell(idx);
+    });
+    function flashCell(i) {
+      var cellEl = cellPool[i];
+      if (!cellEl) return;
+      cellEl.classList.add('mv-flash');
+      setTimeout(function () { cellEl.classList.remove('mv-flash'); }, 1400);
+    }
+  }
+
+  // flowModule 取竖图流模块（可能还没加载完 / 桌面档根本不存在）
+  // 用 try 包住：个别单测会把调用方抠到没有 window 的环境里 eval，不能让这里炸。
+  function flowModule() {
+    try { return (typeof window !== 'undefined' && window.MVFlow) ? window.MVFlow : null; }
+    catch (e) { return null; }
+  }
+
+  // flowOpen 竖图流是否正在显示（只在触屏档可能为真；桌面恒 false）
+  function flowOpen() {
+    var m = flowModule();
+    return !!(m && m.isOpen && m.isOpen());
   }
 
   // loadCellImage 按需发起缩略图请求：只有「用户看得到的行」（eager=true）才真的去取。
@@ -1121,11 +1676,94 @@
     var inner = document.createElement('div');
     inner.className = 'cell-inner';
     if (item.kind === 'dir') {
-      inner.style.background = 'var(--bg-cell)';
-      inner.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:6px;">' +
-        '<div style="font-size:42px;line-height:1;">📁</div>' +
-        '<div style="font-size:11px;color:var(--text-dim);padding:0 6px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;">' +
-        escapeHtml(item.name) + '</div></div>';
+      // 文件夹封面：底层是「📁 + 名称」的兜底，封面图成功加载后盖住它。
+      //
+      // 名称位置有两条路（cfg.coverNameBelow，**默认关**）：
+      //   关（默认）⇒ 压在封面底部的一条**半透明**蒙层上，图片隐约透出来；
+      //                文字颜色按封面底部那块的灰度自动选黑/白（见 pickCoverTone）。
+      //   开         ⇒ 格子内部纵向 flex，封面让出 20px 独立一行放名字（2.4.19 的样式）。
+      // 两个元素都建出来（.cell-label / .cell-name-below），由 .mv-name-below 只显示其一，
+      // 这样切设置只需改一个 class，不必重建 DOM 结构。
+      var nameBelow = cfg.coverNameBelow === true;
+      if (nameBelow) inner.classList.add('mv-name-below');
+      var cover = document.createElement('div');
+      cover.className = 'cell-cover';
+      var fb = document.createElement('div');
+      fb.className = 'cell-fallback';
+      fb.innerHTML = '<div class="cell-fallback-ico">📁</div>' +
+        '<div class="cell-fallback-name">' + escapeHtml(item.name) + '</div>';
+      cover.appendChild(fb);
+      var label = document.createElement('div');
+      label.className = 'cell-label';
+      label.innerHTML = '<span class="cell-label-name">' + escapeHtml(item.name) + '</span>';
+      cover.appendChild(label);
+      if (cfg.coverEnabled) {
+        var cimg = new Image();
+        // 复用 .cell-thumb：loadCellImage 按这个 class 找图，封面因此天然走
+        // 现有的 eager / 并发闸 / 大图打开时挂起 那一整套资源纪律，不用另造。
+        cimg.className = 'cell-thumb cell-cover-img';
+        cimg.decoding = 'async';
+        cimg.fetchPriority = 'low';
+        var dsrc = coverURL(item.path, cfg.thumbSize || 320, item.mtime);
+        cimg.setAttribute('data-src', dsrc);
+        cimg.alt = item.name;
+        // 已加载过同一版本（dir|mtime）⇒ 直接给 src，跳过并发队列与淡入。
+        // 缓存命中时几乎是同步显示，于是"进目录→封面已在"而不是"📁 → 淡入"。
+        var ckey = item.path + '|' + (item.mtime || 0);
+        // 2.4.38：有主色占位就先铺上，并把 📁 兜底藏起来 —— 📁 墙正是"闪封面"的来源。
+        //   封面真正到位时只在这块颜色上做一次短淡入，视觉上是"变清晰"而不是"跳出来"。
+        var phc = coverColorCache[ckey];
+        if (phc) {
+          cover.style.background = phc;
+          cover.classList.add('mv-cover-ph');
+        }
+        if (coverDidLoad[ckey] || coverSeen[ckey]) {
+          cimg.dataset.mvReq = '1';
+          cimg.src = dsrc;
+          cimg.classList.add('mv-cover-ok');
+          cover.classList.add('mv-has-cover');
+          // 灰度结论上次已经算过：先按缓存上色，避免"盖上一层默认配色再闪一下"
+          applyCoverTone(cover, ckey, null);
+        } else {
+          cimg.src = BLANK_PIXEL;
+        }
+        cimg.onload = function () {
+          if (cimg.src.indexOf('data:image/gif') === 0) return; // BLANK_PIXEL 的 load 不算封面成功
+          if (!cimg.isConnected) return;
+          coverDidLoad[ckey] = true;
+          noteCoverSeen(ckey);
+          cimg.classList.add('mv-cover-ok');
+          cover.classList.add('mv-has-cover');
+          // 图真的到位了才算灰度：BLANK_PIXEL 是 1×1 透明图，算出来是纯黑，会把白字用错地方
+          applyCoverTone(cover, ckey, cimg);
+          // 2.4.38：顺手记下主色，供下次进这个目录时当占位（见 sampleCoverColor）
+          var ph = sampleCoverColor(cimg);
+          if (ph) {
+            noteCoverColor(ckey, ph);
+            cover.style.background = ph;
+            cover.classList.add('mv-cover-ph');
+          }
+        };
+        cimg.onerror = function () {
+          // 主动断开（并发闸换 src / 暂停让路）不是"没封面"；真失败也无需额外降级 ——
+          // fallback 📁 一直在底层兜底，封面 opacity 0 时看到的就是文件夹图标。
+          if (cimg.dataset.mvAbort) { delete cimg.dataset.mvAbort; return; }
+          // 真失败（空目录 404 / 图坏了）：把主色占位撤掉，否则会是一块纯色没有 📁
+          cover.classList.remove('mv-cover-ph');
+          cover.style.background = '';
+        };
+        cover.appendChild(cimg);
+      }
+      inner.appendChild(cover);
+      if (nameBelow) {
+        // 封面下方独立一行的名称。放在 .cell-cover **之外**是关键：
+        // 放进封面里就还是"压在图上"，深色封面上依旧看不清。
+        var nb = document.createElement('div');
+        nb.className = 'cell-name-below';
+        nb.textContent = item.name;
+        nb.title = item.name;       // 窄格子下名字会被省略号截断，悬停能看全
+        inner.appendChild(nb);
+      }
       inner.onclick = function () { navigateTo(item.path); };
     } else if (!cfg.thumbEnabled) {
       // 缩略图已关闭：降级为「图标 + 扩展名 + 文件名」，不产生任何缩略图请求
@@ -1191,6 +1829,10 @@
       (function (it) { inner.onclick = function () { openViewer(it); }; })(item);
     }
     el.appendChild(inner);
+    // 内容身份证：renderVisible 靠它判断"这一格能不能直接复用"（见 cellKey / applyItems）
+    el.dataset.mvPath = item.path;
+    el.dataset.mvKind = item.kind || '';
+    el.dataset.mvKey = cellKey(item);
     if (eager) { loadCellImage(el, true); }
     attachHoverPrefetch(inner, item);
     return el;
@@ -1310,31 +1952,6 @@
     }
   }
 
-  // ---------- 切目录时释放浏览器连接池 ----------
-  //
-  // 浏览器对同源只有 6 条 HTTP/1.1 连接。网格里正在生成的缩略图会把它们占满，
-  // 此时切目录发出的 /api/list 只能排到队尾 —— 用户看到的现象就是「点了目录
-  // 没反应，要等几张缩略图冒出来界面才切换」。
-  // 实测（真实 Chromium，40 张未缓存缩略图 / 单张 1.2s）：
-  //   不取消        /api/list 等 1130 ~ 7140 ms（1~6 个缩略图生成周期）
-  //   只清空 DOM    /api/list 等 7140 ms（清 DOM 不会 abort 请求）
-  //   调用本函数    /api/list 等    15 ms（快约 100~500 倍）
-  //
-  // 原理：给 <img> 换 src 会让浏览器 abort 掉上一个还在飞的请求，立刻归还连接。
-  // 与 suspendGridRequests 的区别：那个是「暂停、稍后恢复」（打开查看器用），
-  // 这个是一次性丢弃 —— 旧格子马上会被 layout() 销毁，不需要恢复。
-  function cancelPendingGridRequests() {
-    for (var k in cellPool) {
-      var el = cellPool[k];
-      var im = el && el.querySelector ? el.querySelector('img.cell-thumb') : null;
-      if (im && !im.complete) {
-        im.onerror = null; // 占位不是「加载失败」，别触发降级成文件图标
-        im.src = BLANK_PIXEL;
-      }
-    }
-    gridSuspended = []; // 丢掉暂停记录，避免 resume 把已取消的请求又拉起来
-  }
-
   // fileCard 缩略图关闭时的占位单元格
   function fileCard(item) {
     var box = document.createElement('div');
@@ -1424,23 +2041,60 @@
     var realIdx = v.list.indexOf(target);
     if (realIdx < 0) realIdx = 0;
     v.index = realIdx;
-    viewer.classList.remove('hidden');
-    applyViewerAnimation();
-    // 先把网格在途的缩略图请求撤下来，再请求大图 —— 否则大图要排在它们后面
-    suspendGridRequests();
-    showCurrent(false); // 打开时只加载当前图，不预加载
-    pauseThumbGen();
-    // 2.3.0：**查看器 = 一层历史**（仅触屏档）。
+
+    // ---- 2.4.29：手机档 + 开关打开 ⇒ 竖图连续流（独立模块，不建轨道）----
     //
-    // 为什么必须做：查看器此前只是"叠在网格上的遮罩"、**不产生任何历史条目**。
-    //   历史里只有 mvGuardArm 压的那一条常驻守卫，于是：
-    //     在查看器里按返回 → 退掉的是那条**守卫条目**（而不是"关掉查看器"）
-    //     → 查看器仍开着、而守卫已经没了 ⇒ 用户再返回一次就**直接退出应用**。
-    //   （这正是用户报的"点进大图 → 返回 → 退出软件"。）
-    //   压上这一条之后，"返回"先退掉查看器这一层 ⇒ popstate → closeViewer ⇒ 回到网格。
-    // ⚠️ 网格的"进目录"在本版**不是**真导航（goUpLevel → loadDir 内部切换），
-    //    所以网格里的逐层返回靠的是"守卫每次补回 + mvOnPop 里回上级"，与查看器这条各管各的层级。
-    // 桌面档不加：桌面查看器是独立窗口，语义不同。
+    // 走这条分支时：不创建 .v-track、不加载 track 里的 prev/next、不装缩放状态 ——
+    // 一切都归 flow.js 自己管。返回/关闭仍由本文件的 closeViewer + history 守卫负责
+    //（这是历史上"返回退出软件"踩出来的机制，绝不能因为换了浏览形态就绕开）。
+    // 2.4.29 分流条件。
+    // ⚠️ 用 typeof 守卫读模块级变量：zzz_2230 会把本函数**抠到独立环境**里 eval
+    //    （那里没有 cfg / singleMode），裸引用会 ReferenceError 直接让历史回归测试红。
+    //    守卫之后两个环境语义一致：真实页面里它们一定存在，测试环境里按默认值走。
+    var single = (typeof singleMode !== 'undefined') && singleMode;
+    var flowWanted = (typeof cfg !== 'undefined') && cfg.mobileFlowView !== false;
+    var mf = (typeof flowModule === 'function') ? flowModule() : null;
+    var flowOpened = false;
+    if (PROFILE === 'touch' && !single && flowWanted &&
+        mf && typeof mf.open === 'function') {
+      // 先让查看器可见再 open：flow 要量 scrollEl.clientWidth 来算每张的高度，
+      // 在 display:none 的祖先里量出来是 0（会退回 window.innerWidth，虽然也能用，
+      // 但"先显示再量"才是确定的顺序）。open 失败就把查看器重新藏回去。
+      viewer.classList.remove('hidden');
+      applyViewerAnimation();
+      // 2.4.41：传 **path** 而不是下标 —— 流内部会按当前排序重排，下标在重排后没有意义。
+      try { flowOpened = mf.open(v.list, target.path); } catch (e) { flowOpened = false; }
+      if (flowOpened) {
+        v.mode = 'flow';
+        // 与轨道模式做同样两件事：撤下网格在途请求、让后台缩略图让路
+        suspendGridRequests();
+        pauseThumbGen();
+      } else {
+        viewer.classList.add('hidden');
+      }
+      // 打不开（host 没注入 / 列表为空）⇒ 落到下面走原来的左右滑，不能"点了没反应"
+    }
+
+    if (!flowOpened) {
+      v.mode = 'slide';
+      viewer.classList.remove('hidden');
+      applyViewerAnimation();
+      // 先把网格在途的缩略图请求撤下来，再请求大图 —— 否则大图要排在它们后面
+      suspendGridRequests();
+      showCurrent(false); // 打开时只加载当前图，不预加载
+      pauseThumbGen();
+    }
+    // **查看器 = 一层历史**（仅触屏档）。
+    //
+    // 网格里每一层目录都是真实页面（见 navigateTo），返回天然就是"回上一层页面"。
+    // 但查看器只是叠在网格上的一层遮罩、不产生任何页面 —— 不给它压一条历史的话，
+    // 在查看器里按返回会**直接退到上一层目录**（查看器还开着，网格已经换了）。
+    // 压上这一条之后，"返回"先落在这里 ⇒ popstate → mvOnPop → closeViewer ⇒ 回网格。
+    // 桌面档不加：桌面没有返回手势，查看器由 ✕ / Esc 关。
+    //
+    // 2.4.29：竖图流与轨道模式**共用这一处压栈**（不是各写一遍）——
+    // 压栈点必须只有一处，否则"历史里只该有一条查看器条目"这个前提就不成立了
+    //（多一条会让返回要按两次）。
     if (PROFILE === 'touch') {
       try { history.pushState({ mvViewer: 1 }, ''); } catch (e) {}
     }
@@ -1626,7 +2280,7 @@
       // 若不记，下面重排只能退到后端回传的**裸字段名**（如 "name"），方向随之丢失，
       // 表现为「一个方向正常、另一个方向被排成相反的顺序」。
       usedSort = sort;
-      listPromise = fetchJSON(API + '/list?path=' + enc(dir) + '&sort=' + enc(sort));
+      listPromise = fetchJSON(API + '/list?path=' + enc(dir) + '&sort=' + enc(sort) + externalTag());
     } else {
       // 1.8.173：**删掉了"先问飞牛文件管理器接口要顺序"这一步**。
       //
@@ -1646,7 +2300,7 @@
       //    190/191 已改回。排序字段由 resolveSortForDir 决定：大图读偏好，网格用 state.sort。
       listPromise = resolveSortForDir(dir, true).then(function (s) {
         usedSort = s;
-        return fetchJSON(API + '/list?path=' + enc(dir) + '&sort=' + enc(s));
+        return fetchJSON(API + '/list?path=' + enc(dir) + '&sort=' + enc(s) + externalTag());
       });
     }
     listPromise.then(function (d) {
@@ -2398,27 +3052,29 @@
     resizePickTimer = setTimeout(refreshMaxdimForViewport, 300);
   });
 
-  // 图片手势：只处理缩放（双击/滚轮），平移和切换由 vWrap 的滑动逻辑统一处理
+  // ---------- 屏幕水平三份（大图查看器唯一的"分区"来源） ----------
+  // 返回：-1 = 左 1/3（上一张）；0 = 中间 1/3（只响应双击放大）；1 = 右 1/3（下一张）。
+  //
+  // 语义是"屏幕"，所以基准必须是 vStage 的矩形，**不能**用图片自身的矩形：
+  // 一张竖图在宽窗口里只占中间一条，若按图片宽度分三份，"点屏幕左侧黑边"会被算成
+  // "点在图片中间" —— 于是切图与双击放大两个判定各说各话（一处切、一处放大）。
+  // 点击切图与 dblclick 放大必须共用这一个函数，别再各算一套（2.4.13 收敛成唯一来源）。
+  function stageZoneX(clientX) {
+    var r = $('vStage').getBoundingClientRect();
+    var x = clientX - r.left;
+    if (x < r.width / 3) return -1;
+    if (x > r.width * 2 / 3) return 1;
+    return 0;
+  }
+
+  // 图片手势：只处理滚轮缩放；平移与切换由 vWrap 的滑动逻辑统一处理。
+  //
+  // 2.4.13：**双击不再挂在这里**，改挂到 vWrap 上（一次注册，见下面）。
+  //   原来挂在每个 <img> 上 ⇒ 双击只在"图片像素上"才生效：长图上下留黑边、宽图左右留黑边
+  //   的地方双击完全没反应，用户会以为双击坏了；而"中间 1/3 = 缩放区"是屏幕语义，
+  //   不该跟着图片边界走。
   function attachImageGestures(img) {
     img.classList.add('zoomable');
-    img.addEventListener('dblclick', function (e) {
-      // 2.3.0：**以双击点为中心**放大（原来只是居中放大到 2×）。
-      //   做法：把"双击点相对图片中心"的偏移取负作为平移量，双击点在屏幕上保持不动。
-      if (v.zoomed) {
-        resetView();
-        applyTransform();
-        return;
-      }
-      var rect = this.getBoundingClientRect();
-      var cx = e.clientX - (rect.left + rect.width / 2);
-      var cy = e.clientY - (rect.top + rect.height / 2);
-      // 2.4.0：双击放大倍数按用户要求 2 → **3 倍**（再双击还原）。
-      v.scale = 3; v.zoomed = true; v.actual = false;
-      v.tx = -cx; v.ty = -cy;
-      updateFitBtn();
-      applyTransform();
-      maybeUpgradeToFull();
-    });
     img.addEventListener('wheel', function (e) {
       e.preventDefault();
       var factor = e.deltaY < 0 ? 1.15 : 0.87;
@@ -2434,21 +3090,57 @@
     }, { passive: false });
   }
 
-  // ---------- 跟手滑动切换（手机相册式） ----------
-  // 2.3.3/2.3.4：边缘单击的延迟判定窗（毫秒）—— **仅手机版**使用（见使用处）。
-  //   为什么必须有它：要做到"双击零闪烁"，就不能在第一下就切图 —— 只能先等一小会儿，
-  //   若这段时间内来了第二下（双击），直接取消 ⇒ 从头到尾没切过。
-  //   中间 1/3 不切图，所以不需要延迟、仍是零延迟。
-  var MV_TAP_DELAY_MS = 220;
+  // ---------- 双击放大：**只有中间 1/3**（2.4.13 按用户要求） ----------
+  //
+  // 三处一起改了，别只改一半：
+  //   ① 监听点从 <img> 移到 .v-media-wrap：vWrap 只包着滑动轨道（右下角 1:1 / 全屏按钮是
+  //      它的**兄弟节点**，天然不会误触），于是"中间 1/3 的黑边上双击"也能放大 ——
+  //      这正是原先挂在 img 上时漏掉的那块区域。
+  //   ② 分区用 stageZoneX（与点击切图**同一几何来源**），不再各算一套。
+  //   ③ 左/右 1/3 直接 return ⇒ **不放大**。那两下 click 由 vStage 的 click 处理（各切一张）。
+  //
+  // 守卫按 v.media 而不是 e.target：双击可能落在 .v-vbox / 黑边上，而 transform 永远作用在
+  // 当前媒体元素上；视频不支持缩放（app.js 只对 <img> 做 transform），按 tagName 拦掉。
+  vWrap.addEventListener('dblclick', function (e) {
+    if (e.target.closest && e.target.closest(VIEWER_CTL_SEL)) return;
+    var m = v.media;
+    if (!m || m.tagName !== 'IMG') return;
+    if (stageZoneX(e.clientX) !== 0) return;   // ★ 左/右 1/3：不响应双击放大
+    // 已放大 → 还原（这一步不需要 rect，先判掉）
+    if (v.zoomed) {
+      resetView();
+      applyTransform();
+      return;
+    }
+    // 2.3.0：**以双击点为中心**放大（原来只是居中放大到 2×）。
+    //   做法：把"双击点相对图片中心"的偏移取负作为平移量，双击点在屏幕上保持不动。
+    var rect = m.getBoundingClientRect();
+    var cx = e.clientX - (rect.left + rect.width / 2);
+    var cy = e.clientY - (rect.top + rect.height / 2);
+    // 2.4.0：双击放大倍数按用户要求 2 → **3 倍**（再双击还原）。
+    v.scale = 3; v.zoomed = true; v.actual = false;
+    v.tx = -cx; v.ty = -cy;
+    updateFitBtn();
+    applyTransform();
+    maybeUpgradeToFull();
+  });
 
-  // 2.3.2：双击判定窗（毫秒）。两次 tap 间隔小于它就认为是双击的第二下。
-  //   用时间窗而不是"延时 250ms 再切图" —— 那样单击切图会慢一拍，用户明确不要延迟。
-  var MV_DBL_TAP_MS = 300;
-  // 2.3.2：上一次 tap 的状态 —— 用来判断"这是不是双击的第二下"，以及该把图换回哪一张。
-  //   undo: 0 = 没切过；1 = 上一步切到了上一张；-1 = 切到了下一张。
-  //   at  : 上一次 tap 的时间戳。
-  //   刻意用**对象**而不是两个裸变量：它俩天生是一对，绑在一起语义更清楚。
-  var mvTap = { undo: 0, at: 0, timer: null };
+  // ---------- 跟手滑动切换（手机相册式） ----------
+  // 2.4.13：**220ms 的"单击/双击判定窗"已整笔删除**（原来是 220ms 那个判定窗常量）。
+  //
+  //   它当初（2.3.3）是为"双击不闪"付的赎金：单击若立刻切图，双击就会
+  //   "切过去 → 瞬间切回 → 放大"。但 2.3.0 起中间 1/3 **本来就不切图**，
+  //   2.4.13 起双击放大又**只认中间 1/3** ⇒ 左右两侧再不需要区分单击与双击，
+  //   判定窗失去作用对象，留着只会让每一次单击都慢 220ms。
+  //
+  //   ⇒ 现在触屏与鼠标一致：点左/右 1/3 **当帧切图**，没有任何等待。
+  //   ⇒ 代价（已知并接受）：左右快速双击 = 连切两张 —— "每一下点击都算数"，
+  //      这也正是本项目 1.8.x 花几个版本治好的"连点被吃掉"的反面。
+  //   ⚠️ 别因为"双击会切两张"把它加回来：zzz_2413 有闸门测试盯着
+  //      （Test2413TapSwitchIsSynchronous：click 返回时 prev/next 必须已调用且零定时器）。
+  //
+  //   顺带删掉的死代码：那个早没人引用的双击判定窗常量，以及 tap 状态对象
+  //   （它的 undo/at 字段自 2.3.3 起就没人读了）。
 
   var swipe = {
     active: false, startX: 0, startY: 0, dx: 0, dy: 0,
@@ -2874,11 +3566,20 @@
     warmTrackBoxes(typeof dir === 'number' ? dir : 1);
     settleAfterSwipe(track, dir);
   }
-  function next() { swipeTo(1); }
-  function prev() { swipeTo(-1); }
+  // 2.4.29：flow 打开时箭头键/左右点击都不该切图（轨道根本没建，切了也没意义）
+  function next() { if (flowOpen()) return; swipeTo(1); }
+  function prev() { if (flowOpen()) return; swipeTo(-1); }
 
   function closeViewer() {
     showListHint(false); // 2.0.0：关掉查看器时顺手收起可能还挂着的加载提示
+    // 2.4.29：若当前是竖图连续流，先把它收掉并记下"看到第几张"。
+    // 关闭动作本身仍走下面这套（resume 缩略图 / 历史回退 / 恢复网格），一行不跳 ——
+    // 换浏览形态不该改变"返回"的语义，这正是 2.3.0 那条历史守卫的意义。
+    var flowPath = '';
+    if (flowOpen()) {
+      try { flowPath = window.MVFlow.close() || ''; } catch (e) { flowPath = ''; }
+    }
+    v.mode = 'slide';
     // 恢复网格：把查看器期间变成占位图的缩略图重新请求回来。
     //
     // 1.8.175：**必须先让后端恢复，再重发** —— 顺序反了会拿到占位图，
@@ -2898,15 +3599,13 @@
     //
     // 为什么：打开查看器时我们压了一条 {mvViewer:1}（见 openViewerOverlay）。
     //   · 若是"返回"触发的关闭（mvViewerFromPop=true）⇒ 历史已经退了，这里不能再动；
-    //   · 若是**主动关闭** ⇒ 那条历史还在栈顶，不补一次 back 的话，
-    //     用户下一次按返回会**直接退掉一层目录**（多退一层）。
+    //   · 若是**主动关闭** ⇒ 那条历史还在栈顶，不补一次 back 的话，用户下一次按返回
+    //     会**直接退掉一层目录**（多退一层）。
     //   ⇒ 一句话：**我们压的条目，只有我们自己收得回来。**
+    //   退完那次 popstate 会进 mvOnPop，那时查看器已经隐藏 ⇒ 它什么都不会做。
     if (PROFILE === 'touch' && !mvViewerFromPop && !singleMode) {
       try {
-        if (history.state && history.state.mvViewer) {
-          mvSelfBack = true;   // 让紧接着的 mvOnPop 知道"这次是我们自己退的"
-          history.back();
-        }
+        if (history.state && history.state.mvViewer) history.back();
       } catch (e) {}
     }
     // 1.8.160：轨道没了，但视图状态（v.scale / v.zoomed / v.tx / v.ty）是挂在 v 上的、
@@ -2936,6 +3635,19 @@
     // 2.4.3：关掉查看器后**重新判定**宿主闸门 —— 若此时正停在聚合根层，
     //   闸门要重新挂上（打开查看器时清过一次）。旧版 2.2.0 也有这一处。
     try { syncExitTips(); } catch (e) {}
+
+    // 2.4.29：从竖图流退出来 ⇒ 把网格滚回"你看的那一张"（并闪一下）。
+    // 必须在 resumeGridRequests 之后：滚动会触发 renderVisible → 建格子 → 发缩略图请求，
+    // 顺序反了会在"请求被挂起"的状态下建一批格子，它们永远等不到图。
+    // 2.4.41：流内部会按当前排序重排，所以**不能**再用"下标对下标"换算（重排后下标全变）。
+    //   用 path 反查网格里的位置：点哪张就回到哪张。
+    if (flowPath) {
+      var gi = -1;
+      for (var fi = 0; fi < state.items.length; fi++) {
+        if (state.items[fi] && state.items[fi].path === flowPath) { gi = fi; break; }
+      }
+      if (gi >= 0) scrollToItem(gi, true);
+    }
   }
 
   // ================= 触屏模块接口（仅触屏档位暴露）=================
@@ -2948,7 +3660,9 @@
     window.__mvMobile = {
       version: '__MV_VERSION__',
       // --- 查询 ---
-      viewerOpen: function () { return !viewer.classList.contains('hidden'); },
+      // flow 打开时对 touch.js 报"查看器没开"：捏合只服务轨道里的单张图，
+      // 竖图流里既没有可缩放的 v.media，也不该被捏合抢走上下滚动。
+      viewerOpen: function () { return !viewer.classList.contains('hidden') && !flowOpen(); },
       stageRect: function () {
         var s = $('vStage');
         if (!s) return null;
@@ -3098,15 +3812,24 @@
   };
   updateFitBtn();
 
-  // 点击左/右半区切换（滑动后不触发，避免误触）
+  // 点击左/右 1/3 切换（滑动后不触发，避免误触）
+  //
+  // 2.4.13：**零延迟** —— 这里不再有任何 setTimeout。
+  //   原来触屏档要走 220ms 判定窗（怕把双击的第一下切走），现在中间 1/3 既不切图、
+  //   又独占双击放大，左右两侧的双击就按"两次点击"处理，判定窗整笔删掉。
   animateTransform(false); $('vStage').addEventListener('click', function (e) {
+    // 2.4.29：竖图流打开时，点击归 flow 自己（切 HUD），这里一律不处理 ——
+    // 否则"点一下想收起悬浮件"会顺手切换一张图。
+    //（写成 typeof 守卫而不是裸调 flowOpen()：zzz_2230/2310/2413 会把这段抠出来单独 eval，
+    //  独立环境里既没有那个局部函数、也没有 window —— typeof 对未声明标识符是安全的。）
+    if (typeof flowOpen === 'function' && flowOpen()) return;
     // 刚结束的多指手势（捏合 / 边缘返回）浏览器仍可能补一个 click —— 抑制掉，
     // 否则"捏合松手"会顺手翻一页。时间窗 400ms，过期自动失效（不会残留吞掉下一次点击）。
     if (Date.now() < tgesture.muteClickUntil) return;
     // pointerup 已经按点击处理过（见 endSwipe 的 dir === 0 分支），别再切一次
     if (swipe.suppressClick) { swipe.suppressClick = false; return; }
     if (e.target.closest(VIEWER_CTL_SEL)) return;
-    // ★ 顺序要紧：**先判"这是不是一次点击"，再决定 ≥2 倍时归位。**
+    // ★ 顺序要紧：**先判"这是不是一次点击"，再决定要不要归位。**
     //
     // 1.8.161 修：1.8.160 把下面那条 ≥2 倍的 `return` 改成了 `resetView()`，
     // 但**留在了这条距离守卫之前** —— 原来 `return`（什么都不做）放在前面无害，
@@ -3117,70 +3840,23 @@
     //
     // 所以距离守卫必须在前：拖动过（>8px）就**直接当作拖动**、不进入任何点击逻辑。
     if (Math.abs(swipe.dx) > 8 || Math.abs(swipe.dy) > 8) return;
-    // ≥2 倍时**与键盘 ←/→ 保持一致 —— 先归位**（第二次点击才切图；此时已确认是点击）。
+    // 2.3.0：**屏幕分三份**（图片与视频统一）：左 1/3 = 上一张；中间 = 什么都不做；右 1/3 = 下一张。
     //
-    // 原来这里是 `return`（点图什么都不做），而键盘与界面 ❮/❯ 走 swipeTo，那里是
-    // `if (v.scale >= SWIPE_LOCK_SCALE) { resetView(); applyTransform(); return; }`
-    // —— 同一个"切图"动作两个入口表现不同，而"点了一下完全没反应"最容易让人
-    // 以为功能坏了，所以统一成"先归位"。
-    // 2.3.1：**先分区、再决定要不要归位**。
-    //
-    // 原来这条 ≥2× 的归位放在分区**之前** ⇒ 放大后点**中间**也会"恢复原状"，
-    // 而用户要的是"中间什么都不做"（中间只负责双击缩放）。
-    // 现在：中间直接 return；只有左右 1/3 才有"先归位"这一步（与键盘 ←/→ 一致）。
-    var rect = this.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var _left = rect.width / 3;
-    var _right = rect.width * 2 / 3;
-    if (x >= _left && x <= _right) return;   // 中间 1/3：无论缩放，什么都不做
-    // 2.3.2：**双击的第二下（detail >= 2）不再切图**，并把第一下切走的索引还原。
-    //   否则"在左/右 1/3 双击"= 切一张 + 放大（用户实测报的"边缘双击还会切图然后放大"）。
-    //   还原后由 dblclick 负责放大；单击切图仍是零延迟。
-    // 2.3.3：双击的第二下 ⇒ **取消**待执行的单击切图（于是全程没有切过图，零闪烁）。
-    if (e.detail >= 2) {
-      if (mvTap.timer) { clearTimeout(mvTap.timer); mvTap.timer = null; }
-      return;
-    }
-    // 2.3.3：**取消"放大到 2× 以上时单击先归位"**（用户明确要求）。
-    //   现在放大后点击直接按分区切图；拖动仍然是平移（pointermove 的放大分支没动）。
-    // 2.3.0：**屏幕分三份**（图片与视频统一）。
-    //
-    //   左 1/3 = 上一张；中间 1/3 = **什么都不做**；右 1/3 = 下一张。
-    //
-    // 2.3.2：**双击的第二下不切图，并把第一下切走的索引还原**。
-    //   中间 1/3 本来就不切图，但左右 1/3 的第一下会立即切（这是"零延迟"的代价）。
-    //   若紧接着来了第二下（e.detail >= 2）说明用户其实是在双击，
-    //   于是把索引换回来、让 dblclick 去放大 —— 用户看到的就是"双击只放大"。
-    //   （不做 250ms 延迟，单击切图仍是零延迟。）
-    //
-    // 为什么中间必须"什么都不做"：双击的两下 click 都会命中同一个区域。
-    //   如果中间也切图，双击就会"先切一张/两张、再放大"（用户实测报的正是这个）。
-    //   而把中间留空之后，双击的两下 click 都落在"不切图"区 ⇒
-    //   **不需要用 300ms 延迟去区分单击与双击**，切图仍是零延迟。
-    //   （这正是 touch.js 文件末尾"加双击必须延迟 300ms"那个死结的解法。）
-    // （分区变量在函数开头已经算好：_left / _right。中间 1/3 已在上面 return，
-    //   所以能走到这里必然是左右两侧 —— 不要再重复算一遍，那会让"分区"有两个来源。）
-    // 2.3.3：**延迟 MV_TAP_DELAY_MS 再切图**。
-    //   这段窗口内若来了双击的第二下，上面的 clearTimeout 会把它取消 ⇒ 一次都没切过。
-    //   中间 1/3 已在上面 return，所以只有左右边缘会走到这里。
-    // 2.3.4：**延迟只对手机版**。
-    //   手机：手指双击误触率高，需要 220ms 判定窗来做到"双击零闪烁"。
-    //   桌面：鼠标双击精准，而"单击切图"是高频操作，220ms 是能被感知的延迟 ⇒ 立即切。
+    // 中间为什么必须留空：双击的两下 click 都命中同一个区域，中间若也切图，
+    //   双击就会"先切一张/两张、再放大"（用户实测报过）。留空之后，
+    //   **不需要判定窗也能区分单击与双击** —— 这正是 2.4.13 能删掉 220ms 的前提。
+    // 分区收敛到 stageZoneX()：它是"屏幕三份"的唯一来源，dblclick 放大也用它，
+    //   别再在这里就地重算 _left/_right（两个来源必然漂移）。
+    var zx = stageZoneX(e.clientX);
+    if (zx === 0) return;   // 中间 1/3：无论缩放，什么都不做（双击放大由 vWrap 的 dblclick 负责）
+    // 2.3.3：**没有"放大到 2× 以上时单击先归位"**（用户明确要求：放大后点击直接切图）。
     // 2.4.1：**手机版放大后不响应左右切图**（用户要求）。
     //   放大是为了看细节 —— 此时点左右应该什么都不做，只能拖动查看；
-    //   切图必须先缩回原状（双击还原）再点。桌面版不受影响（鼠标精确，直接切更顺手）。
+    //   切图必须先缩回原状（双击中间还原）再点。桌面版不受影响（鼠标精确，直接切更顺手）。
     if (PROFILE === 'touch' && v.scale > 1.01) return;
-    if (PROFILE === 'touch') {
-      if (mvTap.timer) { clearTimeout(mvTap.timer); mvTap.timer = null; }   // 连点多次只算最后一次
-      mvTap.timer = setTimeout(function () {
-        mvTap.timer = null;
-        if (x < _left) prev();
-        else if (x > _right) next();
-      }, MV_TAP_DELAY_MS);
-    } else {
-      if (x < _left) prev();
-      else if (x > _right) next();
-    }
+    // 2.4.13：**当帧切图**。触屏与鼠标走同一条路 —— 每一下点击都算数，
+    //   所以左右快速双击 = 连切两张（见上面「跟手滑动切换」一段的取舍说明）。
+    if (zx < 0) prev(); else next();
   });
 
   document.addEventListener('keydown', function (e) {
@@ -3230,11 +3906,21 @@
   };
   // 初始化排序控件：让下拉框高亮与升降序按钮图标和 state.sort 保持一致。
   applySort(state.sort, false);
+  // 小视图（格子 96px）要让名称字号收一档。
+  // 大视图格子 180px，15px 的名称条占 20% 很合适；但同一个 15px 放到 96px 的格子里，
+  // 名称条会占到近四成，封面被挤成一条 —— 名称不该抢封面的戏。
+  // 用一个 body class 让 CSS 跟着切（不改 DOM 结构，切换时也无需重建格子）。
+  function syncCellModeClass() {
+    if (!document.body) return;
+    if (state.cellMode === 'small') document.body.classList.add('mv-small');
+    else document.body.classList.remove('mv-small');
+  }
   $('sizeLarge').onclick = function () {
     if (state.cellMode === 'large') return;
     state.cellMode = 'large';
     try { localStorage.setItem('mediaview_cellMode', 'large'); } catch(e) {}
     this.classList.add('active'); $('sizeSmall').classList.remove('active');
+    syncCellModeClass();
     layout(true);
   };
   $('sizeSmall').onclick = function () {
@@ -3242,6 +3928,7 @@
     state.cellMode = 'small';
     try { localStorage.setItem('mediaview_cellMode', 'small'); } catch(e) {}
     this.classList.add('active'); $('sizeLarge').classList.remove('active');
+    syncCellModeClass();
     layout(true);
   };
   // 初始化时按 state.cellMode 同步按钮高亮（从 localStorage 恢复后可能是 small），
@@ -3253,6 +3940,7 @@
     $('sizeLarge').classList.add('active');
     $('sizeSmall').classList.remove('active');
   }
+  syncCellModeClass();
 
   // ================= SETTINGS =================
   var browsePath = null;
@@ -3267,6 +3955,13 @@
   function applySettings(s) {
     if (!s) return;
     cfg.thumbEnabled = !!s.thumbEnabled;
+    cfg.coverEnabled = s.coverEnabled !== false;
+    cfg.coverNameBelow = s.coverNameBelow === true;
+    // 2.4.29：缺字段时按"开"处理（与后端默认一致；老版本保存回来的 JSON 里没有这一项）
+    cfg.mobileFlowView = s.mobileFlowView !== false;
+    cfg.onlyRoots = !!s.onlyRoots;
+    cfg.roots = Array.isArray(s.roots) ? s.roots.slice() : [];
+    cfg.rootsInfo = Array.isArray(s.rootsInfo) ? s.rootsInfo : [];
     cfg.thumbDir = s.thumbDir || '';
     cfg.thumbSize = parseInt(s.thumbSize, 10) || 320;
     cfg.thumbQuality = parseInt(s.thumbQuality, 10) || 80;
@@ -3311,6 +4006,8 @@
     $('settings').classList.remove('hidden');
     $('saveHint').textContent = '';
     $('saveHint').classList.remove('err');
+    setRootHint('');
+    $('dirBrowser').classList.add('hidden');
     // 表单填好之前禁止保存：此刻 DOM 里全是 HTML 静态默认值（缩略图未勾选、尺寸 160、画质 60），
     // 而后端是**整份替换** —— 手快在 GET 返回前点一次保存，就会把用户配置静默重置掉。
     var btn = $('settingsSave');
@@ -3319,6 +4016,7 @@
       applySettings(s);
       fillSettingsForm();
       btn.disabled = false;
+      coverPregenRestore();   // 后台任务的进度与按钮状态跟着面板一起恢复
     }).catch(function () {
       // 读取失败就保持禁用：宁可不让保存，也不能用默认值覆盖用户配置
       $('saveHint').classList.add('err');
@@ -3332,6 +4030,14 @@
 
   function fillSettingsForm() {
     $('setThumbEnabled').checked = cfg.thumbEnabled;
+    $('setCover').checked = cfg.coverEnabled;
+    $('setCoverName').checked = cfg.coverNameBelow;
+    // 容错：旧 index.html 配新 app.js 时这个开关不存在，不能因此让整个设置面板打不开
+    var mfEl = $('setMobileFlow');
+    if (mfEl) mfEl.checked = cfg.mobileFlowView !== false;
+    $('setOnlyRoots').checked = cfg.onlyRoots;
+    pendingRoots = (cfg.roots || []).slice();
+    renderRootsList();
     $('setThumbDir').value = cfg.thumbDir || '';
     setSelValue('setThumbSize', String(cfg.thumbSize));
     setSelValue('setThumbQuality', String(cfg.thumbQuality));
@@ -3412,9 +4118,95 @@
     }
   }
 
+  // ---- 已添加的文件夹（「只显示我添加的文件夹」）----
+  //
+  // pendingRoots 是设置面板里的**工作副本**：增删只改它，点「保存」才写回服务端。
+  // 这样点错了还能取消 —— 直连保存的话一次误触就改掉了整个可见范围。
+  var pendingRoots = [];
+  var dbPickTarget = 'thumbDir'; // 目录选择器当前用途：'thumbDir' | 'root'
+
+  // 目录是否还在：状态来自服务端 rootsInfo（前端拿不到文件系统）。
+  // 刚添加、还没保存过的条目不在 rootsInfo 里 —— 先按"可访问"显示。
+  function rootExists(path) {
+    for (var i = 0; i < (cfg.rootsInfo || []).length; i++) {
+      var r = cfg.rootsInfo[i];
+      if (r && r.path === path) return !!r.exists;
+    }
+    return true;
+  }
+
+  function setRootHint(t) {
+    var el = $('rootHint');
+    if (el) el.textContent = t || '';
+  }
+
+  function renderRootsList() {
+    var box = $('rootList');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!pendingRoots.length) {
+      var e = document.createElement('div');
+      e.className = 'root-empty';
+      e.textContent = '还没有添加文件夹。开关关闭时这份列表不生效。';
+      box.appendChild(e);
+      return;
+    }
+    pendingRoots.forEach(function (p, idx) {
+      var row = document.createElement('div');
+      row.className = 'root-item' + (rootExists(p) ? '' : ' missing');
+      var ico = document.createElement('span');
+      ico.className = 'root-ico';
+      ico.textContent = rootExists(p) ? '📁' : '⚠️';
+      var txt = document.createElement('span');
+      txt.className = 'root-text';
+      var name = document.createElement('span');
+      name.className = 'root-name';
+      name.textContent = baseName(p);
+      var path = document.createElement('span');
+      path.className = 'root-path';
+      path.textContent = p;
+      path.title = p;
+      txt.appendChild(name);
+      txt.appendChild(path);
+      var del = document.createElement('button');
+      del.className = 'btn ghost mini root-del';
+      del.textContent = '移除';
+      del.onclick = function () {
+        pendingRoots.splice(idx, 1);
+        renderRootsList();
+        setRootHint('已移除，点「保存」生效');
+      };
+      row.appendChild(ico);
+      row.appendChild(txt);
+      row.appendChild(del);
+      box.appendChild(row);
+    });
+  }
+
   // ---- directory browser ----
+  // 面板的宿主：点哪个按钮，就在那个区块里展开。
+  //
+  // 早期版本把面板固定放在设置主体末尾，结果点「添加文件夹」会滚到「缩略图缓存」
+  // 那块（清空缓存 / 清除所有数据）的下面 —— 用户看到的是"缩略图区域"，以为跳错了地方。
+  // 就地展开没有这个歧义：按钮下面紧接就是目录列表。
+  function browserHostFor(target) {
+    return $(target === 'root' ? 'rootBrowserHost' : 'thumbBrowserHost');
+  }
+
   function openBrowser(startPath) {
-    $('dirBrowser').classList.remove('hidden');
+    var box = $('dirBrowser');
+    var host = browserHostFor(dbPickTarget);
+    if (host && box.parentNode !== host) {
+      // appendChild 会把节点**移过来**（不是复制）：只有一份 DOM/状态，
+      // 浏览到哪一层、列表内容都跟着走，不用维护两套选择器。
+      host.appendChild(box);
+    }
+    box.classList.remove('hidden');
+    // 按钮文案跟着用途走：两处入口共用同一个面板，不标出来很容易点错
+    // （在缩略图入口点"添加此文件夹"会以为加进了列表，其实写进了输入框）。
+    $('dbPick').textContent = dbPickTarget === 'root' ? '添加此目录' : '用此目录';
+    // 就地展开后可能贴着视口底部：nearest 只在需要时滚动，已可见时不动。
+    try { box.scrollIntoView({ block: 'nearest' }); } catch (e) { box.scrollIntoView(); }
     browse(startPath || null);
   }
 
@@ -3457,6 +4249,13 @@
 
     var body = {
       thumbEnabled: $('setThumbEnabled').checked,
+      coverEnabled: $('setCover').checked,
+      coverNameBelow: $('setCoverName').checked,
+      // 2.4.29：手机端竖图连续流（桌面不生效，但值照样存 —— 换设备登录时状态一致）
+      // 缺元素时按后端默认（开）处理，别把用户已经打开的开关悄悄关掉
+      mobileFlowView: $('setMobileFlow') ? $('setMobileFlow').checked : true,
+      onlyRoots: $('setOnlyRoots').checked,
+      roots: pendingRoots.slice(),
       thumbDir: $('setThumbDir').value.trim(),
       thumbSize: parseInt($('setThumbSize').value, 10) || 320,
       thumbQuality: parseInt($('setThumbQuality').value, 10) || 80,
@@ -3489,6 +4288,8 @@
       return r.json();
     }).then(function (res) {
       btn.disabled = false;
+      var prevOnly = cfg.onlyRoots;
+      var prevRoots = (cfg.roots || []).join('|');
       applySettings(res.settings);
       fillSettingsForm();
       $('saveHint').textContent = '已保存';
@@ -3496,6 +4297,15 @@
       toast('设置已保存');
       // 画质/缩略图目录/尺寸都可能变了：换一批 URL，避免浏览器沿用旧缩略图
       bumpThumbCacheBust();
+      // ★ 可见范围变了 ⇒ 必须**回首页重新取数**，不能只重绘：
+      //   当前所在的目录可能已经不在范围内，服务端会对它的请求返回 403，
+      //   而界面还停在原地 —— 那就是"设置改了、界面没变"。
+      if (prevOnly !== cfg.onlyRoots || prevRoots !== (cfg.roots || []).join('|')) {
+        state.root = false;
+        state.path = null;
+        buildRoot();
+        return;
+      }
       // 目录或缩略图参数变化 → URL 可能已变，统一重绘当前视图
       redraw();
     }).catch(function (e) {
@@ -3556,39 +4366,190 @@
   };
 
   $('btnSettings').onclick = openSettings;
+  // 重建按钮按当前目录**内容分流**（2.4.26）：
+  //   · 有子文件夹 → 逐个重建子文件夹的封面（POST /dircov/rebuild，并发 4）；
+  //   · 有媒体文件 → 清当前层这些文件的缩略图（/thumb/clear&shallow=1，**非递归**，
+  //     不碰下层），清完前台请求 + 后台入队会立刻重新生成；
+  //   · 两者都有 → 两者都做。空目录直接提示。
   $('btnRebuildThumbs').onclick = function () {
     if (!state.path) { toast('请先进入一个目录'); return; }
-    if (!confirm('重建当前目录的缩略图缓存？\n\n' + state.path)) return;
-    fetch(API + '/thumb/clear?path=' + encodeURIComponent(state.path), { method: 'POST' })
-      .then(function (r) {
-        return r.text().then(function (t) {
-          try { return JSON.parse(t); } catch (e) { return { ok: false, error: '非JSON响应: ' + t.substring(0, 200), status: r.status }; }
-        });
-      })
-      .then(function (d) {
-        if (d.ok) {
-          toast('已清除，正在重新生成…');
-          bumpThumbCacheBust();
-          setTimeout(function () { loadDir(state.path); }, 300);
-        } else {
-          toast('清除失败: ' + (d.error || d.status || 'unknown'));
-        }
-      })
-      .catch(function (e) { toast('清除失败: ' + e.message); });
+    var dirs = [], nFiles = 0;
+    (state.items || []).forEach(function (it) {
+      if (!it || !it.path) return;
+      if (it.kind === 'dir') dirs.push(it.path);
+      else nFiles++;
+    });
+    var doCover = dirs.length > 0 && cfg.coverEnabled;
+    var doThumb = nFiles > 0 && cfg.thumbEnabled;
+    if (!doCover && !doThumb) { toast('当前目录没有可重建的内容'); return; }
+    var parts = [];
+    if (doCover) parts.push(dirs.length + ' 个子文件夹的封面');
+    if (doThumb) parts.push(nFiles + ' 个文件的缩略图');
+    if (!confirm('重建当前目录？\n\n' + parts.join('，以及') + '\n\n' + state.path)) return;
+
+    var coverOk = 0, coverFail = 0, thumbOk = false;
+    var jobs = [];
+    if (doCover) {
+      // 并发 4：与格子缩略图的并发纪律对齐，再高只会跟前台抢磁盘/CPU
+      var CONC = 4, idx = 0;
+      function worker() {
+        if (idx >= dirs.length) return Promise.resolve();
+        var p = dirs[idx++];
+        return fetch(API + '/dircov/rebuild?path=' + encodeURIComponent(p) +
+          '&size=' + (cfg.thumbSize || 320), { method: 'POST' })
+          .then(function (r) { if (r.ok) coverOk++; else coverFail++; })
+          .catch(function () { coverFail++; })
+          .then(worker);
+      }
+      for (var i = 0; i < Math.min(CONC, dirs.length); i++) jobs.push(worker());
+    }
+    var chain = Promise.all(jobs).then(function () {
+      if (!doThumb) return;
+      // shallow=1：只清当前层文件的缩略图，不递归下层（下层交给各自的"重建"去管）
+      return fetch(API + '/thumb/clear?path=' + encodeURIComponent(state.path) + '&shallow=1', { method: 'POST' })
+        .then(function (r) {
+          return r.text().then(function (t) {
+            var d;
+            try { d = JSON.parse(t); } catch (e) { d = { ok: false }; }
+            thumbOk = !!d.ok;
+          });
+        })
+        .catch(function () { thumbOk = false; });
+    });
+    chain.then(function () {
+      var msg = [];
+      if (doCover) {
+        msg.push('封面重建 ' + coverOk + ' 个' + (coverFail ? '（失败 ' + coverFail + '）' : ''));
+      }
+      if (doThumb) {
+        msg.push(thumbOk ? '缩略图已清，正在重新生成…' : '缩略图清除失败');
+      }
+      toast(msg.join('；'));
+      bumpThumbCacheBust();
+      setTimeout(function () { loadDir(state.path); }, 300);
+    });
   };
   $('settingsClose').onclick = closeSettings;
   $('settingsCancel').onclick = closeSettings;
   $('settingsMask').onclick = closeSettings;
   $('settingsSave').onclick = saveSettings;
+
+  // ---------- 一键生成文件夹封面 ----------
+  // 与按需生成共用同一套磁盘缓存（服务端同 buildCover / 同 dircov 目录），
+  // 所以重复点不会重做，已生成目录直接跳过（幂等）。
+  var coverPregenTimer = null;
+  var coverPregenWasRunning = false;
+
+  function coverPregenStart() {
+    // 起始目录 = 当前浏览的目录；在聚合根/还没进目录时从头开始
+    var startPath = (state.root || !state.path) ? '/' : state.path;
+    var url = API + '/dircov/pregen?path=' + enc(startPath) +
+      '&size=' + (cfg.thumbSize || 320);
+    var el = $('coverPregenStatus');
+    if (el) el.textContent = '准备中…';
+    fetch(url, { method: 'POST' }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error((t || '').trim()); });
+      return r.json();
+    }).then(function () {
+      coverPregenWasRunning = false;
+      coverPregenPoll();
+    }).catch(function (e) {
+      if (el) el.textContent = '启动失败：' + (e.message || '');
+      toast('一键生成启动失败：' + (e.message || ''));
+    });
+  }
+
+  // coverPregenDoneText 完成文案。
+  //
+  // truncated 是服务端给的"目录清单撞到安全阀、还有目录没排进来"——
+  // **必须说出来**：2.4.45 之前上限固定 3000 且截断是静默的，界面只显示
+  // "已完成：新生成 N 个"，用户以为全做完了，实际后面几千个文件夹永远没封面。
+  function coverPregenDoneText(s) {
+    var msg = '已完成：新生成 ' + (s.generated || 0) + ' 个，跳过 ' + (s.skipped || 0) + ' 个';
+    if (s.failed) msg += '，失败 ' + s.failed + ' 个';
+    if (s.truncated) {
+      msg += '。目录太多，本次只排到前 ' + (s.total || 0) +
+        ' 个目录：再点一次「开始」继续（已生成的会跳过）';
+    }
+    return msg;
+  }
+
+  function coverPregenPoll() {
+    if (coverPregenTimer) { clearTimeout(coverPregenTimer); coverPregenTimer = null; }
+    fetchJSON(API + '/dircov/pregen').then(function (s) {
+      var el = $('coverPregenStatus');
+      var btn = $('btnCoverPregen');
+      if (!s || !s.running) {
+        if (btn) btn.textContent = '开始';
+        if (s && s.finished) {
+          var msg = coverPregenDoneText(s);
+          if (el) el.textContent = msg;
+          toast(msg);
+          // 从「生成中」→「完成」这一次刷新网格，让刚生成的封面显示出来
+          if (coverPregenWasRunning) { coverPregenWasRunning = false; redraw(); }
+        }
+        return;
+      }
+      coverPregenWasRunning = true;
+      var pct = s.total > 0 ? Math.floor(s.done * 100 / s.total) : 0;
+      if (el) el.textContent = '生成中 ' + s.done + ' / ' + (s.total || '?') + '（' + pct + '%）';
+      if (btn) btn.textContent = '取消';
+      coverPregenTimer = setTimeout(coverPregenPoll, 800);
+    }).catch(function () {
+      coverPregenTimer = setTimeout(coverPregenPoll, 1500);
+    });
+  }
+
+  // 每次打开设置页都恢复一次进度显示：一键生成跑在**服务端后台**，
+  // 关掉面板 / 刷新页面都不该中断它。不恢复的话按钮会退回「开始」，
+  // 用户以为任务被取消了，再点一次只会得到「已经在一键生成中」。
+  function coverPregenRestore() {
+    fetchJSON(API + '/dircov/pregen').then(function (s) {
+      if (!s) return;
+      var el = $('coverPregenStatus');
+      var btn = $('btnCoverPregen');
+      if (s.running) {
+        coverPregenWasRunning = true;
+        if (btn) btn.textContent = '取消';
+        coverPregenPoll();
+        return;
+      }
+      if (btn) btn.textContent = '开始';
+      if (s.finished && el) {
+        el.textContent = coverPregenDoneText(s);
+      }
+    }).catch(function () {});
+  }
+
+  function coverPregenCancel() {
+    fetch(API + '/dircov/pregen/cancel', { method: 'POST' }).then(function () {
+      if (coverPregenTimer) { clearTimeout(coverPregenTimer); coverPregenTimer = null; }
+      coverPregenWasRunning = false;
+      var el = $('coverPregenStatus');
+      if (el) el.textContent = '已取消（已生成的部分仍然有效）';
+      var btn = $('btnCoverPregen');
+      if (btn) btn.textContent = '开始';
+    }).catch(function () {});
+  }
+
+  if ($('btnCoverPregen')) {
+    $('btnCoverPregen').onclick = function () {
+      if (this.textContent === '取消') coverPregenCancel();
+      else coverPregenStart();
+    };
+  }
   $('setThumbEnabled').onchange = syncThumbOpts;
   $('setTheme').onchange = function () {
     applyTheme(this.value);
   };
   $('btnBrowse').onclick = function () {
-    if (!$('dirBrowser').classList.contains('hidden')) {
-      $('dirBrowser').classList.add('hidden');
+    var box = $('dirBrowser');
+    // 只有"开着且用途就是本处"才收起；否则切换用途（共用面板，不能一律关掉）
+    if (!box.classList.contains('hidden') && dbPickTarget === 'thumbDir') {
+      box.classList.add('hidden');
       return;
     }
+    dbPickTarget = 'thumbDir';
     // 起点策略：输入框里已有路径 → 从那里开始；
     // 否则从「存储空间聚合层」开始（而不是当前的缩略图目录）——
     // 当前目录多半是深度路径，从那儿出发根本挑不到别的位置。
@@ -3599,11 +4560,37 @@
     $('dirHint').textContent = '将使用默认目录：' + (cfg.defaultThumbDir || '');
   };
   $('dbPick').onclick = function () {
-    if (browsePath) {
+    if (!browsePath) return;
+    if (dbPickTarget === 'root') {
+      if (pendingRoots.indexOf(browsePath) >= 0) {
+        setRootHint('这个文件夹已经在列表里了');
+      } else {
+        pendingRoots.push(browsePath);
+        renderRootsList();
+        setRootHint('已添加：' + browsePath + '（点「保存」生效）');
+        // 列表在面板上方，选择器在底部 —— 不滚回去用户看不到刚加的那一项，
+        // 会以为还是没加上，于是一直点。
+        try { $('rootList').scrollIntoView({ block: 'nearest' }); } catch (e) {}
+      }
+    } else {
       $('setThumbDir').value = browsePath;
       $('dirHint').textContent = '已选择：' + browsePath;
-      $('dirBrowser').classList.add('hidden');
     }
+    $('dirBrowser').classList.add('hidden');
+  };
+  $('btnAddRoot').onclick = function () {
+    var box = $('dirBrowser');
+    // 已经开着且用途就是本处 ⇒ 再点一次收起（与「选择目录」按钮同一套手感）
+    if (!box.classList.contains('hidden') && dbPickTarget === 'root') {
+      box.classList.add('hidden');
+      return;
+    }
+    dbPickTarget = 'root';
+    setRootHint('');
+    openBrowser(null); // 从"存储空间聚合层"起步：这里本来就要挑别的目录
+  };
+  $('dbClose').onclick = function () {
+    $('dirBrowser').classList.add('hidden');
   };
   $('btnPurge').onclick = function () {
     var b = this;
@@ -3647,9 +4634,25 @@
 
   // ---------- Boot ----------
 
+  // 2.4.40：**第一条历史条目必须自带目录**。
+  //
+  //   从桌面图标进来时 URL 是 `/app/mediaview`（没有 ?dir=）。就那样停着的话，
+  //   用户点进第一个文件夹再按返回，回到的是一条"没有目录"的页面 —— 它只能靠
+  //   localStorage 猜目录，很可能又落回同一个文件夹（看起来像"返回没反应"）。
+  //   这里用 replaceState 把**当前这条条目改名**成显式目录：不重载、不新增条目。
+  function fixEntryURL(dir) {
+    if (qsHadDir) return;   // 已经带 ?dir=（真导航落地的页面）：URL 本身就是真相，别动它
+    try {
+      history.replaceState(null, '', GW + '/?dir=' + encodeURIComponent(dir || '/'));
+    } catch (e) { /* 沙箱里不让改 URL：只是这一层不能靠 URL 恢复，不影响功能 */ }
+  }
+
+  var qsHadDir = false;
+
   function boot() {
     var qs = new URLSearchParams(location.search);
     var single = qs.get('path');
+    qsHadDir = qs.get('dir') !== null;
     if (single) {
       // ⚠️ 这里**不再** `singleMode = true` —— 它已经在顶层按 URL 定好了
       //（见「单图 / 独立看图窗口模式」那段）。同一条判据分两处写，迟早会分叉。
@@ -3687,6 +4690,19 @@
       }
       state.root = false;
       state.path = dirParam;
+      // 2.4.31：**不等 settings**，先把目录快照铺上。
+      //   快照里只有 items（网格内容），而 layout 只用得到 cellMode（localStorage）
+      //   和容器宽度 —— 都不依赖设置接口。所以"回到刚看过的目录"可以做到
+      //   **接口还没回、画面已经在**，这才是真正的"不闪"。
+      //   loadDir 里还有一次快照应用，靠 sameItems 判重避免重复布局。
+      var earlySnap = loadSnap(dirParam, state.sort);
+      if (earlySnap) {
+        state.items = earlySnap.items;
+        state.files = earlySnap.files || [];
+        renderCrumb();
+        // 连滚动位置一起恢复：整页重载回来时也停在"你刚才看到的那一屏"
+        applyItems(null, earlySnap.top || 0);
+      }
       settingsReady = loadSettings();
       settingsReady.then(function () { loadDir(dirParam); });
       return;
@@ -3700,10 +4716,15 @@
     }
     settingsReady = loadSettings();
     settingsReady.then(function () {
-      if (last) {
+      // 2.4.16：开启「只显示我添加的文件夹」时**不恢复上次目录**。
+      // 启动就该落在"我的文件夹"这一层：旧地址可能已不在可见范围内，
+      // 恢复它要么先吃一个 403 再回退、要么把用户送进一个他刚表示不想看到的位置。
+      if (last && !cfg.onlyRoots) {
+        fixEntryURL(last);
         fetchJSON(API + '/list?path=' + enc(last)).then(function () { loadDir(last); })
-          .catch(buildRoot);
+          .catch(function () { fixEntryURL('/'); buildRoot(); });
       } else {
+        fixEntryURL('/');
         buildRoot();
       }
     });
@@ -3712,6 +4733,11 @@
   // beforeunload 与 pagehide 都挂：移动端与部分宿主里前者不触发，后者更标准；
   // pagehide 加了 persisted 判断，进 bfcache（页面没销毁、返回后查看器还开着）时不误恢复。
   window.addEventListener('beforeunload', flushResumeThumbGen);
-  window.addEventListener('pagehide', function (e) { if (!e.persisted) flushResumeThumbGen(); });
+  // 2.4.40：真导航 / 宿主手势返回都会卸载页面 —— 离开前把"看到第几屏"写进快照，
+  //   返回时才能停回原处（navigateTo 里也调了一次；这里兜住不由我们发起的那种离开）。
+  window.addEventListener('pagehide', function (e) {
+    try { rememberScroll(); } catch (e2) {}
+    if (!e.persisted) flushResumeThumbGen();
+  });
   boot();
 })();

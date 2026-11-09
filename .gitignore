@@ -27,3 +27,10 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.log
+
+# 本机冒烟与打包临时目录（只忽略仓库根下的，别碰 src 里的测试夹具）
+/_smoke/
+/_out*/
+
+# 交互探针的依赖（按需 npm i，不入库）
+/tools/node_modules/

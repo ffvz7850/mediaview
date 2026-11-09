@@ -606,6 +606,8 @@ body {
 
 /* directory browser */
 .dir-browser {
+  /* modal-body 是 flex column：不给 flex-shrink 的话它会被压扁到看不见 */
+  flex: 0 0 auto;
   margin-top: 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -763,3 +765,225 @@ body {
   /* ⑦ 设置弹层：100vh 在移动端包含地址栏，底部会被顶出屏幕 → 用 dvh */
   .modal-box { max-height: calc(100dvh - 40px); }
 }
+
+/* 手机端「竖图连续浏览」（2.4.29，flow.js）
+   单列铺满宽度、图与图之间 0 间距。无缝靠四条：
+     ① item 与 img 都是 display:block，避免行内基线的空隙；
+     ② 不设 margin / border / border-radius（圆角处必露底）；
+     ③ item 高度由 JS 用**整数 px** 指定（小数高度会在拼接处留 1px 亮线）；
+     ④ 容器背景纯黑（与大图查看器一致），露出来的也是黑，不是"一条缝"。
+   宽度就是手机宽度（100%），左右不留白。
+   ⚠️ 整块包在 @media (pointer: coarse) 里：这既是 zzz_2100 的规矩
+   （overscroll-behavior / touch-action 这类输入相关属性不能出现在顶层，
+   否则鼠标设备也会命中），也正好落实"只在手机版生效"。 */
+#rowMobileFlow { display: none; }   /* 桌面不显示这一行：只在触屏生效 */
+@media (pointer: coarse) {
+  .vf-root { position: absolute; inset: 0; z-index: 3; display: none; background: #000; }
+  .vf-root.vf-on { display: block; }
+  .vf-scroll {
+    position: absolute; inset: 0;
+    overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;   /* 滚到尽头不要带着整个页面一起弹 */
+    /* 2.4.41：**关掉浏览器的滚动锚定**。
+       这里是虚拟滚动：上下两个 spacer 的高度按"当前窗口"实时改写，浏览器会把它
+       当成"上方内容变了"，于是自己补偿 scrollTop —— 打开第 7 张时实测从 3120 被
+       顶到 5200/3640，落到隔壁那张（"点第 N 张打开却在第 N±1 张"）。
+       位置本来就由我们自己算（pre[] + spacer 同步），不需要浏览器再猜一次。 */
+    overflow-anchor: none;
+  }
+  .vf-list { position: relative; width: 100%; }
+  .vf-spacer { width: 100%; height: 0; }
+  .vf-item { position: relative; display: block; width: 100%; overflow: hidden; background: #000; }
+  .vf-item img {
+    position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+    /* 2.4.30：**contain 而不是 cover**。
+       cover 会把图裁成"容器比例"——而容器比例在尺寸还没问回来时是 3:4 占位，
+       于是竖图被裁、横图也被裁（用户报的"都被截成 4:3"就是这个）。
+       contain 保证：容器高度按真实比例算好后图正好铺满；万一比例暂时算错，
+       也只是上下/左右留背景，**绝不裁掉画面**。 */
+    object-fit: contain; display: block;
+  }
+  /* 视频封面帧（只有视频用它；图片一律用大图 raw，见 flow.js 的说明） */
+  .vf-poster { background: #000; }
+  /* 正式图解码完成后才露面，避免滚动中看到逐行刷出来的过程 */
+  .vf-full { opacity: 0; }
+  .vf-full.vf-ok { opacity: 1; }
+  .vf-play { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .vf-play span {
+    width: 56px; height: 56px; border-radius: 50%; background: rgba(0, 0, 0, .55);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-size: 22px; padding-left: 4px;
+  }
+  .vf-video-el { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .vf-hud {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    pointer-events: none; transition: opacity .18s ease;
+  }
+  .vf-count {
+    background: rgba(0, 0, 0, .55); color: #fff; font-size: 12px;
+    padding: 3px 10px; border-radius: 999px;
+  }
+  .vf-hud-hidden .vf-hud { opacity: 0; }
+  /* flow 里没有缩放，1:1 / ⤢ 与轨道计数器都用不上 */
+  body.mv-flow-open .v-controls,
+  body.mv-flow-open .v-counter-float { display: none; }
+
+  /* 设置项「手机端竖图连续浏览」只在触屏档出现（桌面连这一行都看不到，避免误解按钮无效） */
+  #rowMobileFlow { display: flex; }
+}
+
+/* 从竖图流退回网格时，闪一下"你刚才看到的那张"（2.4.29） */
+.cell.mv-flash { box-shadow: inset 0 0 0 3px var(--accent, #3b82f6); border-radius: 6px; }
+
+/* 文件夹封面（2×2 缩略图拼图；名称位置由「文件夹名称显示在封面下方」决定，见下方 .mv-name-below） */
+.cell-cover { position: relative; width: 100%; height: 100%; }
+.cell-fallback {
+  position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px;
+}
+.cell-fallback-ico { font-size: 42px; line-height: 1; }
+.cell-fallback-name {
+  font-size: 15px; font-weight: 600; color: var(--text); padding: 0 6px; text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
+}
+/* 不做淡入过渡：封面"准备好就出现"。
+   0.2s 渐变会让每次进/退目录都看到一次「📁 → 封面」的过渡，用户感知就是"闪一下"；
+   瞬间切换在缓存命中时几乎不可见，慢加载时也只是"📁 停一会儿直接变封面"，不像故障。 */
+.cell-cover-img {
+  position: absolute; left: 0; top: 0;
+  opacity: 0;
+}
+.cell-cover-img.mv-cover-ok { opacity: 1; }
+/* 2.4.38：主色占位 —— 进目录时先用上次算出的平均色铺底（📁 藏在颜色下面），
+   封面到位后只在**同一块颜色上**淡入；没有占位的老目录仍保持"到位即现"。 */
+.cell-cover.mv-cover-ph .cell-fallback { opacity: 0; }
+.cell-cover.mv-cover-ph .cell-cover-img { transition: opacity .18s ease; }
+/* 名称配色（app.js 的 pickCoverTone 决定）：字号 15px / 字重 600，字色**接近**但不用纯黑白
+   （纯反差太硬，像贴上去的；但压得太淡又会"发灰看不清"，中间这道很窄），底的处理两套不同：
+     .mv-tone-dark   ⇒ 图偏暗 ⇒ 柔白字 + 深色半透明渐变（默认就是这套）
+     .mv-tone-bright ⇒ 图偏亮 ⇒ 柔黑字 + **不铺底**，只靠双层白色柔光
+   为什么亮图不铺底：白蒙层压在亮图上就是一条扎眼的白带，封面被割断 ——
+   用户反馈「黑色字体的背景白遮罩有点过于明显，影响封面效果」。
+   没有灰度结论时（canvas 不可用 / 图还没解码）保持默认这套，
+   不会出现"白底白字"。 */
+.cell-label {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  /* ⚠️ 必须显式抬到封面图上面：.cell-cover-img 也是 position:absolute，
+     且在 DOM 里排在名称**之后** ⇒ 同为 z-index:auto 时按 DOM 顺序绘制，
+     图片会把名称整条盖住（2.4.14~2.4.19 一直如此，真机上有封面就看不到名字，
+     只有 📁 兜底时才看得到 —— 视觉对照截图抓出来的）。 */
+  z-index: 2;
+  /* 半透明渐变而不是实心块：上半段完全透明，图片原样透出来，
+     只有压着字的那一小段收紧 —— 这样"底"是半透明的，而不是一条盖住图的色块。 */
+  padding: 12px 6px 5px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, .58));
+  opacity: 0;
+  pointer-events: none;
+}
+.cell-cover.mv-has-cover .cell-label { opacity: 1; }
+/* 亮图那套**不铺底**：白蒙层压在亮图上就是一条扎眼的白带，封面直接被割断。
+   只靠双层白色柔光把黑字从浅底上"托"起来 —— 上浅的图本来就亮，柔光够用。
+   （门槛因此抬到 190：没有底色兜底，就不能让中间调也走这套。） */
+.cell-cover.mv-tone-bright .cell-label {
+  background: none;
+  /* 没有底色就不需要上方那段渐变留白，把名称压回离底 5px，位置与深色那套一致 */
+  padding: 0 6px 5px;
+}
+.cell-label-name {
+  display: block; font-size: 15px; line-height: 20px; font-weight: 600;
+  text-align: center;
+  /* 字色不用纯白/纯黑（纯反差太硬，像贴上去的），但也**不能为了"淡"把字压成灰的** ——
+     2.4.21 用 #e6e9ef/#2f333a 就栽在这：用户看着"发灰、不清晰"。
+     现在取"接近白但带一点冷调" / "接近黑但带一点冷调"，靠 color 拉对比、
+     靠字重 600 让笔画站住，而不是靠底色补救。 */
+  color: #f8fafc;
+  /* 半透明蒙层挡不住花纹：留一层同色系的柔光，压在细碎纹理上也能读 */
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .5);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cell-cover.mv-tone-bright .cell-label-name {
+  color: #191c21;
+  /* 硬边 + 光晕两层：浅底上不用铺白条也有足够分离度 */
+  text-shadow: 0 1px 0 rgba(255, 255, 255, .9), 0 2px 7px rgba(255, 255, 255, .7);
+}
+
+/* 2.4.19：文件夹名称显示在封面**下方**（独立一行），不再压在图上。
+   做法：格子内部改成纵向 flex —— 上半封面吃掉剩余高度，下半固定 20px 的名称行。
+   故意不去改网格行高：网格是 position:absolute + 统一 cell 边长的虚拟滚动，
+   给文件夹单独加高会打乱 renderVisible 里的行号换算（文件格子仍是正方形）。
+   在格子内部让出 20px 对封面几乎无损（object-fit:cover 只多裁掉一点边）。
+
+   ⚠️ 这两条都是必需的（变异 + 截图实测过）：
+     · 少了 display:flex（回到 block）⇒ .cell-cover 仍是 height:100%，
+       名称行被挤到格子外面、被 .cell-inner 的 overflow:hidden 裁掉 —— 界面上
+       **名称和封面一起消失**，只剩一块底色；
+     · 少了 flex 的 shrink（比如 flex:none）⇒ 同样顶出去，结果一样。 */
+.cell-inner.mv-name-below { display: flex; flex-direction: column; }
+.cell-inner.mv-name-below .cell-cover { flex: 1 1 auto; }
+/* 名字已有下方独立一行 ⇒ 封面上的渐变遮罩与兜底里的小字都要收掉，否则同一个名字出现三遍 */
+.cell-inner.mv-name-below .cell-label { display: none; }
+.cell-inner.mv-name-below .cell-fallback-name { display: none; }
+.cell-name-below {
+  flex: 0 0 auto;
+  height: 24px;
+  line-height: 24px;
+  padding: 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;   /* 点名字 = 点格子，不能挡住 click */
+}
+
+/* 小视图（格子 96px）名称收一档。
+   同一个 15px 放在 180px 的格子里很合适（条占 20%），放到 96px 的格子里就占到近四成，
+   封面被挤成一条，名称反而比图还显眼 —— 小视图的意义就是"一排看更多图"，
+   名称不该抢戏。等比缩到 13px / 17px 行高 / 8px 上留白（条高 29px，占 30%）。 */
+/* 用 .mv-small 而不是 body.mv-small：app.js 加在 body 上（子孙照样命中），
+   但也能挂在任意容器上做局部对照/嵌入，不把样式锁死在 body。 */
+.mv-small .cell-label { padding: 8px 5px 4px; }
+.mv-small .cell-label-name { font-size: 13px; line-height: 17px; }
+.mv-small .cell-fallback-name { font-size: 13px; }
+.mv-small .cell-name-below { height: 22px; line-height: 22px; font-size: 13px; }
+
+/* 已添加的文件夹列表（设置 →「只显示我添加的文件夹」） */
+.root-head { display: flex; align-items: center; gap: 14px; }
+.root-list {
+  margin: 6px 0 8px;
+  max-height: 190px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-cell, rgba(128,128,128,.06));
+}
+.root-list:empty { display: none; }
+.root-empty {
+  padding: 12px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.root-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.root-item:last-child { border-bottom: 0; }
+.root-item.missing .root-name { color: #e0603a; }
+.root-ico { flex: 0 0 auto; font-size: 14px; line-height: 1; }
+.root-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.root-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.root-path {
+  font-size: 11px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.root-del { flex: 0 0 auto; }
+.root-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

@@ -1,93 +1,122 @@
 package main
 
+// 2.4.40：换目录回到**真页面导航**，并钉住"返回不闪"的整套机制。
+//
+// 背景（三版试错的结论，别再走回头路）：
+//   · 2.4.35 ~ 2.4.39 为了"换目录不重载"改成内部切换（SPA），于是整个会话只剩一条
+//     历史，宿主的手势返回必然落到应用之外 —— 那五版都在"历史层加守卫"上打补丁，无一奏效。
+//   · 现在换回真页面导航：每层目录 = 一条真实历史条目，返回的语义就是"回上一层页面"，
+//     不需要任何守卫。"不闪"改由**目录快照**承担（sessionStorage 里存 items + 滚动位置，
+//     新页面 boot 时不等任何接口先把画面铺出来）。
+//
+// 本文件守着三件事：
+//   ① 导航真的走 location.href（不是 replace、不是内部 loadDir）；
+//   ② 首条历史条目被改写成显式 ?dir=（否则从第一个文件夹返回会落回"没有目录"的页面）；
+//   ③ 快照在 settings 之前就铺上、且在离开前记住滚动位置（"返回停在原处"）。
+
 import (
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// ---------------------------------------------------------------------------
-// 2.3.1：触屏档的"进目录"必须是**真 URL 导航**（从 2.1.x 移植）
-//
-// 为什么：宿主的页面栈只有一层，且**不感知我们的 pushState**（2.1.9-probe 实测）。
-// 只有让进目录变成真的页面导航，宿主才会跟着记账，返回手势才有"上一页"可退。
-//
-//	参数名必须是 dir —— `?path=` 已被"单文件模式"占用（会把目录当文件去 openSingle）。
-//
-// ---------------------------------------------------------------------------
-func Test2310RealNavigationOnTouch(t *testing.T) {
+func Test2440NavigationIsRealPageNav(t *testing.T) {
 	app := stripLineComments(mustReadWebFile(t, "app.js"))
 
-	// 静态：两个函数必须在，且触屏档走 location.replace('?dir=…')
-	// 2.4.1：href → **replace** —— href 每进一层都压一条真实 URL，守卫删不掉已有条目，
-	// 于是"退到聚合根后继续返回"会恢复旧的 /vol{n}/1000/xxx 整页（用户实测报的就是这个）。
-	if !strings.Contains(app, "function navigateTo(") || !strings.Contains(app, "function navigateRoot(") {
-		t.Fatal("缺少 navigateTo / navigateRoot —— 触屏档的目录切换必须是真导航")
+	// ① 两个入口都必须是 location.href（不能是 replace —— 那会让整个会话只有一条历史）
+	for _, fn := range []string{"function navigateTo(", "function navigateRoot("} {
+		body := segmentBetween(app, fn, "  }")
+		if body == "" {
+			t.Fatalf("找不到 %s", fn)
+		}
+		if !strings.Contains(body, "location.href = GW + '/?dir=") {
+			t.Errorf("★★ %s 必须用 location.href 真导航（每层一条历史）——"+
+				"replace 只改当前条目，整个会话就只剩一条历史，返回必然退出应用", fn)
+		}
+		if strings.Contains(body, "location.replace(") {
+			t.Errorf("%s 不许再出现 location.replace", fn)
+		}
+		if !strings.Contains(body, "rememberScroll();") {
+			t.Errorf("★ %s 必须调 rememberScroll()：离开前把\"看到第几屏\"写进快照，"+
+				"否则返回永远从顶部开始（比闪更难受）", fn)
+		}
 	}
-	if !strings.Contains(app, "location.replace(GW + '/?dir=' + encodeURIComponent(path))") {
-		t.Error("navigateTo 必须导航到 `GW + '/?dir=' + encodeURIComponent(path)` —— " +
-			"参数名必须是 dir：`?path=` 已被单文件模式占用")
+
+	// ② 点击 / 面包屑 / 返回箭头 走同一条路径
+	for _, need := range []string{
+		"navigateTo(item.path)",
+		"if (path === null) navigateRoot(); else navigateTo(path);",
+		"if (!up || up === '/') { navigateRoot(); return; }",
+		"navigateTo(up);",
+	} {
+		if !strings.Contains(app, need) {
+			t.Errorf("★ 缺导航调用点 %q（进目录与回上级必须是同一条路径）", need)
+		}
 	}
-	if !strings.Contains(app, "location.replace(GW + '/?dir=/')") {
-		t.Error("navigateRoot 必须显式导航到 `?dir=/` —— " +
-			"不带参数时 boot 会走 last 分支、从 localStorage 跳回上次目录（回不到最上层）")
-	}
-	// 三处入口都要换过去（否则真导航只做了一半）
-	if !strings.Contains(app, "navigateTo(item.path)") {
-		t.Error("点击目录格子必须走 navigateTo")
-	}
-	if !strings.Contains(app, "if (path === null) navigateRoot(); else navigateTo(path);") {
-		t.Error("面包屑必须走 navigateTo / navigateRoot")
-	}
-	if !strings.Contains(app, "if (!up || up === '/') { navigateRoot(); return; }") ||
-		!strings.Contains(app, "navigateTo(up);") {
-		t.Error("goUpLevel 必须走 navigateTo / navigateRoot（否则进目录真导航、回上级内部切换，两条路会不一致）")
-	}
-	// boot 必须认 ?dir=
+
+	// ③ boot 必须认 ?dir=（真导航落地后没人读它，页面就会跳回 last 目录）
 	if !strings.Contains(app, "var dirParam = qs.get('dir');") {
-		t.Error("boot 必须支持 ?dir= —— 否则真导航落地后没人读它，页面会回到 last 目录")
+		t.Error("boot 必须读 `?dir=`")
 	}
 	if !strings.Contains(app, "if (dirParam === '/')") {
-		t.Error("boot 必须把 ?dir=/ 当作「最上层」，不能落到 last 分支")
+		t.Error("boot 必须把 `?dir=/` 当作「最上层」，不能落到 last 分支")
 	}
-	// 桌面档不许被牵连
-	if !strings.Contains(app, "if (PROFILE === 'touch') {") {
-		t.Error("真导航必须限定在触屏档（桌面档保持内部切换）")
+	// ④ 首条条目归一化：没有 ?dir= 时必须用 replaceState 改成显式目录
+	if !strings.Contains(app, "function fixEntryURL(dir) {") {
+		t.Fatal("★ 缺 fixEntryURL —— 从桌面图标进来时 URL 没有 ?dir=，" +
+			"那条历史条目就没有目录信息，从第一个文件夹返回会落回一个「猜目录」的页面（看起来像返回没反应）")
 	}
-
-	// 2.3.2：左上角箭头必须**按状态分流** —— 查看器开着要关它，而不是走 goUpLevel→真导航。
-	//   此前它直接绑 goUpLevel，于是「在大图里点箭头」会真导航到上层目录（整页重载），
-	//   而查看器里只有系统返回才走 popstate → closeViewer。
-	//   这正是"大图没加载完成时返回就退出软件"的来源。
-	if !strings.Contains(app, "if (!viewer.classList.contains('hidden')) {") {
-		t.Error("箭头必须判断查看器是否开着 —— 开着就关它（closeViewer），不能直接 goUpLevel")
-	}
-	if strings.Contains(app, "navBackBtn.onclick = goUpLevel;") {
-		t.Error("箭头不许再直接绑 goUpLevel —— 那会让「在大图里点箭头」变成真导航换目录（整页重载）")
-	}
-	if !strings.Contains(app, "if (navBackBtn) navBackBtn.onclick = function () {") {
-		t.Error("箭头必须绑定一个按状态分流的函数")
+	if !strings.Contains(app, "fixEntryURL(last);") || !strings.Contains(app, "fixEntryURL('/');") {
+		t.Error("★ boot 的两个落点都要 fixEntryURL（恢复上次目录时写 last，回根层时写 /）")
 	}
 
-	// 2.3.2：closeViewer 主动退历史时，必须让紧接着的 popstate **不再退层**。
-	//   否则"点一次箭头 = 关查看器 + 回上级目录"，一次退两层
-	//   （真 Edge 实测：URL 从 ?dir=/vol1 直接变成 ?dir=/）——
-	//   这正是"大图没加载完返回就退出软件"的根源。
-	if !strings.Contains(app, "var mvSelfBack = false;") {
-		t.Error("必须有 mvSelfBack 标记 —— 用来区分'我们自己发的 back'与'宿主发的返回'")
+	// ⑤ 快照必须**早于** settings 铺上（那是"接口还没回、画面已经在"的全部秘密）
+	iDir := strings.Index(app, "var dirParam = qs.get('dir');")
+	if iDir < 0 {
+		t.Fatal("找不到 boot 的 dirParam 分支")
 	}
-	if !strings.Contains(app, "if (mvSelfBack) { mvSelfBack = false; return; }") {
-		t.Error("mvOnPop 必须在最前面识别 mvSelfBack —— 那时查看器已经关好了，只能补守卫、不能再退层")
+	rest := app[iDir:]
+	iSnap := strings.Index(rest, "var earlySnap = loadSnap(dirParam, state.sort);")
+	if iSnap < 0 {
+		t.Fatalf("boot 的快照分支不见了（找不到 `var earlySnap = loadSnap(dirParam, state.sort);`）")
 	}
-	if !strings.Contains(app, "mvSelfBack = true;") {
-		t.Error("closeViewer 主动退历史前必须置 mvSelfBack")
+	// ⚠️ 从快照那一行**往后**找 settings：`?dir=/` 分支在它之前就有一处 loadSettings，
+	//    按全文件第一个出现位置比会误判（这一条是测试自己写错过一次的坑）。
+	after := rest[iSnap:]
+	iPaint := strings.Index(after, "applyItems(null, earlySnap.top || 0);")
+	iSettings := strings.Index(after, "settingsReady = loadSettings();")
+	if iSettings < 0 || iPaint < 0 {
+		t.Fatalf("boot 的快照分支结构变了（iSettings=%d iPaint=%d）", iSettings, iPaint)
+	}
+	if iPaint > iSettings {
+		t.Error("★★ 快照必须在 loadSettings() **之前**就铺上 —— 顺序反了就要等一个 RTT 才有画面，" +
+			"那正是「返回闪一下」")
 	}
 
-	// 行为：真跑 navigateTo，验触屏档导航、桌面档 loadDir
+	// ⑥ 滚回原处：快照必须存 top，rememberScroll 必须写 top
+	snapBody := segmentBetween(app, "function saveSnap(", "  // 离开目录前把滚动位置写回它自己的快照")
+	if !strings.Contains(snapBody, "top: top || 0") {
+		t.Error("★ saveSnap 必须把滚动位置一起存（top 字段）")
+	}
+	rsBody := segmentBetween(app, "function rememberScroll() {", "  // sameItems")
+	if !strings.Contains(rsBody, "scroller.scrollTop") || !strings.Contains(rsBody, ".top =") {
+		t.Error("★ rememberScroll 必须把 scroller.scrollTop 写回该目录快照的 top")
+	}
+	if !strings.Contains(app, "window.addEventListener('pagehide', function (e) {\n    try { rememberScroll(); }") {
+		t.Error("★ pagehide 里必须补一次 rememberScroll —— 宿主手势返回/前进不由我们发起，" +
+			"不补就记不住滚动位置")
+	}
+}
+
+// Test2440GoUpLevelStillWalksOut 用 node 真跑 goUpLevel：它必须只调导航，不碰 loadDir/buildRoot。
+func Test2440GoUpLevelStillWalksOut(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skipf("node 不可用：%v", err)
 	}
+	readSourceOrSkip(t, filepath.Join("web", "app.js"))
+
 	script := `
 var fs = require('fs');
 var appjs = fs.readFileSync('web/app.js', 'utf8');
@@ -104,49 +133,48 @@ function grab(name) {
 function eq(a, b, m) {
   if (a !== b) { console.error('FAIL ' + m + ' | expect ' + JSON.stringify(b) + ' got ' + JSON.stringify(a)); process.exit(1); }
 }
-var code = grab('navigateTo') + ';' + grab('navigateRoot') + ';' +
-  'return { to: navigateTo, root: navigateRoot };';
-function makeEnv(profile) {
-  // 2.4.1：真导航改用 location.replace（replace 不压历史条目 —— href 每层都压一条，
-  //   守卫删不掉已有条目，于是"退到聚合根后继续返回"会恢复旧的 /vol{n}/... 整页）。
-  var env = { hrefs: [], loads: [], roots: 0, replaces: 0,
-    loc: {
-      set href(v) { env.hrefs.push(v); },
-      get href() { return env.hrefs[env.hrefs.length - 1]; },
-      replace: function (v) { env.replaces++; env.hrefs.push(v); }
-    } };
-  var api = new Function('PROFILE', 'GW', 'location', 'loadDir', 'buildRoot', code)(
-    profile, '/app/mediaview', env.loc,
-    function (p) { env.loads.push(p); }, function () { env.roots++; });
+function mk(st) {
+  var env = { nav: [], root: 0, loads: 0 };
+  var api = new Function('state', 'navigateTo', 'navigateRoot', 'dirName', 'isCustomRoot',
+    'isInsideAnyUserDir',
+    grab('goUpLevel') + ';return goUpLevel;')(
+    st,
+    function (p) { env.nav.push(p); },
+    function () { env.root++; },
+    function (p) { var s = String(p).replace(/\/+$/, ''); var i = s.lastIndexOf('/'); return i <= 0 ? '/' : s.slice(0, i); },
+    function () { return false; },
+    function (p) { return /^\/vol\d+\/1000(\/|$)/.test(p); });
   env.api = api;
   return env;
 }
-// 触屏档：必须真导航，且**不能**再调 loadDir（否则一次点击加载两遍）
-var e1 = makeEnv('touch');
-e1.api.to('/vol1/1000');
-eq(e1.hrefs.join(','), '/app/mediaview/?dir=%2Fvol1%2F1000', '触屏档进目录必须是真导航（?dir= 编码后的路径）');
-eq(e1.replaces, 1, '★★ 触屏档必须用 location.replace —— 用 href 会每层压一条历史，' +
-  '于是退到聚合根后继续返回会恢复旧的 /vol{n}/... 整页（用户实测报的就是这个）');
-eq(e1.replaces, 1, '★★ 触屏档必须用 location.replace —— 用 href 会每层压一条历史，' +
-  '于是退到聚合根后继续返回会恢复旧的 /vol{n}/... 整页（用户实测报的就是这个）');
-eq(e1.loads.length, 0, '触屏档已真导航，不得再走内部 loadDir');
-e1.api.root();
-eq(e1.hrefs[1], '/app/mediaview/?dir=/', '回最上层必须显式带 ?dir=/（否则 boot 会跳回上次目录）');
 
-// 桌面档：保持内部切换，**不许**导航
-var e2 = makeEnv('mouse');
-e2.api.to('/vol1/1000');
-eq(e2.hrefs.length, 0, '桌面档不得导航（多窗口/内部切换在桌面上是有意义的）');
-eq(e2.loads.join(','), '/vol1/1000', '桌面档应走 loadDir');
-e2.api.root();
-eq(e2.roots, 1, '桌面档回最上层应走 buildRoot');
-eq(e2.hrefs.length, 0, '桌面档全程不得导航');
+// ① 聚合根层：箭头**什么都不做**（不弹框、不退出、也不重建）
+var e1 = mk({ root: true, path: null });
+e1.api();
+eq(e1.nav.length + e1.root, 0, '根层按返回箭头必须无动作');
+
+// ② 深层目录：回上一层目录，且走的是 navigateTo（真导航）
+var e2 = mk({ root: false, path: '/vol1/1000/照片/2026/春节' });
+e2.api();
+eq(e2.nav.join(','), '/vol1/1000/照片/2026', '应回到上一层目录');
+eq(e2.root, 0, '深层回上级不许跳到聚合根');
+
+// ③ /vol1/1000 的上一层是 /vol1（存储空间层）⇒ 必须直接回聚合根，不许出现存储空间页
+var e3 = mk({ root: false, path: '/vol1/1000' });
+e3.api();
+eq(e3.root, 1, '/vol1/1000 再往上必须回聚合根');
+eq(e3.nav.length, 0, '/vol1/1000 再往上不许导航到 /vol1');
+
+// ④ 再上一层：/vol1/1000/A → /vol1/1000（走 navigateTo）
+var e4 = mk({ root: false, path: '/vol1/1000/A' });
+e4.api();
+eq(e4.nav.join(','), '/vol1/1000', '/vol1/1000/A 应回 /vol1/1000');
 
 console.log('OK');
 `
 	out, err := exec.Command(node, "-e", script).CombinedOutput()
 	if err != nil {
-		t.Fatalf("真导航探针失败：%v\n%s", err, out)
+		t.Fatalf("goUpLevel 探针失败：%v\n%s", err, out)
 	}
 	if !strings.Contains(string(out), "OK") {
 		t.Fatalf("探针未输出 OK：%s", out)

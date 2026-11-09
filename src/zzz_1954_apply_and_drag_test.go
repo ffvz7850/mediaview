@@ -82,7 +82,10 @@ func Test1954DragPansWithoutSwitching(t *testing.T) {
 	if !strings.Contains(js, "if (Math.abs(swipe.dx) > 8 || Math.abs(swipe.dy) > 8) return;") {
 		t.Error("点击切图的唯一入口（vStage click）没有 8px 距离守卫 —— 拖着看图松手会把图切走")
 	}
-	if !strings.Contains(js, "if (x >= _left && x <= _right) return;") {
-		t.Error("点击切图的判据没有「8px 距离守卫」（2.3.3 起切图只在 click 里做）")
+	// 2.4.13：分区收敛到 stageZoneX()，"中间不切图"由 `if (zx === 0) return;` 承担
+	//   （原来就地算 _left/_right，已删 —— 两处几何定义必然漂移）。
+	if !strings.Contains(js, "if (zx === 0) return;") {
+		t.Error("点击切图的判据里没有「中间 1/3 不切图」（stageZoneX 分区）—— " +
+			"中间若也切图，双击就会先切一张再放大")
 	}
 }

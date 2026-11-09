@@ -18,7 +18,7 @@ import (
 
 const (
 	appName  = "mediaview"
-	version  = "2.4.12"
+	version  = "2.4.45"
 	gwPrefix = "/app/mediaview"
 )
 
@@ -169,6 +169,12 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(gwPrefix+"/api/pregen", handlePregen)
 	mux.HandleFunc(gwPrefix+"/api/scan", handleScan)
 	mux.HandleFunc(gwPrefix+"/api/thumb", handleThumb)
+	mux.HandleFunc(gwPrefix+"/api/dircov", handleDirCover)
+	// 2.4.15：一键生成文件夹封面（POST 启动 / GET 查进度 / POST cancel 取消）
+	mux.HandleFunc(gwPrefix+"/api/dircov/pregen", handleCoverPregen)
+	mux.HandleFunc(gwPrefix+"/api/dircov/pregen/cancel", handleCoverPregen)
+	// 2.4.25：重建单个目录的封面（修坏图，不碰下层）
+	mux.HandleFunc(gwPrefix+"/api/dircov/rebuild", handleRebuildDirCover)
 	mux.HandleFunc(gwPrefix+"/api/raw", handleRaw)
 	mux.HandleFunc(gwPrefix+"/api/meta", handleMeta)
 	mux.HandleFunc(gwPrefix+"/api/health", handleHealth)

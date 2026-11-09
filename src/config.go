@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -28,6 +29,37 @@ import (
 type Settings struct {
 	// ThumbEnabled 是否生成缩略图（默认 true，保持原有行为）
 	ThumbEnabled bool `json:"thumbEnabled"`
+	// MobileFlowView 手机端「竖图连续浏览」（默认 true，2.4.29）。
+	//
+	// 开启后：手机（触屏档）点图片不再是左右滑的轨道模式，而是进入一条竖直线性流 ——
+	// 图片按目录顺序铺满宽度、上下无缝相接，边看边按顺序预载后面几张。
+	// 关闭后回到原来的左右滑（行为与本功能上线前完全一致）。
+	//
+	// 为什么放在服务端：与 CoverEnabled / CoverNameBelow 同一类"全局外观"，
+	// 手机、平板、另一个浏览器各开一个实例时看到的开关状态要一致。
+	// 桌面档（鼠标）永远不生效 —— 开关在设置里也只在触屏档显示，见 app.js 的 PROFILE。
+	MobileFlowView bool `json:"mobileFlowView"`
+	// CoverEnabled 是否生成文件夹封面（默认 true）。关闭后 dir 格子恢复 📁，且不发任何封面请求。
+	CoverEnabled bool `json:"coverEnabled"`
+	// CoverNameBelow 文件夹名称是否显示在封面**下方**的独立一行（默认 false）。
+	//
+	// false（默认，2.4.20 起）：名字压在封面底部的一条半透明蒙层上，图片隐约透出，
+	// 字色按封面底部的灰度自动切黑/白（见 app.js 的 pickCoverTone）。
+	// true：封面让出一行，名字单独排在下面（2.4.19 的样式，不压图、也不看灰度）。
+	//
+	// 为什么放在服务端：和 CoverEnabled 一样属于"全局外观"，用户可能在
+	// 桌面小窗 / 手机 / 另一个浏览器各开一个实例 —— 只存 localStorage 的话
+	// 每个入口看到的封面样式会不一致。
+	CoverNameBelow bool `json:"coverNameBelow"`
+	// OnlyRoots 开启后：**首页只显示 Roots 里已添加的文件夹**，
+	// 其它目录、存储空间、默认目录既不显示也**不读取**（所有读取接口都会拒绝白名单外的路径）。
+	//
+	// 为什么放在服务端而不是只在前端过滤：前端过滤只是"不画出来"，
+	// 直接切 URL / 留存的旧地址仍然能读到别的目录 —— 那就不是"不加载"。
+	OnlyRoots bool `json:"onlyRoots"`
+	// Roots 用户添加的文件夹（绝对路径，保存时已解析成真实路径）。
+	// 只在 OnlyRoots 开启时决定可见范围；关闭时保留内容，方便再次打开。
+	Roots []string `json:"roots"`
 	// ThumbDir 自定义缩略图目录；空字符串 = 使用默认的 <运行期目录>/thumbs
 	ThumbDir string `json:"thumbDir"`
 	// ThumbSize 生成的缩略图边长（像素），64~640
@@ -86,9 +118,6 @@ type Settings struct {
 	// PreloadConcurrency 后台预生成 worker 数（0~8，默认0=关闭）。
 	// 0 = 不启动 worker、也不主动投递：进入目录后完全由前台按需生成。
 	PreloadConcurrency int `json:"preloadConcurrency"`
-	// SchemaVersion 配置结构版本，仅供一次性迁移使用（见 migrate）。
-	// 前端 body 不含该字段，由服务端在保存时补上当前值。
-	SchemaVersion int `json:"schemaVersion"`
 	// GPUDecode 是否启用 GPU 视频硬件解码（VAAPI，默认 true）。
 	// 视频抽帧（H.264/HEVC）走核显硬解，大幅降低 CPU 占用。A8-7680 已实测支持 H.264 + HEVC Main 8-bit。
 	GPUDecode bool `json:"gpuDecode"`
@@ -158,6 +187,11 @@ const thumbSubdir = ".mediaview-thumbs"
 func defaultSettings() Settings {
 	return Settings{
 		ThumbEnabled:        true,
+		CoverEnabled:        true,
+		MobileFlowView:      true,  // 2.4.29：手机端默认走竖图连续流（用户拍板）
+		CoverNameBelow:      false, // 2.4.20：默认"压在封面底部的半透明条 + 灰度自适应字色"
+		OnlyRoots:           false, // 默认不限制：保持原有"聚合所有存储空间"的行为
+		Roots:               nil,
 		ThumbDir:            "",
 		ThumbSize:           320,
 		ThumbQuality:        80,
@@ -171,7 +205,6 @@ func defaultSettings() Settings {
 		CPUCores:            0, // 0 = 不限制
 		ThumbConcurrency:    thumbConcurrencyDefault(),
 		PreloadConcurrency:  2, // 默认开 2 个后台 worker：把"等待"提前到空闲时段（0 = 关闭）
-		SchemaVersion:       currentSettingsSchema,
 		GPUDecode:           true,
 		ViewerPreload:       2,
 		ViewerAnimation:     "slide",
@@ -194,17 +227,9 @@ func loadSettings() {
 		saveSettingsFile()
 		return
 	}
-	// P0-1 治本：从默认值出发再反序列化，缺失字段保留默认值 ——
-	// 这样以后**每一个新加的 bool 字段**都不会再因为"零值 = false"而静默失效
-	// （1.8.136 的 ThumbLowres 就是这么丢的：normalize 里没有它，bool 缺失即 false，
-	//   还会被 migrate/save 落盘固化）。
-	//
-	// ★ SchemaVersion 必须在 Unmarshal **之前**清零：
-	//   defaultSettings() 会把它设成 currentSettingsSchema，而"磁盘上从来没写过
-	//   schemaVersion 的老配置"Unmarshal 后不会覆盖它 → migrated 判为 false →
-	//   migrate 整段跳过、迁移失效。清零后：JSON 里有就覆盖、没有就保持 0 → 迁移照常跑。
+	// 从默认值出发再反序列化，缺失字段保留默认值 ——
+	// 这样以后**每一个新加的 bool 字段**都不会再因为"零值 = false"而静默失效。
 	s := defaultSettings()
-	s.SchemaVersion = 0
 	if err := json.Unmarshal(data, &s); err != nil {
 		// 配置损坏：退回默认值，但保留原文件（改名备份）以便排查
 		if len(data) > 0 {
@@ -216,20 +241,10 @@ func loadSettings() {
 		saveSettingsFile()
 		return
 	}
-	// 先留原始值再 normalize：normalize 会做交叉钳制（Preload ≤ Thumb−1），
-	// 迁移判据「是否仍等于旧默认值」必须看磁盘上的原值，见 migrate 注释。
-	rawThumb, rawPreload := s.ThumbConcurrency, s.PreloadConcurrency
 	s.normalize()
-	migrated := s.SchemaVersion < currentSettingsSchema
-	s.migrate(rawThumb, rawPreload)
 	settingsMu.Lock()
 	settings = s
 	settingsMu.Unlock()
-	if migrated {
-		// 迁移结果必须落盘：否则 SchemaVersion 永远停在 0，每次启动都重判一遍，
-		// 用户手动把值设回 6/3 会被反复改掉。
-		saveSettingsFile()
-	}
 }
 
 func resolveSettingsPath() string {
@@ -272,57 +287,6 @@ func saveSettingsFile() {
 		return
 	}
 	_ = os.WriteFile(settingsFile, data, 0o644)
-}
-
-// currentSettingsSchema 当前配置结构版本。需要「把旧默认值升到新默认值」时 +1。
-//
-//	v1：1.8.66 —— ThumbConcurrency 6→3、PreloadConcurrency 3→0，
-//	    但判据是「两个值同时等于旧默认组合」，太窄。
-//	v2：1.8.67 —— 两个旧默认值各自独立判断。v1 的窄判据会漏掉
-//	    「改过并发数、没碰过预生成」的配置（旧版预生成默认 3，
-//	    只要用户调过并发数就不再等于 6，于是预生成一直是 3 —— 表现就是「关不掉」）。
-const currentSettingsSchema = 4
-
-// migrate 把旧默认值升到新默认值。
-//
-// rawThumb / rawPreload 必须是**磁盘上的原始值**，要在 normalize() 之前取：
-// normalize 的交叉钳制（Preload ≤ Thumb−1）会先把 3 改成 2，
-// 那样下面「是否仍等于旧默认值」的判断就落空了。
-//
-//	ThumbConcurrency    旧默认 6 → 3
-//	PreloadConcurrency  旧默认 3 → 0（0 = 关闭）
-//
-// 两个值各自独立判断：只要仍等于旧默认值就升级。用户主动改过的非默认值
-// （例如把预生成调到 5）不会被覆盖。迁移后写入 SchemaVersion，所以只发生一次 ——
-// 之后用户手动把值设回 6 或 3 不会被反复改掉。
-func (s *Settings) migrate(rawThumb, _ int) { // 第二个参数（rawPreload）已无规则使用
-	if s.SchemaVersion >= currentSettingsSchema {
-		return
-	}
-	if rawThumb == 6 {
-		// 6 是旧版本的固定默认值 → 迁移到「按核数收敛」的新默认，
-		// 而不是硬编码 3（那样存量用户永远拿不到 thumbConcurrencyDefault 的结果）。
-		s.ThumbConcurrency = thumbConcurrencyDefault()
-	}
-	// 【已删除】schema 3 曾有一条「rawPreload == 3 || == 0 → 新默认」的迁移，
-	// 于 1.8.139 按用户要求移除：0 是合法的「关闭」值，而这条规则没有版本守卫，
-	// 每次 schema 升级都会重跑一次，等于用户永远关不掉后台预生成。
-	// 现在磁盘上是几就是几（旧默认 3 会被 normalize 钳到 ThumbConcurrency-1）。
-	// 1.8.139：原先这里有一条「rawPreload == 3 || == 0 → 新默认」的迁移，
-	// 已按需求删除。原因：0 是合法的「关闭」值，而这条规则没有版本守卫，
-	// 每次 schema 升级都会重跑一次，等于用户永远关不掉后台预生成。
-	// 删除后行为：磁盘上是几就是几（旧默认 3 会被 normalize 钳到 ThumbConcurrency-1）。
-	// schema 4：ThumbLowres 是 1.8.136 新加的 bool 字段。
-	// 存量配置里没有它 → 反序列化成零值 false → -lowres 静默失效，
-	// 而且会被 migrate/save 落盘固化（用户此后打开设置保存还会再写一次 false）。
-	// 该字段在 1.8.136 之前不可能被用户显式设置过，直接给新默认。
-	//
-	// 这一条专门救"已经升到 1.8.136、配置里已被写成 thumbLowres:false"的情况
-	// （他们 schemaVersion 已是 3，光靠治本路径不够 —— Unmarshal 会用磁盘上的 false 覆盖默认值）。
-	if s.SchemaVersion < 4 {
-		s.ThumbLowres = defaultSettings().ThumbLowres
-	}
-	s.SchemaVersion = currentSettingsSchema
 }
 
 // normalize 把越界值收敛到合法范围
@@ -401,6 +365,48 @@ func (s *Settings) normalize() {
 	// 补成具体值而不是留 nil：/api/settings 的响应里就会是一个真实 bool，
 	// 用户在前端看到的开关状态与磁盘上的内容一致，排查时不会被 null 绕。
 	s.ThumbDir = strings.TrimSpace(s.ThumbDir)
+
+	// 已添加的文件夹：只做形状整理（去空白、清洗、去重），**不在这里判存在性**。
+	// 存在性属于保存时的校验（见 handleSettingsSave）：配置文件读回来的那一刻
+	// 磁盘可能还没挂载好，此时把条目删掉就等于用户白加了一次。
+	s.Roots = cleanRoots(s.Roots)
+}
+
+// maxCustomRoots 「已添加的文件夹」条目上限（防呆，见 cleanRoots）。
+const maxCustomRoots = 64
+
+// cleanRoots 去空白、filepath.Clean、大小写不敏感去重，并限制条目数量。
+// 数量上限是防呆：这个列表会进每一次 resolveMediaPath 的范围判断，
+// 几千条会让每个请求都扫一遍；正常用户不会超过几十个。
+func cleanRoots(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, r := range in {
+		r = strings.TrimSpace(expandUser(r))
+		if r == "" {
+			continue
+		}
+		r = filepath.Clean(r)
+		if !filepath.IsAbs(r) {
+			continue // 相对路径无法作为范围依据
+		}
+		key := strings.ToLower(r)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+		if len(out) >= maxCustomRoots {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func getSettings() Settings {
@@ -558,24 +564,45 @@ func cacheStats() (files int, bytes int64) {
 	cacheStatsMu.Unlock()
 
 	root := currentThumbRoot()
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
+	count := func(p string, d os.DirEntry) {
+		if d.IsDir() {
+			return
 		}
-		// 跳过缩略图的内容标识 sidecar（每个缩略图旁边一个），
-		// 否则「已缓存 N 个文件」会凭空翻倍
-		// 1.8.148：附属文件都跳过。.key 已不再产生（旧缓存可能还有），
-		// .meta.json 也已停止落盘 —— 但旧缓存里存在，若不算进去，
-		// 界面上「已缓存 N 张」会虚高近一倍（实测 19356 vs 真实 9664）。
-		if strings.HasSuffix(d.Name(), thumbKeySuffix) || strings.HasSuffix(d.Name(), ".meta.json") {
-			return nil
+		// 跳过附属文件：它们不是"缓存图片"，算进去会让「已缓存 N 张」虚高。
+		//   .key  —— 缩略图的内容标识 sidecar（xattr 不可用时的回退载体）
+		//   .json —— 封面元数据（xattr 不可用时的回退载体）
+		if strings.HasSuffix(d.Name(), thumbKeySuffix) || strings.HasSuffix(d.Name(), ".json") {
+			return
 		}
 		if info, err := d.Info(); err == nil {
 			files++
 			bytes += info.Size()
 		}
-		return nil
-	})
+	}
+
+	// 只统计**本应用创建的目录**（尺寸档 + dircov），与 purgeCache 的白名单保持同一口径：
+	// 缓存根可以由用户指到任意目录，里面可能有别人的东西 —— 那些不是"已缓存"。
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		full := filepath.Join(root, e.Name())
+		if !e.IsDir() {
+			// 根下直接躺着的文件一律不算缓存（也不是我们会清理的东西）
+			continue
+		}
+		if !isCacheOwnedDir(e.Name()) {
+			continue
+		}
+		_ = filepath.WalkDir(full, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			count(p, d)
+			return nil
+		})
+	}
 
 	cacheStatsMu.Lock()
 	cacheStatsN, cacheStatsSize, cacheStatsAt = files, bytes, time.Now()
@@ -590,7 +617,7 @@ func invalidateCacheStats() {
 	cacheStatsMu.Unlock()
 }
 
-// purgeCache 清空缩略图缓存（递归删除 size 子目录及旧版平铺文件）
+// purgeCache 清空缩略图缓存（递归删除 size 子目录与封面目录 dircov）
 func purgeCache() (int, error) {
 	root := currentThumbRoot()
 	entries, err := os.ReadDir(root)
@@ -601,26 +628,35 @@ func purgeCache() (int, error) {
 	for _, e := range entries {
 		name := e.Name()
 		full := filepath.Join(root, name)
-		if e.IsDir() {
-			// 只删我们自己创建的 size 子目录（目录名必须是纯数字尺寸）。
-			// 任何非数字目录一律不碰 —— 防止误删用户数据。
-			if _, err := strconv.Atoi(name); err != nil {
-				continue
-			}
-			if err := os.RemoveAll(full); err == nil {
-				n++
-			}
-		} else {
-			// 旧版兼容：平铺的 hash 命名文件
-			if strings.HasSuffix(name, ".jpg") || strings.HasSuffix(name, ".json") ||
-				strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".gen.jpg") {
-				if err := os.Remove(full); err == nil {
-					n++
-				}
-			}
+		if !e.IsDir() {
+			continue // 根下直接躺着的文件不是本应用的产物，不碰
+		}
+		// 只删我们自己创建的目录：纯数字尺寸档 + 封面目录 dircov。
+		// 任何其它目录一律不碰 —— 缓存根可能是用户指定的共享目录，误删代价太大。
+		//
+		// ⚠ 2.4.23 之前这里只放行"纯数字"，而封面目录叫 dircov ⇒ 被整段跳过，
+		//   于是「清空缓存」清掉了缩略图、却把封面（含 .json）原样留着：
+		//   用户点了按钮、数字也归零，磁盘上那堆封面还在。实测复现过，别改回去。
+		if !isCacheOwnedDir(name) {
+			continue
+		}
+		if err := os.RemoveAll(full); err == nil {
+			n++
 		}
 	}
 	return n, nil
+}
+
+// isCacheOwnedDir 判断缓存根下的某个目录是不是本应用自己建的。
+//
+// 白名单而不是黑名单：缓存根可以由用户指到任意目录（设置里那个「缩略图缓存目录」），
+// 里面可能还有别的东西 —— 只认自己会创建的两种名字。
+func isCacheOwnedDir(name string) bool {
+	if name == coverCacheDirName {
+		return true
+	}
+	_, err := strconv.Atoi(name) // 尺寸档：320 / 800 / 1920 …
+	return err == nil
 }
 
 // ---------------------------------------------------------------------------
@@ -918,8 +954,27 @@ func underRoot(abs, root string) bool {
 // 必须用 Windows 专用的 EqualFold：如果拿 filepath.Clean 的结果去比对
 // 没做过 Clean 的原串（如 "/vol1" vs `\vol1`），分隔符不一致会导致永远判 false，
 // 白名单形同虚设 —— 这是实测踩到的坑。
+//
+// 注：EqualFold 在 Linux 上是"过度宽松"的（/a/B 与 /a/b 本是两个目录）。
+// 这里没有按平台分支，是因为调用方拿到的都是 resolveRealPath 之后的真实路径，
+// 大小写不同即意味着路径不存在 ⇒ 后面那次 stat 会把它挡掉，不会形成放行。
+// 真正需要"同一目录"语义的去重场景请用 pathKey（见下），不要用这个。
 func samePath(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
+// pathKey 生成"判断是不是同一个目录"用的比较键（去重 / 环路检测）。
+//
+// 只有 Windows 需要折叠大小写（Photo 与 photo 是同一个目录）；
+// Linux（飞牛 NAS 的本体）上它们是两个**不同**目录 —— 早期 collectDirsWithMedia
+// 无条件 ToLower，一旦同一层同时存在 "Photos" 与 "photos"，后一个会被当成
+// "已访问"整棵子树跳过，「一键生成」就漏掉一半目录（2.4.28 修）。
+func pathKey(p string) string {
+	c := filepath.Clean(p)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(c)
+	}
+	return c
 }
 
 // pathAllowed 判断媒体路径是否落在白名单内（只做字面比较，范围校验的入口见 resolveMediaPath）
@@ -1006,6 +1061,57 @@ func resolveRealPath(abs string) (string, bool) {
 // 因此凡是接受 path 参数去读文件的 handler，都必须走这里。
 // 返回 (路径, HTTP 状态码)；状态码为 0 表示通过。
 func resolveMediaPath(p string) (string, int) {
+	return resolveMediaPathOpt(p, true)
+}
+
+// resolveMediaPathBroad 只做普通的存储空间白名单校验，**不**按「只显示已添加的文件夹」收窄。
+//
+// 四个场景必须用它，否则会把用户锁死在门外：
+//   - 目录选择器（/api/browse）：用户正是要靠它浏览到尚未添加的目录；
+//   - 缩略图目录校验：缩略图目录是应用内部目录，不必落在"可见范围"内；
+//   - 接管系统缩略图（systemthumb）：那是替**飞牛文件管理器**供图，范围由宿主决定，
+//     与本应用的可见范围无关 —— 拿本应用的设置去卡它，会让文件管理器其它目录全丢缩略图。
+//   - **外部打开**（见 resolveMediaPathReq）：宿主点名要打开某个文件，不属于"应用内浏览"。
+func resolveMediaPathBroad(p string) (string, int) {
+	return resolveMediaPathOpt(p, false)
+}
+
+// externalOpenParam 是「这次请求来自宿主把**单个文件**交给我们打开」的标记。
+//
+// 场景：飞牛文件管理器里双击图片/视频 → 打开方式选本应用 → 宿主打开
+// `…/?path=/vol1/1000/…/a.jpg`。前端（单文件模式）随后要读这个文件本身、它所在目录的
+// 同级列表（左右切换）、以及它的元数据 —— 这些请求都带上 `external=1`。
+//
+// 为什么不套「只显示我添加的文件夹」：那个开关约束的是**本应用自己的浏览范围**
+// （首页聚合层、网格、面包屑）。而这里是宿主按用户当场点击给出的**单文件级指令**，
+// 用户并没有在应用里"浏览"，把他挡在 403 上只会表现成"文件管理器里双击打不开图"。
+//
+// 安全边界一点没放松：仍然要过存储空间白名单（/vol*、TRIM_DATA_ACCESSIBLE_PATHS、
+// 应用自身目录）、仍然要求绝对路径、仍然解析链接后复检。只是不再叠加 OnlyRoots 那一层。
+const externalOpenParam = "external"
+
+func isExternalOpen(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.URL.Query().Get(externalOpenParam) == "1"
+}
+
+// resolveMediaPathReq 按**请求上下文**选校验口径。
+//
+// 所有接受 path 的媒体接口都应该走它，而不是直接调 resolveMediaPath：
+// 少改一处，外部打开就会在那里 403（表现为"图能看见、左右切不动"这类半坏状态）。
+func resolveMediaPathReq(r *http.Request, p string) (string, int) {
+	if isExternalOpen(r) {
+		return resolveMediaPathBroad(p)
+	}
+	return resolveMediaPath(p)
+}
+
+// resolveMediaPathOpt 是两者的共同实现。
+// applyRootScope=true 时，除普通白名单外还要落在「已添加的文件夹」之内
+// （仅当 OnlyRoots 开启；未开启时该步骤恒通过）。
+func resolveMediaPathOpt(p string, applyRootScope bool) (string, int) {
 	abs, ok := safePath(p)
 	if !ok {
 		return "", http.StatusBadRequest
@@ -1023,7 +1129,40 @@ func resolveMediaPath(p string) (string, int) {
 	if !samePath(real, abs) && !pathAllowed(real) {
 		return "", http.StatusForbidden
 	}
+	if applyRootScope && !rootScopeAllows(real) {
+		return "", http.StatusForbidden
+	}
 	return real, 0
+}
+
+// rootScopeAllows 判断真实路径是否落在「已添加的文件夹」范围内。
+//
+// 语义要点：
+//   - 未开启 OnlyRoots：恒通过（保持原有行为，不影响存量用户）；
+//   - 开启但一个都没添加：**一律拒绝** —— 这就是"什么都不加载"的字面含义。
+//     前端在这种情况下会显示引导文案，而不是让用户对着空白猜。
+//   - 判断用**解析后的真实路径**，条目自身也再解析一次：配置里存的是保存时的真实路径，
+//     但目录本身可能是挂载点/链接，隔一段时间真实路径会变。
+func rootScopeAllows(real string) bool {
+	s := getSettings()
+	if !s.OnlyRoots {
+		return true
+	}
+	if len(s.Roots) == 0 {
+		return false
+	}
+	for _, r := range s.Roots {
+		if r == "" {
+			continue
+		}
+		if underRoot(real, r) {
+			return true
+		}
+		if rr, ok := resolveRealPath(r); ok && underRoot(real, rr) {
+			return true
+		}
+	}
+	return false
 }
 
 // isForbiddenThumbDir 拒绝把"根目录级别"的位置当作缩略图目录。
@@ -1052,17 +1191,28 @@ func isForbiddenThumbDir(dir string) bool {
 // HTTP 接口
 // ---------------------------------------------------------------------------
 
+// rootInfo 已添加文件夹的**实时状态**，给设置页画「✓ 可访问 / ⚠ 不存在」用。
+//
+// 为什么不在前端自己判断：前端拿不到文件系统；而"盘没挂载 / 目录被删"恰恰是
+// 这个列表最容易出问题的形态 —— 不标出来，用户只会看到首页少了一项、不知道为什么。
+type rootInfo struct {
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Exists bool   `json:"exists"`
+}
+
 type settingsView struct {
 	Settings
-	DefaultThumbDir   string `json:"defaultThumbDir"`
-	ActiveThumbDir    string `json:"activeThumbDir"`
-	Note              string `json:"note,omitempty"`
-	CacheFiles        int    `json:"cacheFiles"`
-	CacheBytes        int64  `json:"cacheBytes"`
-	SettingsFile      string `json:"settingsFile"`
-	FFmpeg            bool   `json:"ffmpeg"`
-	SystemThumbAvail  bool   `json:"systemThumbAvail"`
-	SystemThumbActive bool   `json:"systemThumbActive"`
+	RootsInfo         []rootInfo `json:"rootsInfo"`
+	DefaultThumbDir   string     `json:"defaultThumbDir"`
+	ActiveThumbDir    string     `json:"activeThumbDir"`
+	Note              string     `json:"note,omitempty"`
+	CacheFiles        int        `json:"cacheFiles"`
+	CacheBytes        int64      `json:"cacheBytes"`
+	SettingsFile      string     `json:"settingsFile"`
+	FFmpeg            bool       `json:"ffmpeg"`
+	SystemThumbAvail  bool       `json:"systemThumbAvail"`
+	SystemThumbActive bool       `json:"systemThumbActive"`
 }
 
 func handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -1082,6 +1232,7 @@ func buildSettingsView() settingsView {
 	sysAvail, sysActive := systemThumbnailerState()
 	return settingsView{
 		Settings:          s,
+		RootsInfo:         customRootInfos(s.Roots),
 		DefaultThumbDir:   filepath.Join(workDir, thumbSubdir),
 		ActiveThumbDir:    currentThumbRoot(),
 		Note:              currentThumbNote(),
@@ -1095,20 +1246,35 @@ func buildSettingsView() settingsView {
 }
 
 func handleSettingsSave(w http.ResponseWriter, r *http.Request) {
+	// 先把 body 读成字节：除了正常解码，还要判断**哪些字段根本没出现**。
+	// 原因见下面 preserveOnAbsent —— 整份替换的语义会把缺失字段当成零值写回去。
+	raw, rerr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if rerr != nil {
+		http.Error(w, "read body failed", http.StatusBadRequest)
+		return
+	}
 	var in Settings
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.Unmarshal(raw, &in); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	var present map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &present)
+
+	prev0 := getSettings()
+	in.mergeAbsent(present, prev0)
 	in.normalize()
-	// 前端 body 不含 schemaVersion，保存时补上当前版本；
-	// 否则保存一次就把它清回 0，下次启动又会触发一次迁移。
-	in.SchemaVersion = currentSettingsSchema
 
 	// 先在副本上完成全部校验，任何一项不通过就整体拒绝。
 	// （绝不能"边校验边写入"：那样非法请求会把配置改坏一半 —— 实测踩过。）
-	prev := getSettings()
+	prev := prev0
 	note := ""
+	roots, badMsg := validateCustomRoots(in.Roots)
+	if badMsg != "" {
+		http.Error(w, badMsg, http.StatusBadRequest)
+		return
+	}
+	in.Roots = roots
 	if in.ThumbDir != "" {
 		dir, ok := cleanThumbDir(in.ThumbDir, false)
 		if !ok {
@@ -1123,7 +1289,9 @@ func handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		// 白名单校验：必须走 resolveMediaPath 而不是只调 pathAllowed，
 		// pathAllowed 只做字面前缀比较，而 currentThumbRoot() 之后会被 os.MkdirAll / purgeCache 使用，
 		// 两者都跟随链接。因此在白名单目录里放一个链接，就能把缩略图目录指到白名单外。
-		realDir, sc := resolveMediaPath(dir)
+		// 用 Broad：缩略图目录是应用**内部**目录，不必落在"可见范围"内；
+		// 用收窄版会让「开了只显示已添加文件夹」之后连缩略图目录都改不了。
+		realDir, sc := resolveMediaPathBroad(dir)
 		if sc != 0 {
 			http.Error(w, "该目录不在允许访问范围内（仅支持存储空间等已授权路径）", http.StatusBadRequest)
 			return
@@ -1166,6 +1334,71 @@ func handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		"settings": buildSettingsView(),
 		"note":     note,
 	})
+}
+
+// mergeAbsent 让"请求里根本没出现的字段"保持原值。
+//
+// 这个接口是**整份替换**：没带的字段会被写成零值。对后加的字段来说那就是数据丢失 ——
+// 一个还跑着旧版 app.js 的窗口（或第三方脚本）保存一次设置，
+// 用户辛苦添加的文件夹就被清空了（`onlyRoots` 变成"关闭"，`roots` 变成空列表）。
+func (s *Settings) mergeAbsent(present map[string]json.RawMessage, prev Settings) {
+	if _, ok := present["onlyRoots"]; !ok {
+		s.OnlyRoots = prev.OnlyRoots
+	}
+	if _, ok := present["roots"]; !ok {
+		s.Roots = prev.Roots
+	}
+	// 默认值为 true 的开关必须一起保护：请求里没带 ⇒ 反序列化出 false ⇒
+	// 一个还缓存着老 app.js 的窗口保存一次，就把用户的"名称在封面下方"悄悄关掉了。
+	// （coverEnabled 没进这张表是历史遗留，这里不顺手改 —— 那会改变存量行为。）
+	if _, ok := present["coverNameBelow"]; !ok {
+		s.CoverNameBelow = prev.CoverNameBelow
+	}
+	// 2.4.29 同理：mobileFlowView 默认 true，老 app.js（或另一个还缓存着旧 JS 的窗口）
+	// 保存设置时不带这个字段 ⇒ 不能把它悄悄关成 false，否则用户的手机流莫名其妙消失。
+	if _, ok := present["mobileFlowView"]; !ok {
+		s.MobileFlowView = prev.MobileFlowView
+	}
+	// 2.4.35 同理：mobileSpaNav 默认 true。
+	if _, ok := present["mobileSpaNav"]; !ok {
+	}
+}
+
+// validateCustomRoots 校验并归一化「已添加的文件夹」，返回 (清理后的列表, 错误文案)。
+// 错误文案为空表示通过。
+//
+// 校验口径与正常浏览一致（绝对路径 + 存在 + 普通白名单 + 链接解析），
+// 但走 Broad：这一步正是"添加"动作本身，不能要求它已经在可见范围内 ——
+// 否则就成了"只能添加已添加的目录"。
+//
+// 任何一条不合法就**整体拒绝**（与缩略图目录同一套"先校验后写入"的纪律）：
+// 悄悄丢掉用户刚加的那一条，比直接报错更让人困惑。
+func validateCustomRoots(roots []string) ([]string, string) {
+	if len(roots) == 0 {
+		return nil, ""
+	}
+	cleaned := make([]string, 0, len(roots))
+	seen := make(map[string]bool, len(roots))
+	for _, rawDir := range roots {
+		abs := filepath.Clean(expandUser(strings.TrimSpace(rawDir)))
+		if !filepath.IsAbs(abs) {
+			return nil, "文件夹需要绝对路径：" + rawDir
+		}
+		if !dirExists(abs) {
+			return nil, "文件夹不存在：" + abs
+		}
+		real, sc := resolveMediaPathBroad(abs)
+		if sc != 0 {
+			return nil, "该文件夹不在允许访问范围内（仅支持存储空间等已授权路径）：" + abs
+		}
+		key := strings.ToLower(real)
+		if seen[key] {
+			continue // 同一目录用不同写法加了两次：静默去重（这就是用户意图，不算错）
+		}
+		seen[key] = true
+		cleaned = append(cleaned, real)
+	}
+	return cleaned, ""
 }
 
 func dirExists(p string) bool {
@@ -1237,6 +1470,13 @@ func handleVolumes(w http.ResponseWriter, r *http.Request) {
 		Path string `json:"path"`
 	}
 	out := []volEntry{}
+	// 开启「只显示我添加的文件夹」后，盘位列表也一并收敛 —— 这是"磁盘不显示"的另一半：
+	// 首页已经改用 /api/list?path=/ 取数，这个接口主要是给外部脚本用的，
+	// 但既然语义叫"存储空间列表"，就应当与界面口径一致。
+	if getSettings().OnlyRoots {
+		writeJSON(w, r, map[string]any{"volumes": out})
+		return
+	}
 	for _, p := range listVolDirs() {
 		if !dirExists(p) {
 			continue
@@ -1325,7 +1565,9 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	// 链接防护：pathAllowed 只做字面前缀比较，而 os.ReadDir 会跟随符号链接。
 	// 只借 resolveMediaPath 的校验，列表与返回仍用字面路径 abs。
-	if _, sc := resolveMediaPath(abs); sc != 0 {
+	// Broad：目录选择器的用途就是"浏览到尚未添加的目录"，
+	// 用收窄版会把用户锁死 —— 只能在已添加的文件夹里打转，永远加不了新的。
+	if _, sc := resolveMediaPathBroad(abs); sc != 0 {
 		http.Error(w, "路径不在允许范围内", http.StatusForbidden)
 		return
 	}
@@ -1354,6 +1596,25 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 // defaultUserDir 返回 /vol{n}/1000（不存在则报错）
+// customRootInfos 把已添加的文件夹展开成带状态的条目（顺序与配置一致）。
+func customRootInfos(roots []string) []rootInfo {
+	out := make([]rootInfo, 0, len(roots))
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		info := rootInfo{Path: r, Name: filepath.Base(r), Exists: dirExists(r)}
+		if !info.Exists {
+			// 目录没了也把最后一段名字留住，否则列表里只剩一条空白路径
+			if info.Name == "" || info.Name == string(filepath.Separator) {
+				info.Name = r
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
 func defaultUserDir(root string) (string, error) {
 	p := filepath.Join(root, "1000")
 	st, err := os.Stat(p)
