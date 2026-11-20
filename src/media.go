@@ -8,6 +8,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -290,6 +291,15 @@ func thumbRequestSize() int {
 	return s
 }
 
+// pregenMaxPaths 单次 /api/pregen 最多接受的路径条数（二次审查 P1-4）。
+//
+// 前端一次最多回传"一屏到两屏"的可见条目（几十条），1024 已经远超正常用量。
+// 不设上限时，一个 POST 放几十万条路径就能把内存与后台队列一起打爆（DoS）。
+const pregenMaxPaths = 1024
+
+// pregenMaxBody 单次 /api/pregen 请求体上限（与 handleSettingsSave 的 1MB 对齐）。
+const pregenMaxBody = 1 << 20
+
 // handlePregen 由前端在**按显示顺序重排之后**调用，回传有序 path 列表，
 // 让后台预生成按「用户实际看到的顺序」入队。
 //
@@ -308,9 +318,17 @@ func handlePregen(w http.ResponseWriter, r *http.Request) {
 		Paths  []string `json:"paths"`
 		Manual bool     `json:"manual"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// 2.4.50（二次审查 P1-4）：请求体必须限长。原实现直接把 r.Body 交给
+	// json.Decoder，一个超大的 JSON 就能吃光内存（服务端没有读写超时）。
+	if err := json.NewDecoder(io.LimitReader(r.Body, pregenMaxBody)).Decode(&body); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
+	}
+	if len(body.Paths) > pregenMaxPaths {
+		// 超出部分直接截断（不是 400）：前端正常不会超，截断比整批失败更友好，
+		// 且"顺序原样保留"语义不受影响。
+		log.Printf("pregen: paths %d exceeds limit %d, truncating", len(body.Paths), pregenMaxPaths)
+		body.Paths = body.Paths[:pregenMaxPaths]
 	}
 	files := make([]FileItem, 0, len(body.Paths))
 	for _, p := range body.Paths {
@@ -318,12 +336,26 @@ func handlePregen(w http.ResponseWriter, r *http.Request) {
 		if p == "" {
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(p))
+		// 2.4.50（二次审查 P1-4）：**每个路径都要过白名单**。
+		//
+		// 原实现只 TrimSpace + classify(ext)，于是任何能访问本接口的调用者都能传
+		// 任意绝对路径（如 /root/私密照片/a.jpg）：root 进程替它解码白名单外的文件，
+		// 产物落到 <thumbRoot>/<原绝对路径>，而 allowedRoots() 把 currentThumbRoot()
+		// 也当合法根 —— 再走 /api/browse + /api/raw 就能把缩略图取回来。
+		// OnlyRoots 承诺的"所有读取接口拒绝白名单外路径"因此被整条绕过。
+		abs, sc := resolveMediaPathReq(r, p)
+		if sc != 0 {
+			log.Printf("pregen: reject %q (status %d)", p, sc)
+			continue // 单条非法不整批失败：前端可能混入一个刚被删/移出的路径
+		}
+		// Ext/Kind 必须从**解析后的真实路径**重取：链接解析可能改变扩展名所在的路径形态
+		// （例如 a.jpg 是指向 a.png 的链接），用原串算出的 kind 会与真正被读的文件不符。
+		ext := strings.ToLower(filepath.Ext(abs))
 		kind := classify(ext)
 		if kind == "" {
 			continue // 非媒体：前端不该传，兜底忽略
 		}
-		files = append(files, FileItem{Name: filepath.Base(p), Path: p, Ext: ext, Kind: kind})
+		files = append(files, FileItem{Name: filepath.Base(abs), Path: abs, Ext: ext, Kind: kind})
 	}
 	var n int
 	if body.Manual {
@@ -379,7 +411,12 @@ func handleRaw(w http.ResponseWriter, r *http.Request) {
 	// 用与 systemthumb.go 里 size=big 相同的机制：暂停窗口内到达的缩略图请求直接
 	// 返回占位图（tryServeDeferredThumb），CPU 全部让给大图。
 	// /api/raw 自己走 scaledSem，与缩略图信号量相互独立，不会被这次暂停挡住。
-	noteForegroundPreview()
+	//
+	// 2.4.50（二次审查 P2-12）：noteForegroundPreview() **必须放在校验之后**。
+	// 原实现在路径/类型校验之前调用，于是任何能连上 app socket 的本地进程都可以用
+	// 一串无效请求（?path=乱写）反复暂停后台 20 秒并 cancelBackgroundCtx（kill 在跑的
+	// ffmpeg）—— 滑动续期下，低成本请求就能让后台预生成永久停摆。
+	// 现在：非法/非媒体/非普通文件的请求在下面几道闸门直接返回，根本不进入暂停。
 	path, sc := resolveMediaPathReq(r, r.URL.Query().Get("path"))
 	if sc != 0 {
 		http.Error(w, http.StatusText(sc), sc)
@@ -403,6 +440,10 @@ func handleRaw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a regular file", http.StatusForbidden)
 		return
 	}
+	// 走到这里 = 这是一次**合法的**大图请求：现在才暂停后台。
+	// （后续按需转码的分支在 serveScaledImage 里还有一次 pause，缓存命中时不会触发 ——
+	//  与那里的做法一致：不该为"毫秒级就返回的命中"去 kill 一轮后台 ffmpeg。）
+	noteForegroundPreview()
 	// 图片查看器可传 maxdim，由后端用 ffmpeg 缩放后输出，
 	// 避免浏览器把几万像素的原图全量解码导致内存爆炸。
 	maxdim := 0
@@ -875,6 +916,14 @@ func handleMeta(w http.ResponseWriter, r *http.Request) {
 	info, err := os.Stat(path)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// 普通文件闸门（二次审查 P1-5）：与 handleRaw 完全同口径。
+	// 缺这道闸门时，白名单目录里的 `mkfifo evil.jpg` + 一次 /api/meta 就会让
+	// ffprobe/imageDimCached 永久阻塞（FIFO 的 open 要等写端），
+	// 而服务端没有读写超时 → 每个请求永久泄漏一个 goroutine + fd。
+	if !info.Mode().IsRegular() {
+		http.Error(w, "not a regular file", http.StatusForbidden)
 		return
 	}
 	kind := classify(filepath.Ext(path))

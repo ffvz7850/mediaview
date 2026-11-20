@@ -89,11 +89,12 @@ func Test2426RebuildButtonBranching(t *testing.T) {
 		seg = seg[:j]
 	}
 	for _, want := range []string{
-		"it.kind === 'dir'",              // 按内容分流
-		"'/dircov/rebuild?path='",        // 子文件夹 → 重建封面
-		"'&shallow=1'",                   // 媒体文件 → 非递归清当前层缩略图
-		"encodeURIComponent(state.path)", // shallow 清的是**当前目录**
-		"bumpThumbCacheBust()",           // 完成后强制浏览器重新拉
+		"it.kind === 'dir'",                      // 按内容分流
+		"'/dircov/rebuild?path='",                // 子文件夹 → 重建封面
+		"'&shallow=1'",                           // 媒体文件 → 非递归清当前层缩略图
+		"encodeURIComponent(state.path)",         // shallow 清的是**当前目录**
+		"if (doCover) bumpCoverCacheBust();",     // 2.4.50 P3-23：重建了封面 ⇒ 封面 URL 必须换
+		"if (doThumb) bumpThumbCacheBust(true);", // 只清缩略图 ⇒ 保留封面记忆（别无谓淡入）
 	} {
 		if !strings.Contains(seg, want) {
 			t.Errorf("★ 重建按钮缺少分流关键结构 %q", want)

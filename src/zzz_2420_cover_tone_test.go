@@ -48,17 +48,23 @@ func Test2420CoverToneWiring(t *testing.T) {
 		t.Errorf("★ syncCellModeClass() 应被调用 3 次（大/小视图按钮各一次 + 初始化一次），实际 %d 次", n)
 	}
 
-	// 清缓存必须发生在 bumpThumbCacheBust 里（这是"封面 URL 变了"的唯一入口）
-	i := strings.Index(js, "function bumpThumbCacheBust()")
+	// 2.4.48：封面记忆的清理收敛到 resetCoverMem()，由两个 bump 共用。
+	//   （旧断言写死 function bumpThumbCacheBust() 空参数签名，签名一加参数就假失败。）
+	i := strings.Index(js, "function resetCoverMem()")
 	if i < 0 {
-		t.Fatal("找不到 bumpThumbCacheBust")
+		t.Fatal("找不到 resetCoverMem：封面灰度结论必须在某处统一作废")
 	}
 	seg := js[i:]
 	if j := strings.Index(seg, "\n  }"); j > 0 {
 		seg = seg[:j]
 	}
 	if !strings.Contains(seg, "coverToneCache = {}") {
-		t.Error("★ bumpThumbCacheBust 里必须清空 coverToneCache（否则换了封面还在用旧灰度结论）")
+		t.Error("★ resetCoverMem 里必须清空 coverToneCache（否则换了封面还在用旧灰度结论）")
+	}
+	// 两个 URL 计数器都要走这条清理路径：封面真被重建时灰度结论必须作废
+	n := strings.Count(js, "resetCoverMem();")
+	if n < 2 {
+		t.Errorf("★ resetCoverMem() 应在两个 bump 里各调一次（bumpThumb 的 !keepCover 分支 + bumpCover），实际 %d 处", n)
 	}
 
 	// 灰度判断不能挡住封面显示：失败路径要 return ''（CSS 保持默认深色条+白字）

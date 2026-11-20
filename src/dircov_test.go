@@ -31,6 +31,18 @@ func touch(t *testing.T, path string) {
 	}
 }
 
+// imgMtime 取文件的真实 mtime（毫秒，与列表接口同口径）。
+// 2.4.50：coverStillValid 会拿 Items[].Mtime 与磁盘上的 mtime 比较，
+// fixture 必须用真实值，不能用 time.Now() 近似（两者相差几毫秒就会判失效）。
+func imgMtime(t *testing.T, path string) int64 {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("imgMtime(%s): %v", path, err)
+	}
+	return st.ModTime().UnixMilli()
+}
+
 // setCoverSeed 固定挑选随机种子（可复现），用完自动还原。
 func setCoverSeed(t *testing.T, seed int64) {
 	t.Helper()
@@ -512,7 +524,10 @@ func TestCoverPregenSkipIsIdempotent(t *testing.T) {
 		V:      coverCacheVersion,
 		Dir:    dir,
 		PickAt: time.Now().UnixMilli(),
-		Items:  []coverItem{{Path: img, Mtime: time.Now().UnixMilli(), Kind: "image"}},
+		// 2.4.50：coverStillValid 现在会比较 Items[].Mtime（P2-11），
+		// fixture 必须用**文件的真实 mtime**，不能拿 time.Now() 近似 ——
+		// 原先的写法能被"不比较 mtime"的实现蒙混过关，正好掩盖了那个 bug。
+		Items:  []coverItem{{Path: img, Mtime: imgMtime(t, img), Kind: "image"}},
 		Checks: []coverCheck{{Path: dir, Mtime: st.ModTime().UnixMilli()}},
 	}
 	saveCoverPick(meta, p)
@@ -673,7 +688,10 @@ func TestCoverStillValid(t *testing.T) {
 		V:      coverCacheVersion,
 		Dir:    dir,
 		PickAt: time.Now().UnixMilli(),
-		Items:  []coverItem{{Path: img, Mtime: time.Now().UnixMilli(), Kind: "image"}},
+		// 2.4.50：coverStillValid 现在会比较 Items[].Mtime（P2-11），
+		// fixture 必须用**文件的真实 mtime**，不能拿 time.Now() 近似 ——
+		// 原先的写法能被"不比较 mtime"的实现蒙混过关，正好掩盖了那个 bug。
+		Items:  []coverItem{{Path: img, Mtime: imgMtime(t, img), Kind: "image"}},
 		Checks: []coverCheck{{Path: dir, Mtime: st.ModTime().UnixMilli()}},
 	}
 	if !coverStillValid(p, dir) {

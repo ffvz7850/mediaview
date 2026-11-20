@@ -9,16 +9,31 @@
   // 同名文件被覆盖后 URL 不变 → 浏览器一年内不回源，一直显示旧缩略图。
   // 再叠加「清除缓存计数器」：清缓存后 mtime 没变，只能靠这个换 URL。
   // 它必须持久化，否则刷新页面归零 → 又命中一年前那份旧缓存，清缓存等于白清。
+  // 两个计数器各自独立（2.4.48）：以前封面 URL 跟着 thumbCacheBust 走，
+  // 清缩略图会把没被删的封面也全量重下。现在清谁只让谁的 URL 失效。
+  // 都必须持久化：否则刷新归零 → 又命中 immutable 的旧图，清缓存等于白清。
   var thumbCacheBust = 0;
+  var coverCacheBust = 0;
   try { thumbCacheBust = parseInt(localStorage.getItem('mediaview_thumb_bust') || '0', 10) || 0; } catch (e) {}
-  function bumpThumbCacheBust() {
-    thumbCacheBust++;
-    try { localStorage.setItem('mediaview_thumb_bust', String(thumbCacheBust)); } catch (e) {}
-    // 换 URL ⇒ 封面会重新合成（缝色/画质/尺寸都可能变），灰度结论也一并作废
+  try { coverCacheBust = parseInt(localStorage.getItem('mediaview_cover_bust') || '0', 10) || 0; } catch (e) {}
+
+  // 封面记忆重置：缝色/灰度结论 + 跨会话"加载过"记录。
+  // 封面真被重建时才需要调；只清缩略图时封面原样留着，不该让它淡入闪一下。
+  function resetCoverMem() {
     coverToneCache = {};
-    // 2.4.35：跨会话的"加载过"记录同理作废 —— 否则清缓存后仍会直接给旧 URL 的 src
     coverSeen = {}; coverSeenOrder = [];
     try { localStorage.removeItem('mediaview_cover_seen'); } catch (e) {}
+  }
+  // keepCover=true：只换缩略图 URL，封面记忆不动（"清空缩略图"按钮走这条）。
+  function bumpThumbCacheBust(keepCover) {
+    thumbCacheBust++;
+    try { localStorage.setItem('mediaview_thumb_bust', String(thumbCacheBust)); } catch (e) {}
+    if (!keepCover) resetCoverMem();
+  }
+  function bumpCoverCacheBust() {
+    coverCacheBust++;
+    try { localStorage.setItem('mediaview_cover_bust', String(coverCacheBust)); } catch (e) {}
+    resetCoverMem();
   }
   function thumbURL(p, size, mtime) {
     // 带上画质：服务端的缓存标识含画质（改画质会重新生成），URL 也必须跟着变，
@@ -249,7 +264,7 @@
   // 缝色是服务端固定色（2.4.26 起），与主题、请求参数无关 —— 缓存键只含 path/size。
   function coverURL(p, size, mtime) {
     return API + '/dircov?path=' + enc(p) + '&size=' + (size || 320) +
-      '&_t=' + (mtime || 0) + '&_v=' + thumbCacheBust;
+      '&_t=' + (mtime || 0) + '&_v=' + coverCacheBust;
   }
 
   function metaURL(p) { return API + '/meta?path=' + enc(p) + externalTag(); }
@@ -358,6 +373,11 @@
     note: '',
     cacheFiles: 0,
     cacheBytes: 0,
+    // 2.4.48：缩略图与封面分开统计（设置页两个按钮各自显示自己的占用）
+    cacheThumbFiles: 0,
+    cacheThumbBytes: 0,
+    cacheCoverFiles: 0,
+    cacheCoverBytes: 0,
     settingsFile: '',
     takeoverSystemThumb: false,
     systemThumbAvail: false,
@@ -580,7 +600,9 @@
       //   （网格档 resolveSortForDir 恒返回 state.sort）。
       //   不用 state.currentSort：那是"上一次请求的产物"，语义上绕了一层，
       //   而且列表还在飞的时候它代表的是**旧**请求。
-      currentSort: function () { return state.sort; }
+      currentSort: function () { return state.sort; },
+      // 2.4.47：流里"当前张"变了 ⇒ 把 `&p=` 同步进 URL（replace，不涨历史）。
+      onIndex: function (path) { try { setUrlPhoto(path); } catch (e) {} }
     };
     try { window.dispatchEvent(new Event('mv-flow-host')); } catch (e) {}
   }
@@ -918,6 +940,11 @@
       hideLoadingNow();
     } else if (snap) {
       hideLoadingNow();
+      // 2.4.48：同 loadDir —— 内容一致也要恢复滚动位置，否则快速切走再回来会被冲成 0。
+      if (typeof snap.top === 'number' && snap.top > 0) {
+        scroller.scrollTop = snap.top;
+        snapApplied = true;
+      }
     }
     // 一次拿到真实盘位列表：原来是硬编码 /vol1..10（盘位更多的机器看不到后面的存储空间），
     // 而且每一轮还先发一个返回值完全没用的 /api/health —— 首屏白白多打 10 个请求。
@@ -947,13 +974,18 @@
       rootFiles = resortLikeFnOs(rootFiles, rootSort);
       var nextItems = rootDirs.concat(rootFiles);
       var unchanged = sameItems(state.items, nextItems);
-      var keepTop = snapApplied ? scroller.scrollTop : 0;
+      // 2.4.48：快照恢复过就用快照里记录的 top（而非当时易被虚拟滚动 clamp 的
+      //   scroller.scrollTop）—— 快速「返回→前进」时后者可能已被冲成 0，
+      //   直接沿用 snap.top 才能让列表回来后停在离开时那一屏。
+      var keepTop = snapApplied ? (snap.top || 0) : 0;
       state.items = nextItems;
       state.files = rootFiles;
       saveSnap('/', nextItems, rootFiles, keepTop, rootSort);
       renderCrumb();
       if (!unchanged) applyItems(null, keepTop);
       applyRootEmptyHint();      // 2.4.16：首页空状态要说清"为什么空"
+      // 2.4.47：URL 里有 p（刷新/前进落在聚合根）⇒ 列表到位后补开大图
+      try { maybeOpenPending(); } catch (e) {}
       syncExitTips();            // 2.4.0：到根层 ⇒ 挂上"是否退出"的确认
     }).catch(function () {
       hideLoadingNow();
@@ -969,39 +1001,102 @@
   // 目录加载序号：快速连点两个目录时先发的请求可能后返回 ——
   // 没有这个守卫就会出现「面包屑是后点的目录、网格却是先点目录的内容」。
   var loadSeq = 0;
-  // ---------- 换目录：真页面导航 ----------
+  // ---------- 换目录：单文档 SPA（pushState + 就地渲染）----------
   //
-  // 每一层目录都是一个**真实的页面条目**（`?dir=<绝对路径>`），由浏览器/宿主自己记账。
-  // 于是"返回"只有一种语义：回到上一层那个页面 —— 不需要在历史里布置守卫，
-  // 也不需要猜宿主一次手势到底退了几格。这是最朴素、也最难出错的方案。
+  // 2.4.46：**改回单文档**（2.4.35 就是这个模型；2.4.40 曾为了"让宿主自己记账"退回整页导航）。
+  //   整页导航的代价是：每按一次返回 = 一次**文档重载** —— WebView 要重新拉 HTML/JS、
+  //   重新鉴权、重建全部状态，期间页面被卸载重建。慢、会闪，而且"返回"的落点完全交给
+  //   宿主/浏览器去猜。piGallery2 恰好相反：目录在 URL 里、切换只 pushState、
+  //   内容就地渲染，全程一个文档 —— 返回就是回退一条历史，落点由 event.state 决定。
+  //   而且**单文档才谈得上"逐层"**：整页导航时每个条目都是一份独立文档，
+  //   宿主一旦对同 URL 的文档做去重/复用，"层级"就和网页的认知对不上了。
   //
-  // 代价只有一条：每次换目录都是一次文档加载，首屏本来要等 /api/list。
-  // 对策是**目录快照**（见下面 2.4.31 那段）：离开前把 items 与滚动位置写进
-  // sessionStorage，新页面 boot 时**不等任何接口**先把画面铺出来，真实列表回来
-  // 一致就一个字节都不改 —— 这就是"返回不闪"的全部机制。
+  // 所以：进一层目录 = pushState 一条（URL 带 `?dir=<绝对路径>`）+ `loadDir()` 就地渲染；
+  //   返回 = 浏览器/宿主回退一条 → popstate 按 `event.state` 决定渲染哪一层。
+  //   「不闪」靠两件事：目录快照（先铺内容，见 2.4.31 那段）+ 增量替换 DOM（applyItems）。
   //
   // ⚠️ 参数名必须是 `dir`：`?path=` 已被"单文件模式"占用。
+  //
+  // 历史条目的状态形状（这三样是 mvOnPop 唯一的判据）：
+  //   { mvDir: '/绝对路径', from: '进来之前在哪一层' }   —— 一层目录
+  //   { mvRoot: 1, from: ... }                          —— 聚合文件夹层（最上层）
+  //   { mvViewer: 1 }                                   —— 大图查看器（叠在当前目录上）
+  // 2.4.47：URL 里除了目录，还要带「正在看哪张」（`&p=`）—— 学 piGallery2。
+  //
+  // 为什么非要把大图也写进 URL：2.4.46 的查看器条目是 `pushState({mvViewer:1}, '')`，
+  //   **URL 一个字符都没变**，历史里两条条目的地址完全相同、只能靠 state 区分。
+  //   这等于又回到了「靠内部记账」—— 只要有任何一次 pop 落点和我们以为的不一样，
+  //   URL 上看不出差别，界面就会和 URL 脱节（表现为"退错层/一次退两层"）。
+  // piGallery2 恰好相反：大图就是 `?p=文件名`，界面完全由 URL 决定，谁都不用记账。
+  function navUrl(path, photo) {
+    var s = GW + '/?dir=' + encodeURIComponent(path || '/');
+    if (photo) s += '&p=' + encodeURIComponent(photo);
+    return s;
+  }
+
+  // 读当前 URL 的目标状态。这是**唯一**的状态来源（不看 DOM、不看历史栈）。
+  function urlState() {
+    var out = { dir: '/', photo: '' };
+    try {
+      var q = new URLSearchParams(location.search);
+      var d = q.get('dir');
+      if (d) out.dir = d;
+      var p = q.get('p');
+      if (p) out.photo = p;
+    } catch (e) { /* 读不到就按根层 */ }
+    return out;
+  }
+
+  // 压一条历史。失败（沙箱不让改 URL 等）就退回真导航 —— 功能不能丢。
+  function pushNav(st, path, photo) {
+    try {
+      history.pushState(st, '', navUrl(path, photo));
+      // 记下"最近一次我们自己写的 URL"：否则紧接着的一次真实返回因为和它相同，
+      // 会被 applyUrl 的 400ms 去重闸当成回声吞掉（大图就关不掉了）。
+      markApplied();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 改写当前这条历史（不新增、不触发 pop）。只用于"同一层的状态变化"：
+  //   大图里换了一张、或者把 `p` 收掉。
+  function replaceNav(st, path, photo) {
+    try {
+      history.replaceState(st, '', navUrl(path, photo));
+      markApplied();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function navigateTo(path) {
+    if (!path) return;
+    if (!state.root && state.path === path) return;   // 已经在这一层：不重复压条目
     rememberScroll();   // 离开前记住"看到第几屏"，返回时停在原处
-    location.href = GW + '/?dir=' + encodeURIComponent(path);
+    var st = { mvDir: path, from: state.root ? null : state.path };
+    if (!pushNav(st, path)) { location.href = navUrl(path); return; }
+    loadDir(path);
   }
 
-  // 回"存储空间列表"（最上层）。显式带 ?dir=/ —— 否则 boot 会把它当成
-  // "没有指定目录"而走到首页逻辑（那里可能又落回上次目录）。
+  // 回聚合文件夹层（最上层）。
   function navigateRoot() {
+    if (state.root) return;
     rememberScroll();
-    location.href = GW + '/?dir=/';
+    var st = { mvRoot: 1, from: state.path };
+    if (!pushNav(st, '/')) { location.href = navUrl('/'); return; }
+    buildRoot();
   }
 
-  // ---------- 2.4.31：目录快照（跨页秒开 / 来回切目录不闪）----------
+  // ---------- 2.4.31：目录快照（切目录秒开 / 来回切不闪）----------
   //
-  // 问题：换目录是**整页导航**（见 navigateTo 的说明 —— 那是让宿主/浏览器自己记账、
-  //   返回能逐层退的代价）。整页重载后首屏必然要等 /api/list 才有内容，
-  //   这段时间就是用户看到的"进/退文件夹闪一下"。
-  //
-  // 做法：把最近几个目录的 items 存进 sessionStorage（同标签页、关掉即清）。
-  //   新页面 loadDir 时**先**用快照画出来（通常 <1 帧就到位），真实列表回来后再比对：
+  // 快照解决的是"内容比数据晚到"：SPA 切目录时界面不该先清空再等 /api/list，
+  //   所以把最近几个目录的 items 存进 sessionStorage（同标签页、关掉即清），
+  //   切过去**先**用快照画出来（通常 <1 帧就到位），真实列表回来后再比对：
   //   完全一致 ⇒ 一个字都不改（DOM/缩略图/滚动位置全都不动）→ 真正的零闪烁。
+  //   （整页导航时代它还兼着"重载后首屏不空"，现在只剩这一条职责。）
   //
   // 为什么用 sessionStorage 而不是 localStorage：这是"这次浏览的来回切换"，
   //   换设备/关标签页就该忘掉；也避免长期占着几 MB。
@@ -1105,6 +1200,15 @@
       hideLoadingNow();
     } else if (snap) {
       hideLoadingNow();   // boot 已经铺过同一份内容，不再重复布局（重复布局本身就是闪一下）
+      // 2.4.48：内容一致、无需重建，但**滚动位置仍要恢复**。
+      //   快速「返回→前进」时 buildRoot 的异步列表会被 loadDir 打断（mySeq 守卫），
+      //   state.items 还停在这一层，于是 sameItems 为真走这里；若不恢复 top，
+      //   后面的 saveSnap 会用 keepTop=0 把快照里正确的位置冲掉 —— 表现为
+      //   "前进回来跳回顶部"。只设 scrollTop、不碰 DOM，零闪。
+      if (typeof snap.top === 'number' && snap.top > 0) {
+        scroller.scrollTop = snap.top;
+        snapApplied = true;   // 让 .then 里的 saveSnap 保留这个位置
+      }
     }
     // 先确定排序（可能要读文件管理器的偏好），再发列表请求：列表顺序决定了大图切换
     // 顺序、预加载取哪几张、后台预生成的顺序，顺序错了这三样全跟着错。
@@ -1129,7 +1233,8 @@
       var unchanged = sameItems(state.items, nextItems);
       // 快照先铺过 ⇒ 用户可能已经在看、甚至滚了几屏。真实列表回来必须停在原地，
       // 否则"刚滑到第 30 张，列表一回来被弹回顶部"比闪烁更难受。
-      var keepTop = snapApplied ? scroller.scrollTop : 0;
+      // 2.4.48：同 buildRoot —— 用 snap.top 而非 scroller.scrollTop，避免被冲成 0。
+      var keepTop = snapApplied ? (snap.top || 0) : 0;
       state.items = nextItems;
       state.files = files;
       saveSnap(path, nextItems, files, keepTop, effSort);
@@ -1137,6 +1242,8 @@
       // 变了也只做**增量**替换（见 applyItems）：只有真换了内容的格子才动，
       // 其余 DOM 一个字节都不改，浏览器只 paint 最终状态。
       if (!unchanged) applyItems(null, keepTop);
+      // 2.4.47：URL 说"要看某张图"，但刚才列表还没到 —— 现在补开。
+      try { maybeOpenPending(); } catch (e) {}
       if ((cfg.preloadConcurrency || 0) > 0) postPregen(state.files);
       try { localStorage.setItem('mediaview_last', path); } catch (e) {}
     }).catch(function (e) {
@@ -1183,6 +1290,12 @@
     //   它的内容层 —— 用户会觉得"怎么又冒出这个文件夹"。
     if (isCustomRoot(up)) { navigateRoot(); return; }
     if (!isInsideAnyUserDir(up)) { navigateRoot(); return; }
+    // 2.4.46：**这一层就是从上一层点进来的 ⇒ 直接回退历史，别再压新条目**。
+    //   否则历史会变成锯齿：箭头回上一层（压一条）→ 再按系统返回，就**退回刚离开的
+    //   子目录**（"返回不按路径逐层"的另一种来源）。`from` 是压栈时记下的来处。
+    var cur = null;
+    try { cur = history.state; } catch (e) { /* 读不到就按普通导航走 */ }
+    if (cur && cur.from === up) { history.back(); return; }
     navigateTo(up);
   }
 
@@ -1224,6 +1337,41 @@
 
   // 通用确认弹层：确定 → onOk()；取消 / 点遮罩 → 什么都不做（留在原地）。
   // 每次都重新绑定 handler 并在收起时清掉，避免"上一次的 onOk 被下一次触发"。
+  //
+  // 2.4.50（二次审查 P2-15）：这里是**实现**了（2.2.1 删掉旧退出确认层时只留下注释，
+  // 于是"重建当前目录/清除所有数据"两处仍在用原生 window.confirm()）。
+  // 纯 DOM 实现、不依赖宿主，iframe 下也稳：结构复用 index.html 的
+  // #askConfirm（.modal/.modal-mask/.modal-box 与设置弹层同一套样式）。
+  var askConfirmEl = null, askConfirmCb = null;
+  function askConfirmClose() {
+    if (askConfirmEl) askConfirmEl.classList.add('hidden');
+    askConfirmCb = null;
+  }
+  function askConfirm(message, onOk) {
+    if (!askConfirmEl) {
+      askConfirmEl = $('askConfirm');
+      if (!askConfirmEl) {
+        // 极端兜底：DOM 缺失（旧缓存只更新了 app.js）时退回原生 confirm，
+        // 至少功能不失效；正常情况永远走自绘层。
+        if (window.confirm(message)) { try { if (onOk) onOk(); } catch (e) {} }
+        return;
+      }
+      var ok = $('askConfirmOk');
+      var cancel = $('askConfirmCancel');
+      var mask = $('askConfirmMask');
+      if (ok) ok.onclick = function () {
+        var cb = askConfirmCb;
+        askConfirmClose();
+        if (cb) cb();
+      };
+      if (cancel) cancel.onclick = askConfirmClose;
+      if (mask) mask.onclick = askConfirmClose;   // 点遮罩 = 取消（留在原地）
+    }
+    var text = $('askConfirmText');
+    if (text) text.textContent = message || '';
+    askConfirmCb = onOk || null;
+    askConfirmEl.classList.remove('hidden');
+  }
   
 
   // 退出整个应用：借宿主桥接的 close。
@@ -1279,32 +1427,109 @@
     } catch (e) { /* 能力缺失 / 调用失败都不影响页面本身 */ }
   }
 
-  // ---------- 查看器自己的一层历史 ----------
+  // ---------- 返回 = 把 URL 应用成界面（2.4.47）----------
   //
-  // 网格层与层之间**不需要**任何历史操作 —— 每层都是一个真实页面（见 navigateTo）。
-  // 唯一需要记账的是**大图查看器**：它只是叠在网格上的一层遮罩、不是页面，
-  // 所以打开时压一条历史，让"返回"先落在这里（= 关掉查看器），而不是退到上一层目录。
+  // piGallery2 里没有一行「处理返回」的代码：目录在路径段、大图在 `?p=`，
+  //   界面是 URL 的函数，popstate 由它的 router 代听。它返回得对，不是写得巧，
+  //   而是**没有任何状态机需要和历史对账**。
   //
-  // 规则只有两条：
-  //   · 打开时 pushState({ mvViewer: 1 }) —— 全项目唯一一处 pushState；
-  //   · popstate 里若查看器还开着 ⇒ 关掉它（历史已经退了，这里不用再动历史）。
-  // 主动关闭（✕ / 点背景 / Esc）时由 closeViewer 把这条历史收回去，见那里的说明。
-  var mvViewerFromPop = false;
+  // 2.4.46 还留着一处在对账：popstate 一进来先看「查看器是不是开着」，开着就关掉并 return。
+  //   这条分支的代价是**落点信息被丢掉** —— URL 已经退到上一层了，界面却只关了个遮罩，
+  //   于是"界面"和"URL"从此差一层。下一次返回就按 URL 再退一层，体感正是
+  //   「一次滑动退了两层 / 再滑一下就退出」。
+  //
+  // 现在：popstate 只有一个动作 `applyUrl()` —— 读 URL、渲染，**绝不写历史**。
+  //   它天然幂等：同一个 URL 连着来两次，第二次什么都不做。
 
-  function mvOnPop() {
-    if (viewer.classList.contains('hidden')) return;   // 不是查看器这一层：什么都不做
-    mvViewerFromPop = true;
-    try { closeViewer(); } finally { mvViewerFromPop = false; }
+  // 大图 = `?p=`。pendingPhoto 用在"URL 说要看图，但列表还没到"的窗口期。
+  var pendingPhoto = '';
+  // 正在派发（加载中）的目标目录。只用来"判重"，**不写 state.path** ——
+  // 提前改 state.path 会让滚动记忆把旧那一屏的位置写进新目录的快照（实测会把 300 写成 0）。
+  var applyingDir = '';
+  var lastApply = { href: '', at: 0 };
+
+  // 记下"最近一次我们自己写的 URL"（push / replace 之后调用）。
+  // 作用：让 400ms 去重闸只吞"同一落点重复到达"的回声，绝不吞掉真实的一次返回。
+  function markApplied() {
+    try { lastApply.href = location.href; lastApply.at = Date.now(); } catch (e) {}
   }
 
-  if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);
+  function curPath() { return state.root ? '/' : (state.path || '/'); }
+
+  function viewerHidden() { return !viewer || viewer.classList.contains('hidden'); }
+
+  // 把 URL 应用成界面。**只读 URL，不写历史**。
+  function applyUrl() {
+    if (singleMode) return;
+    var href = '';
+    try { href = location.href; } catch (e) {}
+    var now = Date.now();
+    // 同一个 URL 在 400ms 内重复到达（宿主一次手势发两个 pop、或回声）⇒ 直接忽略。
+    // 这是"一次滑动退两层"的最后一道闸：落点没变就绝不重复渲染。
+    if (href && href === lastApply.href && now - lastApply.at < 400) return;
+    if (href) { lastApply.href = href; lastApply.at = now; }
+
+    var u = urlState();
+    if (u.dir !== curPath()) {
+      // 上一次 pop 派发的目录还在加载中（loadDir 是异步的）：
+      //   同一个目标就不重复派发；换了目标就接着派发（loadSeq 会作废上一轮）。
+      if (u.dir === applyingDir) return;
+      // 先把**离开的这一层**看到第几屏记进快照 —— 否则"前进"回来会从顶部开始。
+      // ⚠️ 顺序不能反：rememberScroll 读的是 state.path，必须趁它还是"旧那一层"。
+      rememberScroll();
+      pendingPhoto = u.photo || '';
+      applyingDir = u.dir;
+      if (u.dir === '/') buildRoot(); else loadDir(u.dir);
+      return;
+    }
+    // 已经落在 URL 指向的目录上：加载中标记可以清了
+    applyingDir = '';
+    if (u.photo) {
+      pendingPhoto = u.photo;
+      if (viewerHidden()) maybeOpenPending();
+      return;
+    }
+    pendingPhoto = '';
+    if (!viewerHidden()) closeViewer({ fromUrl: true });
+  }
+
+  // 列表到位后补开大图（URL 里有 p，但当时 items 还没加载）
+  function maybeOpenPending() {
+    if (!pendingPhoto) return;
+    var p = pendingPhoto;
+    var items = state.items || [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && items[i].path === p) {
+        pendingPhoto = '';
+        openViewerOverlay(items[i], { fromUrl: true });
+        return;
+      }
+    }
+  }
+
+  // 同一层里"换了一张"：只改写当前条目（replace），不新增历史。
+  // 只在查看器开着时动 —— 关着的时候 URL 不该有 p。
+  function setUrlPhoto(path) {
+    if (singleMode || !path) return;
+    if (viewerHidden()) return;
+    var u = urlState();
+    if ((u.photo || '') === path) return;
+    replaceNav({ mvViewer: 1 }, u.dir || curPath(), path);   // 内部已 markApplied()
+  }
+
+  function mvOnPop() { applyUrl(); }
+
+  // 两个档位都挂：SPA 下桌面浏览器的后退键同样会换 URL 而不重载。
+  if (!singleMode) window.addEventListener('popstate', mvOnPop);
 
   // ⛔ 这里曾有整条「守卫条目」体系（2.3.0 ~ 2.4.39）：启动时压 1~3 条 pushState /
-  //    hash 条目，popstate 里补满，用来把宿主的滑动返回"吃掉"。它要解决的问题
-  //    （网格里滑动就退出应用）**只存在于内部切换（SPA）**：那时整个会话只有一条
-  //    历史，返回必然落到应用之外。改成真页面导航之后，每一层目录本身就是一条历史，
-  //    宿主怎么数都不会数到"没有可退的了" —— 前提不存在了，机制也就整块删掉了。
-  //    （留档：2.4.33 ~ 2.4.39 七版都在这一层加补丁，无一奏效，原因见交接报告。）
+  //    hash 条目，popstate 里补满，用来把宿主的滑动返回"吃掉"。它当初是为了解决
+  //    "网格里滑一下就退出应用"，而那个问题的真身是：**历史里根本不存在本应用的上一层**
+  //    （整页 `location.replace` 换目录 + 唯一一条入口条目）。
+  // 2.4.46 的解法不是补守卫，而是**让历史如实反映层级**：每进一层目录 pushState 一条，
+  //    返回必然落在某一层目录上，永远不会"没得退"。守卫那套（补条目、轮询、去抖、
+  //    提交式事务）随之整块删除 —— 它只是在替不存在的层级打补丁。
+  //    （留档：2.4.33 ~ 2.4.39 七版都在守卫层加补丁，无一奏效，原因见交接报告。）
 
   // ---------- Breadcrumb ----------
   // 当前路径在某个「已添加的文件夹」之下时，返回它的相对段。
@@ -2033,7 +2258,9 @@
   }
 
   // 原有遮罩模式逻辑（从 openViewer 重命名而来）
-  function openViewerOverlay(target) {
+  // opts.fromUrl=true：这次打开是"URL 让我打开的"（前进 / 刷新 / 深链），
+  //   那条历史已经在栈上了，**不能再压一条**（压了就要多按一次返回）。
+  function openViewerOverlay(target, opts) {
     // 打开前先把本页可能残留的媒体停掉（防御：任何"隐藏而非销毁"的上一次会话）
     stopAllMediaIn(vWrap);
     // build a list of only media items (skip dirs)
@@ -2041,6 +2268,21 @@
     var realIdx = v.list.indexOf(target);
     if (realIdx < 0) realIdx = 0;
     v.index = realIdx;
+
+    // 2.4.47：查看器 = 一条历史，**而且 URL 上要看得见**（`&p=`）。
+    //
+    //   2.4.46 压的是 `pushState({mvViewer:1}, '')` —— URL 一个字符都没变，两条条目
+    //   地址完全相同、只能靠 state 区分。那等于又回到"靠内部记账"：只要有一次 pop 的
+    //   落点和我们以为的不一样，URL 上看不出来，界面就会和 URL 脱节。
+    //   现在把 p 写进 URL：返回时 URL 自己变回"无 p"，applyUrl 一读就知道该关大图。
+    //   从 URL 打开（前进 / 刷新 / 深链）时不压栈 —— 那条历史已经在栈上。
+    //
+    // ⚠️ 必须在渲染**之前**压：下面的 showCurrent 会调 setUrlPhoto，
+    //    它看到"URL 里已经是这张"就不再写（压晚了会变成两条条目）。
+    v.photoPath = target.path;
+    if ((typeof singleMode === 'undefined' || !singleMode) && !(opts && opts.fromUrl)) {
+      pushNav({ mvViewer: 1 }, curPath(), target.path);
+    }
 
     // ---- 2.4.29：手机档 + 开关打开 ⇒ 竖图连续流（独立模块，不建轨道）----
     //
@@ -2084,20 +2326,7 @@
       showCurrent(false); // 打开时只加载当前图，不预加载
       pauseThumbGen();
     }
-    // **查看器 = 一层历史**（仅触屏档）。
-    //
-    // 网格里每一层目录都是真实页面（见 navigateTo），返回天然就是"回上一层页面"。
-    // 但查看器只是叠在网格上的一层遮罩、不产生任何页面 —— 不给它压一条历史的话，
-    // 在查看器里按返回会**直接退到上一层目录**（查看器还开着，网格已经换了）。
-    // 压上这一条之后，"返回"先落在这里 ⇒ popstate → mvOnPop → closeViewer ⇒ 回网格。
-    // 桌面档不加：桌面没有返回手势，查看器由 ✕ / Esc 关。
-    //
-    // 2.4.29：竖图流与轨道模式**共用这一处压栈**（不是各写一遍）——
-    // 压栈点必须只有一处，否则"历史里只该有一条查看器条目"这个前提就不成立了
-    //（多一条会让返回要按两次）。
-    if (PROFILE === 'touch') {
-      try { history.pushState({ mvViewer: 1 }, ''); } catch (e) {}
-    }
+    // 2.4.47：查看器 = 一条历史 / URL 带 `&p=` —— 压栈已在函数开头做过（见那里的说明）。
     // 2.4.2：查看器打开 ⇒ 不是"最外层"了，撤掉宿主闸门（旧版 2.2.0 也是这么接的）
     try { syncExitTips(); } catch (e) {}
   }
@@ -2375,6 +2604,9 @@
     // 比逐点贴 `item &&` 更可靠，一处守卫覆盖整条调用链。
     if (!v.list || v.list.length === 0 || v.index < 0 || v.index >= v.list.length) return;
     var item = v.list[v.index];
+    // 2.4.47：换了一张 ⇒ 把 `&p=` 改写进当前这条历史（replace，不涨历史）。
+    //   这样关掉大图后按"前进"能回到你离开时那张，而不是最初打开那张。
+    try { setUrlPhoto(item && item.path); } catch (e) {}
     updateWindowTitle();
     resetView();
     flashCounter();
@@ -3570,7 +3802,9 @@
   function next() { if (flowOpen()) return; swipeTo(1); }
   function prev() { if (flowOpen()) return; swipeTo(-1); }
 
-  function closeViewer() {
+  // opts.fromUrl=true：这次关闭是"URL 让我关的"（返回/前进落到无 p 的条目）。
+  //   此时 URL 已经是对的，**不能再动历史** —— 否则就是我们自己给这次手势补了第二次返回。
+  function closeViewer(opts) {
     showListHint(false); // 2.0.0：关掉查看器时顺手收起可能还挂着的加载提示
     // 2.4.29：若当前是竖图连续流，先把它收掉并记下"看到第几张"。
     // 关闭动作本身仍走下面这套（resume 缩略图 / 历史回退 / 恢复网格），一行不跳 ——
@@ -3595,17 +3829,17 @@
     v.media = null;       // 元素已销毁，v.media 不该再指向失效对象
     // 2.3.0（P2）：把解码引用一并清掉 —— 手机连开十几张大图后不容易被系统杀。
     v.hiSrc = '';
-    // 2.3.0：**主动关闭**（点关闭按钮 / 点背景 / Esc）时补一次历史回退。
+    v.photoPath = '';
+    // 2.4.47：**主动关闭**（✕ / 点背景 / Esc / 流内下滑）⇒ 把查看器那条历史 pop 掉。
     //
-    // 为什么：打开查看器时我们压了一条 {mvViewer:1}（见 openViewerOverlay）。
-    //   · 若是"返回"触发的关闭（mvViewerFromPop=true）⇒ 历史已经退了，这里不能再动；
-    //   · 若是**主动关闭** ⇒ 那条历史还在栈顶，不补一次 back 的话，用户下一次按返回
-    //     会**直接退掉一层目录**（多退一层）。
-    //   ⇒ 一句话：**我们压的条目，只有我们自己收得回来。**
-    //   退完那次 popstate 会进 mvOnPop，那时查看器已经隐藏 ⇒ 它什么都不会做。
-    if (PROFILE === 'touch' && !mvViewerFromPop && !singleMode) {
+    //   为什么必须是 pop 而不是 replace：replace 会把当前条目改写成"同一目录、无 p"，
+    //   于是栈上留下两条**完全相同**的目录条目 —— 用户下一次返回会"原地不动"一下。
+    //   为什么不能什么都不做：条目留着，再按返回就把大图又打开了（piGallery2 实测就是这个坑）。
+    //   为什么要看 URL 而不是 state：URL 里有 p ⇔ 栈顶那条就是查看器条目。
+    //   `fromUrl` 时 URL 已经收过了（返回/前进落到无 p 的条目），这里再动就是自己补一刀。
+    if (!singleMode && !(opts && opts.fromUrl)) {
       try {
-        if (history.state && history.state.mvViewer) history.back();
+        if (urlState().photo) history.back();
       } catch (e) {}
     }
     // 1.8.160：轨道没了，但视图状态（v.scale / v.zoomed / v.tx / v.ty）是挂在 v 上的、
@@ -3980,6 +4214,10 @@
     cfg.note = s.note || '';
     cfg.cacheFiles = s.cacheFiles || 0;
     cfg.cacheBytes = s.cacheBytes || 0;
+    cfg.cacheThumbFiles = s.cacheThumbFiles || 0;
+    cfg.cacheThumbBytes = s.cacheThumbBytes || 0;
+    cfg.cacheCoverFiles = s.cacheCoverFiles || 0;
+    cfg.cacheCoverBytes = s.cacheCoverBytes || 0;
     cfg.settingsFile = s.settingsFile || '';
     cfg.takeoverSystemThumb = !!s.takeoverSystemThumb;
     cfg.systemThumbAvail = !!s.systemThumbAvail;
@@ -4104,7 +4342,8 @@
   function renderCacheInfo() {
     var el = $('cacheInfo');
     el.innerHTML = '当前目录：<b>' + escapeHtml(cfg.activeThumbDir || '-') + '</b><br>' +
-      '已缓存 ' + cfg.cacheFiles + ' 个文件，占用 ' + fmtB(cfg.cacheBytes);
+      '缩略图 ' + cfg.cacheThumbFiles + ' 个，占用 ' + fmtB(cfg.cacheThumbBytes) +
+      '　｜　封面 ' + cfg.cacheCoverFiles + ' 个，占用 ' + fmtB(cfg.cacheCoverBytes);
     var hint = $('cfgPath');
     if (cfg.note) {
       hint.className = 'dir-hint warn';
@@ -4353,10 +4592,11 @@
   var navBackBtn = $('navBack');
   if (navBackBtn) navBackBtn.onclick = function () {
     // 2.3.2：**按状态分流**。此前它直接绑 goUpLevel —— 于是"在大图里点箭头"会走
-    //   goUpLevel → navigateTo(上级) → **真导航整页重载**，而不是"关掉查看器回网格"。
+    //   goUpLevel（换目录），而不是"关掉查看器回网格"。
     //   查看器里只有**系统返回**才走 popstate → closeViewer，箭头这条路整个绕过了它。
-    //   ⇒ 这正是"大图没加载完成时返回就退出软件"的来源：
-    //      点箭头触发了真导航、页面正在加载，此时再返回，宿主的状态机就乱了。
+    //   ⇒ 这正是"大图没加载完成时返回就退出软件"的来源：点箭头触发了换页/换目录，
+    //      此时再按返回，宿主的状态机就乱了。
+    // 2.4.46：换目录已经改成同文档渲染，不再有"页面正在加载"的中间态。
     if (!viewer.classList.contains('hidden')) {
       // closeViewer 内部会在"主动关闭"时补一次 history.back()，把我们压的那条收回。
       closeViewer();
@@ -4385,38 +4625,40 @@
     var parts = [];
     if (doCover) parts.push(dirs.length + ' 个子文件夹的封面');
     if (doThumb) parts.push(nFiles + ' 个文件的缩略图');
-    if (!confirm('重建当前目录？\n\n' + parts.join('，以及') + '\n\n' + state.path)) return;
-
-    var coverOk = 0, coverFail = 0, thumbOk = false;
-    var jobs = [];
-    if (doCover) {
-      // 并发 4：与格子缩略图的并发纪律对齐，再高只会跟前台抢磁盘/CPU
-      var CONC = 4, idx = 0;
-      function worker() {
-        if (idx >= dirs.length) return Promise.resolve();
-        var p = dirs[idx++];
-        return fetch(API + '/dircov/rebuild?path=' + encodeURIComponent(p) +
-          '&size=' + (cfg.thumbSize || 320), { method: 'POST' })
-          .then(function (r) { if (r.ok) coverOk++; else coverFail++; })
-          .catch(function () { coverFail++; })
-          .then(worker);
+    // 2.4.50（二次审查 P2-15）：用自绘 askConfirm，不再用原生 confirm()。
+    // 全应用入口均为 iframe 型（app/ui/config type=iframe），宿主 WebView/sandbox 下
+    // 原生 confirm 可能被静默拦截 —— 表现就是"按钮点了完全没反应"。
+    askConfirm('重建当前目录？\n\n' + parts.join('，以及') + '\n\n' + state.path, function () {
+      var coverOk = 0, coverFail = 0, thumbOk = false;
+      var jobs = [];
+      if (doCover) {
+        // 并发 4：与格子缩略图的并发纪律对齐，再高只会跟前台抢磁盘/CPU
+        var CONC = 4, idx = 0;
+        function worker() {
+          if (idx >= dirs.length) return Promise.resolve();
+          var p = dirs[idx++];
+          return fetch(API + '/dircov/rebuild?path=' + encodeURIComponent(p) +
+            '&size=' + (cfg.thumbSize || 320), { method: 'POST' })
+            .then(function (r) { if (r.ok) coverOk++; else coverFail++; })
+            .catch(function () { coverFail++; })
+            .then(worker);
+        }
+        for (var i = 0; i < Math.min(CONC, dirs.length); i++) jobs.push(worker());
       }
-      for (var i = 0; i < Math.min(CONC, dirs.length); i++) jobs.push(worker());
-    }
-    var chain = Promise.all(jobs).then(function () {
-      if (!doThumb) return;
-      // shallow=1：只清当前层文件的缩略图，不递归下层（下层交给各自的"重建"去管）
-      return fetch(API + '/thumb/clear?path=' + encodeURIComponent(state.path) + '&shallow=1', { method: 'POST' })
-        .then(function (r) {
-          return r.text().then(function (t) {
-            var d;
-            try { d = JSON.parse(t); } catch (e) { d = { ok: false }; }
-            thumbOk = !!d.ok;
-          });
-        })
-        .catch(function () { thumbOk = false; });
-    });
-    chain.then(function () {
+      var chain = Promise.all(jobs).then(function () {
+        if (!doThumb) return;
+        // shallow=1：只清当前层文件的缩略图，不递归下层（下层交给各自的"重建"去管）
+        return fetch(API + '/thumb/clear?path=' + encodeURIComponent(state.path) + '&shallow=1', { method: 'POST' })
+          .then(function (r) {
+            return r.text().then(function (t) {
+              var d;
+              try { d = JSON.parse(t); } catch (e) { d = { ok: false }; }
+              thumbOk = !!d.ok;
+            });
+          })
+          .catch(function () { thumbOk = false; });
+      });
+      chain.then(function () {
       var msg = [];
       if (doCover) {
         msg.push('封面重建 ' + coverOk + ' 个' + (coverFail ? '（失败 ' + coverFail + '）' : ''));
@@ -4425,8 +4667,18 @@
         msg.push(thumbOk ? '缩略图已清，正在重新生成…' : '缩略图清除失败');
       }
       toast(msg.join('；'));
-      bumpThumbCacheBust();
+      // 2.4.50（二次审查 P3-23）：按**实际重建了什么**分流 bump。
+      //   · 重建了封面 → bumpCoverCacheBust()（其内部已含 resetCoverMem）。
+      //     原来这里只 bump 缩略图计数器，而 coverURL 的 _v 取 coverCacheBust、
+      //     _t 取**源目录** mtime ——「重建封面」只写缓存目录、源 mtime 不变，
+      //     于是重建前后封面 URL 字节级相同，而封面响应是 Cache-Control: max-age=600
+      //     ⇒ 最多 10 分钟仍看到旧/坏封面（用户以为"重建没生效"）。
+      //   · 只清了缩略图 → bumpThumbCacheBust(true)（保留封面记忆，别让封面无谓淡入；
+      //     2.4.49 修的 bug#2 就是这个：无参调用会 resetCoverMem）。
+      if (doCover) bumpCoverCacheBust();
+      if (doThumb) bumpThumbCacheBust(true);
       setTimeout(function () { loadDir(state.path); }, 300);
+    });
     });
   };
   $('settingsClose').onclick = closeSettings;
@@ -4592,58 +4844,82 @@
   $('dbClose').onclick = function () {
     $('dirBrowser').classList.add('hidden');
   };
-  $('btnPurge').onclick = function () {
-    var b = this;
-    b.disabled = true;
-    fetch(API + '/settings/purge', { method: 'POST' }).then(function (r) {
+  // 2.4.48：清缓存拆成两个按钮。
+  //   缩略图：每张图一个文件，重建要逐张重新解码（贵）
+  //   封面：一个目录一张拼图，重建只要扫一遍文件名（便宜）
+  //   混着清的话，用户"只想换缩略图尺寸"也会把所有封面重合成一遍。
+  function purgeCacheOf(what, btn, label) {
+    btn.disabled = true;
+    fetch(API + '/settings/purge?what=' + what, { method: 'POST' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (d) {
-      b.disabled = false;
-      toast('已清空 ' + (d.removed || 0) + ' 个缓存文件');
-      bumpThumbCacheBust(); // 换 URL，避免浏览器继续用旧缩略图
+      btn.disabled = false;
+      // removed 是"删掉的缓存目录数"（尺寸档 / dircov），不是文件数 —— 别再报成文件
+      toast('已清空' + label + (d.removed ? '（' + d.removed + ' 个缓存目录）' : ''));
+      // 只让被清的那一类失效：各自换 URL，避免浏览器继续用旧图
+      // 清缩略图时封面原样留着 ⇒ 保留它的加载记忆，别让封面无谓淡入
+      if (what === 'cover') bumpCoverCacheBust(); else bumpThumbCacheBust(true);
       return loadSettings();
     }).then(function () {
       fillSettingsForm();
       redraw();
     }).catch(function () {
-      b.disabled = false;
-      toast('清空缓存失败');
+      btn.disabled = false;
+      toast('清空' + label + '失败');
     });
-  };
+  }
+
+  $('btnPurgeThumb').onclick = function () { purgeCacheOf('thumb', this, '缩略图'); };
+  $('btnPurgeCover').onclick = function () { purgeCacheOf('cover', this, '封面缩略图'); };
 
   // 清除所有数据：缩略图缓存 + 设置，恢复出厂默认（卸载前可用）
   $('btnFactoryReset').onclick = function () {
-    if (!confirm('确定要清除所有数据吗？\n\n将删除：全部缩略图缓存、所有设置项\n并恢复系统缩略图服务。\n\n此操作不可撤销！')) return;
+    // 2.4.50（二次审查 P2-15）：同上，原生 confirm 在 iframe 下可能被静默拦截。
+    // this 必须在回调外捕获 —— askConfirm 的回调里 this 已不是按钮。
     var b = this;
-    b.disabled = true;
-    fetch(API + '/settings/factory_reset', { method: 'POST' }).then(function (r) {
-      return r.json();
-    }).then(function (d) {
-      b.disabled = false;
-      toast('已清除所有数据，设置已恢复默认');
-      bumpThumbCacheBust();
-      return loadSettings();
-    }).then(function () {
-      fillSettingsForm();
-      redraw();
-    }).catch(function () {
-      b.disabled = false;
-      toast('清除失败');
+    askConfirm('确定要清除所有数据吗？\n\n将删除：全部缩略图缓存、所有设置项\n并恢复系统缩略图服务。\n\n此操作不可撤销！', function () {
+      b.disabled = true;
+      fetch(API + '/settings/factory_reset', { method: 'POST' }).then(function (r) {
+        return r.json();
+      }).then(function (d) {
+        b.disabled = false;
+        toast('已清除所有数据，设置已恢复默认');
+        // 全部缓存都清了（含封面）⇒ 两个 URL 计数器都要换，否则封面沿用一年前的旧图
+        bumpThumbCacheBust();
+        bumpCoverCacheBust();
+        return loadSettings();
+      }).then(function () {
+        fillSettingsForm();
+        redraw();
+      }).catch(function () {
+        b.disabled = false;
+        toast('清除失败');
+      });
     });
   };
 
   // ---------- Boot ----------
 
-  // 2.4.40：**第一条历史条目必须自带目录**。
+  // 2.4.40 / 2.4.46：**第一条历史条目必须自带目录，而且必须自带 state**。
   //
-  //   从桌面图标进来时 URL 是 `/app/mediaview`（没有 ?dir=）。就那样停着的话，
-  //   用户点进第一个文件夹再按返回，回到的是一条"没有目录"的页面 —— 它只能靠
-  //   localStorage 猜目录，很可能又落回同一个文件夹（看起来像"返回没反应"）。
-  //   这里用 replaceState 把**当前这条条目改名**成显式目录：不重载、不新增条目。
+  //   1) 从桌面图标进来时 URL 是 `/app/mediaview`（没有 ?dir=）。就那样停着的话，
+  //      用户点进第一个文件夹再按返回，回到的是一条"没有目录"的页面 —— 它只能靠
+  //      localStorage 猜目录，很可能又落回同一个文件夹（看起来像"返回没反应"）。
+  //   2) SPA 的返回全靠 `event.state` 判落点（见 mvOnPop）：入口这条如果是 null，
+  //      从第一层文件夹退回来时就没法判断"该回聚合根"，只能兜底猜。所以顺手把
+  //      state 也写上（`{mvRoot:1}` / `{mvDir:...}`），让整条历史口径统一。
+  //
+  //   只改**当前这条**条目：不重载、不新增条目。
   function fixEntryURL(dir) {
-    if (qsHadDir) return;   // 已经带 ?dir=（真导航落地的页面）：URL 本身就是真相，别动它
+    var st = (!dir || dir === '/') ? {mvRoot: 1} : {mvDir: dir, from: null};
+    var u = urlState();   // 2.4.47：入口 URL 可能已经带 `&p=`（深链直接看图），别弄丢
     try {
-      history.replaceState(null, '', GW + '/?dir=' + encodeURIComponent(dir || '/'));
+      if (qsHadDir) {
+        history.replaceState(st, '');            // URL 已经是真相（刷新的页面）：只补 state
+      } else {
+        history.replaceState(st, '', navUrl(dir || '/', u.photo));
+      }
     } catch (e) { /* 沙箱里不让改 URL：只是这一层不能靠 URL 恢复，不影响功能 */ }
   }
 
@@ -4680,16 +4956,20 @@
     // 2.3.1：**真导航落地**时 URL 带 `?dir=` —— 优先用它打开目标目录。
     //   ⚠️ 不能用 `?path=`：那个参数**已经被"单文件模式"占用**（见上面的 single 分支）。
     var dirParam = qs.get('dir');
+    // 2.4.47：URL 里若已经指明"看哪张"，记下来 —— 列表一到就打开（见 maybeOpenPending）。
+    try { pendingPhoto = qs.get('p') || ''; } catch (e) { pendingPhoto = ''; }
     if (dirParam !== null && dirParam !== '') {
       if (dirParam === '/') {
         // 显式要求"最上层"：**不能**走下面的 last 分支，
         // 否则会从 localStorage 跳回上次目录（"回到最上层失败"就是这么来的）。
+        fixEntryURL('/');           // 2.4.46：给这条条目补上 {mvRoot:1}，返回判定要用
         settingsReady = loadSettings();
         settingsReady.then(function () { buildRoot(); });
         return;
       }
       state.root = false;
       state.path = dirParam;
+      fixEntryURL(dirParam);        // 2.4.46：给这条条目补上 {mvDir:...}（刷新/重载落地时同样需要）
       // 2.4.31：**不等 settings**，先把目录快照铺上。
       //   快照里只有 items（网格内容），而 layout 只用得到 cellMode（localStorage）
       //   和容器宽度 —— 都不依赖设置接口。所以"回到刚看过的目录"可以做到
@@ -4733,8 +5013,9 @@
   // beforeunload 与 pagehide 都挂：移动端与部分宿主里前者不触发，后者更标准；
   // pagehide 加了 persisted 判断，进 bfcache（页面没销毁、返回后查看器还开着）时不误恢复。
   window.addEventListener('beforeunload', flushResumeThumbGen);
-  // 2.4.40：真导航 / 宿主手势返回都会卸载页面 —— 离开前把"看到第几屏"写进快照，
-  //   返回时才能停回原处（navigateTo 里也调了一次；这里兜住不由我们发起的那种离开）。
+  // 离开页面（关窗 / 刷新 / 宿主销毁 / bfcache 进出）前把"看到第几屏"写进快照，
+  //   下次进来才能停回原处（navigateTo 里也调了一次；这里兜住不由我们发起的那种离开）。
+  // 2.4.46：同文档内切目录不再触发 pagehide，这条只剩"整页离开"时兜底。
   window.addEventListener('pagehide', function (e) {
     try { rememberScroll(); } catch (e2) {}
     if (!e.persisted) flushResumeThumbGen();

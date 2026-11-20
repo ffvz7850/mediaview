@@ -107,7 +107,7 @@ func Test2220SingleModeJudgeHasSingleSource(t *testing.T) {
 	}
 
 	// 2.4.40：守卫体系已删，唯一的历史接线变成查看器的 popstate 监听。
-	wiring := "if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);"
+	wiring := "if (!singleMode) window.addEventListener('popstate', mvOnPop);"
 	iDef := strings.Index(app, "var singleMode = false;")
 	iWire := strings.Index(app, wiring)
 	if iDef < 0 || iWire < 0 {

@@ -155,6 +155,84 @@ type Meta struct {
 	Codec    string  `json:"codec"`
 }
 
+// ---- 在途子进程注册表（2.4.50，二次审查 P3-16）----
+//
+// 背景：SIGTERM 时原来只 cancel()（取消 thumbCtx），而实际跑着的 ffmpeg 用的是
+// bgctx（从 context.Background() 派生）或干脆 Background（前台路径）——
+// cancel 根本传不到它们，进程退出后在跑的转码会变成**孤儿进程**继续吃 CPU/IO
+// 直到自己跑完（单条最长 30s；升级/卸载场景下用户会明显感到"卡一下"）。
+//
+// 做法：所有 ffmpeg/ffprobe/vipsthumbnail 子进程在 Run/Output 之前登记到这张表，
+// 退出时遍历 kill。**不在这里重复 Wait**：每个子进程的 Wait 已由它自己的
+// Run/Output/CombinedOutput 在同一 goroutine 完成，重复 Wait 会返回
+// "exec: Wait was already called"；killLiveCommands 改为"发信号 + 等注册表变空"，
+// 既不漏 Wait，也保证函数返回时子进程确实已经退出。
+var (
+	liveCmdMu sync.Mutex
+	liveCmds  = map[*exec.Cmd]struct{}{}
+)
+
+// trackCmd 登记一个即将启动的子进程，返回注销函数。
+func trackCmd(cmd *exec.Cmd) func() {
+	liveCmdMu.Lock()
+	liveCmds[cmd] = struct{}{}
+	liveCmdMu.Unlock()
+	return func() {
+		liveCmdMu.Lock()
+		delete(liveCmds, cmd)
+		liveCmdMu.Unlock()
+	}
+}
+
+// runCmd 登记后同步执行（等价 cmd.Run）。
+func runCmd(cmd *exec.Cmd) error {
+	untrack := trackCmd(cmd)
+	defer untrack()
+	return cmd.Run()
+}
+
+// outputCmd 登记后同步执行（等价 cmd.Output）。
+func outputCmd(cmd *exec.Cmd) ([]byte, error) {
+	untrack := trackCmd(cmd)
+	defer untrack()
+	return cmd.Output()
+}
+
+// combinedOutputCmd 登记后同步执行（等价 cmd.CombinedOutput）。
+func combinedOutputCmd(cmd *exec.Cmd) ([]byte, error) {
+	untrack := trackCmd(cmd)
+	defer untrack()
+	return cmd.CombinedOutput()
+}
+
+// killLiveCommands 杀掉所有在途子进程，并等它们从注册表消失（最多 timeout）。
+//
+// 退出流程调用：cancel() 之后、主 server Shutdown 之前。幂等：没有在途进程时立即返回。
+func killLiveCommands(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		liveCmdMu.Lock()
+		cmds := make([]*exec.Cmd, 0, len(liveCmds))
+		for c := range liveCmds {
+			cmds = append(cmds, c)
+		}
+		liveCmdMu.Unlock()
+		if len(cmds) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("mediaview: %d child process(es) still running after %v; giving up", len(cmds), timeout)
+			return
+		}
+		for _, c := range cmds {
+			if c.Process != nil {
+				_ = c.Process.Kill()
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func probeMeta(ctx context.Context, path string) (*Meta, error) {
 	if ffprobePath != "" {
 		return probeWithFFprobe(ctx, path)
@@ -170,7 +248,7 @@ func probeWithFFprobe(ctx context.Context, path string) (*Meta, error) {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, ffprobePath, "-v", "quiet",
 		"-print_format", "json", "-show_format", "-show_streams", path)
-	data, err := cmd.Output()
+	data, err := outputCmd(cmd)
 	if err != nil {
 		// ffprobe failed; try ffmpeg fallback
 		if ffmpegPath != "" {
@@ -208,7 +286,7 @@ func probeWithFFmpeg(ctx context.Context, path string) (*Meta, error) {
 	cmd := exec.CommandContext(cctx, ffmpegPath, "-hide_banner", "-i", path)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
-	_ = cmd.Run() // expected non-zero exit
+	_ = runCmd(cmd) // expected non-zero exit
 	return parseFFmpegInfo(stderr.String())
 }
 
@@ -438,7 +516,7 @@ func extractFrameAt(ctx context.Context, path string, size int, out string, seek
 		"-vf", vf, "-an", "-y", "-q:v", itoa(q), out)
 
 	cmd := exec.CommandContext(cctx, ffmpegPath, args...)
-	if err := cmd.Run(); err != nil {
+	if err := runCmd(cmd); err != nil {
 		return 0, 0, err
 	}
 	// 校验产物：ffmpeg 退出码 0 **不代表**产物可用（磁盘满、被信号 kill 但 Run 未报错、
@@ -486,7 +564,7 @@ func extractFrameVAAPI(ctx context.Context, path string, size int, out string, d
 	cmd := exec.CommandContext(cctx, ffmpegPath, args...)
 	cmd.Env = vaapiEnv()
 	// 用 CombinedOutput 捕获 stderr，失败时能看到具体原因（profile 不支持 / 驱动缺失等）
-	output, err := cmd.CombinedOutput()
+	output, err := combinedOutputCmd(cmd)
 	if err != nil {
 		return fmt.Errorf("VAAPI ffmpeg 执行失败: %w (stderr: %s)", err, strings.TrimSpace(string(output)))
 	}

@@ -32,7 +32,11 @@ import (
 func fileBirthTime(path string) int64 {
 	var stx unix.Statx_t
 	err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &stx)
-	if err == nil && stx.Mask&unix.STATX_BTIME != 0 {
+	// 2.4.50（二次审查 P3-21）：除了看掩码位，还必须确认**值真的存在**（Sec > 0）。
+	// 某些文件系统 / 内核组合会置 STATX_BTIME 位但把 Btime 填成 0（未初始化），
+	// 原实现直接返回 0 → 这些文件按「创建时间」排序全部垫底，且不落下面的 ctime 兜底。
+	// 判 Sec > 0 后自然走到 ctime 兜底，保证"越靠后越不精确，但一定有值可用"。
+	if err == nil && stx.Mask&unix.STATX_BTIME != 0 && stx.Btime.Sec > 0 {
 		return time.Unix(stx.Btime.Sec, 0).UnixMilli()
 	}
 	var st unix.Stat_t

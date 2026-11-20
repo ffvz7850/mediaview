@@ -79,7 +79,7 @@ func Test2414CoverURLShape(t *testing.T) {
 		"API + '/dircov?path=' + enc(p)",
 		"'&size=' + (size || 320)",
 		"'&_t=' + (mtime || 0)",
-		"'&_v=' + thumbCacheBust",
+		"'&_v=' + coverCacheBust", // 2.4.48：封面独立计数器，清缩略图不再牵连封面
 	} {
 		if !strings.Contains(seg, want) {
 			t.Errorf("coverURL 缺少 %q —— 少了它清缓存/换目录就无法让封面失效", want)
@@ -130,7 +130,10 @@ var coverURL = grab('coverURL');
 var API = '/app/mediaview';
 function enc(s) { return encodeURIComponent(s); }
 var cfg = { thumbSize: 320 };
-var thumbCacheBust = 3;
+// 2.4.48：封面用 coverCacheBust，缩略图用 thumbCacheBust，两者必须解耦。
+// 故意给缩略图一个不同的值，确保 coverURL 拿的是封面那个。
+var thumbCacheBust = 9;
+var coverCacheBust = 3;
 
 // grab 返回的是「function 名(...) {...}」完整声明，直接 eval 声明即可
 eval(coverURL);
@@ -141,7 +144,11 @@ function eq(a, b, m) {
 
 // coverURL 完整形状：path 编码 + size + _t + _v（2.4.26 起无 bg，缝色固定在服务端）
 var u = coverURL('/vol1/1000/图片 目录', 320, 123456);
-eq(u, '/app/mediaview/dircov?path=' + encodeURIComponent('/vol1/1000/图片 目录') + '&size=320&_t=123456&_v=3', 'coverURL 形状');
+eq(u, '/app/mediaview/dircov?path=' + encodeURIComponent('/vol1/1000/图片 目录') + '&size=320&_t=123456&_v=3', 'coverURL 形状（_v 必须取 coverCacheBust）');
+
+// 清缩略图（thumbCacheBust++）不该改变封面 URL —— 封面没被删，就不该全量重下
+thumbCacheBust++;
+eq(coverURL('/vol1/1000/图片 目录', 320, 123456), u, '★ 清缩略图后封面 URL 必须保持不变');
 
 console.log('OK');
 `

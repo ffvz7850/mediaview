@@ -36,6 +36,39 @@ type sortSpec struct {
 // defaultSortSpec 与飞牛文件管理器的默认排序一致：文件名升序。
 var defaultSortSpec = sortSpec{field: sortFieldName, desc: false}
 
+// sortFieldAlias 字段别名表：别名（小写）→ 内部字段名。
+//
+// 单独抽成表是为了修 2.4.50（二次审查 P3-19）的那个真 bug：
+// 原实现先用 `IndexAny(raw, ":_")` 在**第一个**分隔符处切开，于是
+//
+//	file_name   → field="file",  dir="name"  → 未知字段 → defaultSortSpec
+//	modify_time → field="modify", dir="time" → 同上
+//
+// 也就是注释里明确承诺的整批下划线别名**全部失效**（create_time 还会变成 name:asc）。
+// 现在顺序改成：① 含 ':' 按 ':' 拆 ② 整串命中本表（含下划线的别名因此有效）
+// ③ 否则按**最后**一个 '_' 拆出方向、前缀再查表（支持 name_asc / file_name_desc）。
+var sortFieldAlias = map[string]string{
+	"name": sortFieldName, "filename": sortFieldName, "file_name": sortFieldName,
+	"mtim": sortFieldMtime, "mtime": sortFieldMtime, "modify_time": sortFieldMtime,
+	"modified": sortFieldMtime, "modification": sortFieldMtime,
+	"date": sortFieldMtime, "datetime": sortFieldMtime, "time": sortFieldMtime,
+	"size": sortFieldSize, "filesize": sortFieldSize, "file_size": sortFieldSize,
+	"type": sortFieldType, "filetype": sortFieldType, "file_type": sortFieldType,
+	"ext": sortFieldType, "extension": sortFieldType, "kind": sortFieldType,
+	"btim": sortFieldBtime, "btime": sortFieldBtime, "birth_time": sortFieldBtime,
+	"birthtime": sortFieldBtime, "ctime": sortFieldBtime, "create_time": sortFieldBtime,
+	"created": sortFieldBtime, "created_time": sortFieldBtime, "createtime": sortFieldBtime,
+	"creation": sortFieldBtime,
+	// 文件管理器有「位置」列。本应用一次只列一个目录，按路径排等价于按名字排。
+	"position": sortFieldName, "path": sortFieldName, "location": sortFieldName,
+}
+
+// sortDefaultDesc 只给字段、没给方向时的默认方向（沿用旧行为，避免已保存的
+// 书签/URL 换了语义）：修改时间与大小的旧默认都是倒序（date=最新在前、size=从大到小）。
+func sortDefaultDesc(field string) bool {
+	return field == sortFieldMtime || field == sortFieldSize
+}
+
 // parseSort 解析排序参数，大小写不敏感、允许首尾空格。接受的写法：
 //
 //	字段 + 方向（推荐，前端与探测到飞牛偏好时统一用这个）：
@@ -47,7 +80,7 @@ var defaultSortSpec = sortSpec{field: sortFieldName, desc: false}
 //	1.8.70 以前的旧值（保留兼容，语义不变）：
 //	  "date" → 修改时间倒序（旧默认）   "name" → 文件名升序   "size" → 大小倒序
 //
-// 字段别名同时接受 mtime/modified/date、ctime/created/birthtime 等，
+// 字段别名见 sortFieldAlias（mtime/modified/date、ctime/created/birthtime 等），
 // 因为飞牛不同页面（文件列表 / 搜索 / 分享）用的词不完全一样。
 //
 // 无法识别时退回 defaultSortSpec —— 宁可给一个确定的顺序，也不要让列表乱序；
@@ -58,29 +91,27 @@ func parseSort(s string) sortSpec {
 		return defaultSortSpec
 	}
 	field, dir := raw, ""
-	if i := strings.IndexAny(raw, ":_"); i >= 0 {
+	// ① 显式的 "字段:方向"：方向里不可能有 ':'，按第一个 ':' 切是安全的。
+	if i := strings.Index(raw, ":"); i >= 0 {
 		field, dir = raw[:i], raw[i+1:]
+	} else if _, ok := sortFieldAlias[raw]; ok {
+		// ② 整串就是字段名（含下划线的 file_name / modify_time 走这条）——
+		//    这一步必须在按 '_' 拆之前，否则别名会被拆坏。
+		field, dir = raw, ""
+	} else if i := strings.LastIndex(raw, "_"); i > 0 {
+		// ③ "字段_方向"：按**最后**一个 '_' 拆，前缀必须在别名表里。
+		//    用 LastIndex 才能支持 file_name_desc 这种"字段本身带下划线"的写法。
+		if _, ok := sortFieldAlias[raw[:i]]; ok {
+			field, dir = raw[:i], raw[i+1:]
+		}
 	}
-
-	spec := defaultSortSpec
-	switch field {
-	case "name", "filename", "file_name":
-		spec.field = sortFieldName
-	case "mtim", "mtime", "modified", "modify_time", "modification", "date", "datetime", "time":
-		spec.field = sortFieldMtime
-	case "size", "filesize", "file_size":
-		spec.field = sortFieldSize
-	case "type", "ext", "extension", "filetype", "file_type", "kind":
-		spec.field = sortFieldType
-	case "btim", "btime", "ctime", "created", "create_time", "birthtime", "birth_time", "creation",
-		"created_time", "createtime":
-		spec.field = sortFieldBtime
-	case "position", "path", "location":
-		// 文件管理器有「位置」列。本应用一次只列一个目录，按路径排等价于按名字排。
-		spec.field = sortFieldName
-	default:
+	// 字段查表（查不到 = 未知字段 → 整体退回默认，绝不乱序）
+	f, ok := sortFieldAlias[field]
+	if !ok {
 		return defaultSortSpec
 	}
+	spec := defaultSortSpec
+	spec.field = f
 
 	switch dir {
 	case "desc", "d", "down", "true", "1":
@@ -88,14 +119,7 @@ func parseSort(s string) sortSpec {
 	case "asc", "a", "up", "false", "0":
 		spec.desc = false
 	default:
-		// 只给了字段、没给方向：沿用旧行为的默认方向，避免已保存的书签/URL 换了语义。
-		// 修改时间与大小的旧默认都是倒序（date=最新在前、size=从大到小）。
-		switch spec.field {
-		case sortFieldMtime, sortFieldSize:
-			spec.desc = true
-		default:
-			spec.desc = false
-		}
+		spec.desc = sortDefaultDesc(spec.field)
 	}
 	return spec
 }

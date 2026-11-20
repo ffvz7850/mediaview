@@ -114,7 +114,13 @@ func thumbFailedRecently(key string) bool {
 func markThumbFailed(key string) {
 	thumbFailMu.Lock()
 	defer thumbFailMu.Unlock()
-	if len(thumbFailMap) > 4096 { // 防止无限增长
+	// 2.4.50（二次审查 P3-17）：阈值从 4096 提到 8192 并补日志。
+	// 整体清空的代价不只是内存回收：在册的负缓存条目（10 分钟 TTL）会被一次抹掉，
+	// 下一轮列表里那批注定失败的文件（svg / 无解码器的 heic）会突然重跑一遍 ffmpeg，
+	// 表现为周期性 CPU 尖峰。提高阈值把这次"抖动"的周期拉长，日志让线上能看出它发生过。
+	// （彻底方案是按 TTL 惰性删除或 LRU，留待后续版本，见 CHANGELOG。）
+	if len(thumbFailMap) > 8192 { // 防止无限增长
+		log.Printf("mediaview: thumb fail cache reset (%d entries)", len(thumbFailMap))
 		thumbFailMap = map[string]time.Time{}
 	}
 	thumbFailMap[key] = time.Now()
@@ -491,7 +497,30 @@ func initThumbWorkers(ctx context.Context) {
 
 // spawnThumbWorkers 拉起 worker goroutine，数量由配置 PreloadConcurrency 决定。
 // 重复调用会先停止旧 worker 再启动新的（支持设置变更后动态调整）。
+//
+// 2.4.50（二次审查 P1-2）：把"拉几个 worker"从"后台常驻开关"里解耦出来。
+// 原来 n 恒取 PreloadConcurrency，于是 PreloadConcurrency=0（用户关掉后台预生成）时
+// `for i:=0;i<n;i++` 一次都不执行 —— 而「立即生成当前目录缩略图」和「清缓存后重建」
+// 正是靠 ensureManualWorkers 调它来起消费者的，结果是"接口返回 enqueued=N、
+// UI 提示已请求生成，但任务 30 秒内一个都不跑"。
+// 现在：本函数保留"按配置取值"的无参语义（restartThumbWorkers 等调用点不变），
+// 需要指定数量的调用方走 spawnThumbWorkersWith。
 func spawnThumbWorkers() {
+	n := getSettings().PreloadConcurrency
+	if n < 0 {
+		n = 0
+	}
+	if n > maxThumbConcurrency {
+		n = maxThumbConcurrency
+	}
+	spawnThumbWorkersWith(n)
+}
+
+// spawnThumbWorkersWith 以**显式数量**拉起 worker（n<=0 表示只替换队列、不启 worker）。
+//
+// 调用方：spawnThumbWorkers（按 PreloadConcurrency）、ensureManualWorkers（固定 2）。
+// 两条路径共用同一套"先停旧、再换队列、再起新"的纪律。
+func spawnThumbWorkersWith(n int) {
 	thumbWorkerMu.Lock()
 	defer thumbWorkerMu.Unlock()
 
@@ -502,7 +531,6 @@ func spawnThumbWorkers() {
 
 	// 0 = 关闭后台预生成：不启动任何 worker（队列照建，代码路径保持一致；
 	// enqueueThumb 在 0 时也直接返回，所以队列不会被投递撑满）。
-	n := getSettings().PreloadConcurrency
 	if n < 0 {
 		n = 0
 	}
@@ -539,23 +567,54 @@ func spawnThumbWorkers() {
 	}
 }
 
-// waitWhilePaused 在「后台已暂停」期间阻塞，直到恢复或被取消。
+// pauseWakeMargin 在 TTL 唤醒定时器上多等的余量。
+//
+// 只等 remaining 是危险的：time.After 的定时器与 thumbPauseUntil 用的是同一个
+// 单调时钟，但剩余量算出来可能比实际定时器短一丁点，醒来时 time.Now() 仍
+// Before(thumbPauseUntil)，于是又算一次极小的 remaining → 空转（极端情况下成忙循环）。
+// 加 100ms 余量既保证"到点一定醒"，也避免因几纳秒误差反复唤醒。
+const pauseWakeMargin = 100 * time.Millisecond
+
+// waitWhilePaused 在「后台已暂停」期间阻塞，直到恢复、TTL 到期或被取消。
 // 返回 false 表示应当退出（上下文已取消）。
+//
+// 2.4.50（二次审查 P1-1）：原实现只 select `wctx.Done()` 与 `resumeCh`，
+// 而 TTL 到点只把 thumbPaused/thumbPauseUntil 改成"未暂停"，**不产生任何唤醒信号** ——
+// 已经阻塞在 select 上的 worker 永远不会回到循环顶重新判断，后台预生成永久停摆
+// （只有重启应用或改一次设置才恢复）。而"收不到 resume"恰恰是核心场景：
+// 飞牛文件管理器关闭大图预览时不发任何请求。
+//
+// 修法：每轮在锁内取 `remaining`，select 增加 `<-time.After(remaining+余量)`；
+// 超时后回到循环顶重新读 thumbPaused/thumbPauseUntil —— 滑动续期天然生效
+// （续期后 remaining 变大，定时器重算）。resumeCh 仍是**优先唤醒**源：
+// 它一旦 close 立刻返回循环顶，不必等 TTL。
 func waitWhilePaused(wctx context.Context) bool {
 	for {
 		thumbPauseMu.Lock()
 		// 到点自动恢复：前端异常关窗（点标题栏 X、刷新）时不会发 resume，
 		// 没有这条后台预生成会永久停摆，只能重启应用。
 		paused := thumbPaused && time.Now().Before(thumbPauseUntil)
+		// remaining 必须在**同一把锁内**算：thumbPauseUntil 会被 noteForegroundPreview
+		// 滑动续期，锁外读到的是过期值，定时器就会提前/滞后。
+		remaining := time.Until(thumbPauseUntil)
 		resumeCh := thumbResumeCh // 在锁内复制引用：全局变量可能被 handleResumeThumb 替换，
 		thumbPauseMu.Unlock()     // 直接读全局变量会与 close+替换产生数据竞争
 		if !paused {
 			return true
 		}
+		if remaining <= 0 {
+			// 时钟精度导致"判定为暂停但剩余量已非正"：直接回循环顶，
+			// 下一轮 paused 必为 false → 返回 true。不能在这里 time.After(负值)
+			// （它等价于立即触发，会退化成忙循环）。
+			continue
+		}
 		select {
 		case <-wctx.Done():
 			return false
 		case <-resumeCh:
+			// 显式恢复：回到循环顶重读状态（可能紧接着又被 pause，那也要重新算）
+		case <-time.After(remaining + pauseWakeMargin):
+			// TTL 到点：回到循环顶重新判断 paused；若期间被滑动续期，这里会重算 remaining
 		}
 	}
 }
@@ -748,6 +807,11 @@ var (
 	manualWorkerActive bool
 )
 
+// manualWorkerCount 手动通道临时拉起的 worker 数（至少 1，2 是实测够用的值：
+// 手动这批一般是"当前目录可见的几十张"，2 路足够在 30 秒窗口内跑完，又不会跟
+// 前台按需生成抢太多 CPU）。
+const manualWorkerCount = 2
+
 func ensureManualWorkers() {
 	if getSettings().PreloadConcurrency > 0 {
 		return // 已有常驻 worker
@@ -761,7 +825,11 @@ func ensureManualWorkers() {
 	manualWorkerActive = true
 	manualWorkerMu.Unlock()
 
-	spawnThumbWorkers()
+	// 2.4.50（二次审查 P1-2）：必须传**显式数量**。
+	// 原来调 spawnThumbWorkers()，而它按 PreloadConcurrency 取值 —— 这里能走到
+	// 就说明 PreloadConcurrency<=0，即 n=0，一个 worker 都不会起；投进去的任务
+	// 没有任何消费者（且 spawn 已经先把旧队列/旧 worker 换掉）。
+	spawnThumbWorkersWith(manualWorkerCount)
 	go func() {
 		time.Sleep(30 * time.Second) // 给手动这批留足时间
 		restartThumbWorkers()        // 按当前设置重建（PreloadConcurrency=0 → 收掉）
@@ -862,6 +930,9 @@ func boolStr(b bool) string {
 // ensureThumb generates the thumbnail if missing; returns cache file path.
 // 前台请求固定用 Background：客户端断开（翻页、关窗）时若绑 r.Context()，
 // exec.CommandContext 会 kill 掉跑到一半的 ffmpeg，缓存不落盘、下次从零重跑。
+//
+// 2.4.50 起这个 ctx 只用于「入口取消检查」与「取槽排队」；**真正的生成**用
+// newThumbGenCtx（应用级 + 固定超时），所以调用方的 ctx 差异不会再互相影响。
 func ensureThumb(path, kind string, size int) (string, error) {
 	return ensureThumbInternal(context.Background(), path, kind, size, true, false)
 }
@@ -884,9 +955,72 @@ func ensureThumbSys(path, kind string, size int, immediate bool) (string, error)
 // ensureThumbBG 后台预生成专用。
 // 调用方（worker）必须已持有前台信号量的一个空余槽（见 waitBackgroundTurn）——
 // 后台不再「额外」占并发，所以前台+后台的总并发始终不超过 ThumbConcurrency。
-// ctx 可被 pause 取消：取消后正在跑的 ffmpeg 被 kill，半成品不会落进缓存。
+//
+// 2.4.50（P2-8）语义变化，必须说清楚：ctx 仍然决定**要不要开工**
+// （入口 ctx.Err() 检查 + 取槽排队），但**不再能中断已经开始的生成** ——
+// 生成统一走 newThumbGenCtx（应用级 + 45s 超时）。原因见 newThumbGenCtx 注释：
+// 让 singleflight 合并出来的那次生成听命于"第一个到达者"的 ctx，会让前后台的
+// 让路状态机互相破坏（后台 pause 会 kill 掉用户正在等的那张图）。
+// 代价：pause 时已经在跑的后台 ffmpeg 不会被立刻 kill，但最迟 30s（ffmpeg 自身
+// 超时）内必然结束；且后台任务的取槽策略保证它至多占 cap-1 个槽。
 func ensureThumbBG(ctx context.Context, path, kind string, size int) (string, error) {
 	return ensureThumbInternal(ctx, path, kind, size, false, false)
+}
+
+// errThumbNotRegular 目标不是普通文件（FIFO / socket / 设备节点 / 目录）。
+// 单独的哨兵值：调用方据此回 403，且**不能**记负缓存 —— 它描述的是"这个路径
+// 现在不是普通文件"，换一个时间点（或换了文件）语义就变了。
+var errThumbNotRegular = &simpleErr{"not a regular file"}
+
+// thumbGenTimeout 单次缩略图生成的兜底超时。
+//
+// 为什么必须有：生成用的 ctx 不再绑请求（见 ensureThumbInternal），就必须自带
+// 一个上限，否则损坏文件 / 网络挂载 IO hang 会让生成永久挂住，白占解码槽。
+// 取值 45s：单条 ffmpeg 抽帧已各自限 30s（ffmpeg.go）、vips 30s（tryVipsImageThumb），
+// 45s 覆盖"probe + 抽帧"或"vips 失败后回退 ffmpeg"这两条串行路径。
+const thumbGenTimeout = 45 * time.Second
+
+// newThumbGenCtx 返回缩略图生成专用的 ctx：**应用级**父 ctx（thumbCtx）+ 固定超时。
+//
+// 绝不能绑调用方 ctx（二次审查 P2-8）：singleflight 闭包只由**第一个到达者**
+// 执行，闭包捕获谁的 ctx 就等于让所有等待者共享那一个人的取消语义：
+//
+//	· 后台先到 → 用户打开大图触发 pause 取消 bgctx → 正在合并生成的 ffmpeg 被 kill
+//	  → 正在等的前台用户拿到 cancel 错误、看到占位图；
+//	· 前台先到 → 后台 join 后用的是不可取消的 Background → 抢占失效，后台 ffmpeg
+//	  继续跟用户抢 CPU。
+//
+// 改用应用级 ctx 后：生成的生命周期只跟"应用是否退出"和"单次超时"有关，
+// 前后台的差异只体现在**取槽策略**上（见 acquireThumbSlotFor）。
+func newThumbGenCtx() (context.Context, context.CancelFunc) {
+	parent := thumbCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, thumbGenTimeout)
+}
+
+// acquireThumbSlotFor 按"谁在等"决定取槽方式，返回释放函数。
+//
+// 取槽是**调用方**的事、生成是**singleflight 领导者**的事，两者拆开：
+//   - immediate（飞牛大图预览）：预留槽，不排网格的 FIFO（见 acquireImmediateSlot）；
+//   - foreground（网格 / 查看器）：阻塞式抢 thumbGenSem 的槽；
+//   - 后台：worker 在进入 singleflight 之前已经用 tryAcquireThumbSlot 拿到槽，
+//     这里绝不能再取一次，否则"前台 6 + 后台 3"会重新叠加成 9 个并发解码。
+func acquireThumbSlotFor(ctx context.Context, foreground, immediate bool) (func(), error) {
+	if immediate {
+		return acquireImmediateSlot(), nil
+	}
+	if !foreground {
+		return func() {}, nil
+	}
+	sem := getThumbSem()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // immediate=true 表示「用户正在等的那一张」：取槽时走预留槽、不排网格的队（见 acquireImmediateSlot）。
@@ -900,6 +1034,14 @@ func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreg
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
+	}
+	// 普通文件闸门（二次审查 P1-5）：FIFO / 设备节点 / socket 上 os.Open 会**永久阻塞**，
+	// 而本服务 http.Server 的 ReadTimeout/WriteTimeout 都是 0，没有任何兜底 ——
+	// 一个 `mkfifo evil.jpg` + 一次 /api/thumb 就能永久占住一个 goroutine、一个 fd
+	// 和一个解码槽（默认只有 4 个），构造几次就整站无响应。
+	// 这是最内层的兜底：/api/thumb、/api/meta、/api/raw、系统缩略图全部汇到这里。
+	if !info.Mode().IsRegular() {
+		return "", errThumbNotRegular
 	}
 	// 两个 key 各司其职，**不能混用**：
 	//   key     —— 元数据缓存用，只与 path+mtime+size 有关（meta 和画质无关，
@@ -929,13 +1071,24 @@ func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreg
 	// （系统缩略图接管时文件管理器会并发请求 list/medium/big），不拼 size 会导致
 	// 后到达的大尺寸请求拿到先生成的小尺寸结果。
 	sfKey := cacheID + ":s" + strconv.Itoa(size)
+	// 先取槽、再进 singleflight：合并的是**生成**，不是"排队等槽"。
+	// 合并前取槽意味着同一张图的并发请求各占一个槽直到拿到共享结果 ——
+	// 这是有意的：否则第一个调用者的槽会覆盖所有等待者，sem 容量存在感消失。
+	release, aerr := acquireThumbSlotFor(ctx, foreground, immediate)
+	if aerr != nil {
+		return "", aerr
+	}
+	defer release()
+	// 生成用独立 ctx（应用级 + 固定超时），不捕获任何调用方 ctx（二次审查 P2-8）。
+	genCtx, genCancel := newThumbGenCtx()
+	defer genCancel()
 	v, err, _ := sfGroup.Do(sfKey, func() (any, error) {
-		return generateThumb(ctx, path, kind, size, info, key, cacheID, foreground, immediate)
+		return generateThumb(genCtx, path, kind, size, info, key, cacheID)
 	})
 	if err != nil {
 		// 只对「确定性失败」记负缓存：被 pause 抢占（context canceled）或超时是可恢复的，
 		// 记下来反而会让这张图在 TTL 内一直拿不到缩略图。
-		if err != errThumbDisabled && !isCancelErr(err) {
+		if err != errThumbDisabled && err != errThumbNotRegular && !isCancelErr(err) {
 			markThumbFailed(cacheID)
 		}
 		return "", err
@@ -945,30 +1098,27 @@ func ensureThumbInternal(ctx context.Context, path, kind string, size int, foreg
 	return v.(string), nil
 }
 
-func generateThumb(ctx context.Context, path, kind string, size int, info os.FileInfo, key, cacheID string, foreground, immediate bool) (string, error) {
-	// 前台请求在这里阻塞取槽（防止快速滚动时几十个大图同时解码导致 OOM）。
-	// 后台任务的槽已由 worker 在进入 singleflight 之前用 tryAcquireThumbSlot 拿到，
-	// 这里不再取槽 —— 否则「前台 6 + 后台 3」会重新叠加成 9 个并发解码。
-	if immediate {
-		// 用户正在等的那一张（文件管理器大图预览）：走预留槽，不排 thumbGenSem 的 FIFO。
-		// 打开未缓存目录时整页 list 请求已经先到先得地排在那条 channel 上，
-		// 大图若一起排队，用户就得等整页缩略图跑完 —— 这正是本函数要消除的等待。
-		release := acquireImmediateSlot()
-		defer release()
-	} else if foreground {
-		sem := getThumbSem()
-		// // 前台取槽是**阻塞式**排队（channel 发送）。
-		// 注意：前台 ctx 恒为 context.Background()（见 ensureThumbInternal 的调用），
-		// 所以下面的 `case <-ctx.Done()` 在当前调用方式下**永远不会触发** ——
-		// 保留它是为了让签名对"可取消的调用方"仍然安全。
-		// 结论：暂停并不拦截前台取槽；让路由 tryServeDeferredThumb 在更外层完成。
-		select {
-		case sem <- struct{}{}:
-			defer func() { <-sem }()
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
+// thumbTmpSuffix 由 cacheID 派生的短后缀，用于给中间产物（.tmp / .gen-*.jpg）命名。
+//
+// 二次审查 P2-10：产物路径（thumbPathFor）只含 path+size，不含画质，而 singleflight
+// key 含 cacheID —— 用户改画质后，新旧画质是两个**独立任务**，却写同一份 out 与
+// 同名的 `.tmp` / `.gen.jpg`：两路开头都 os.Remove 对方半成品，可能留下与源不符的
+// 图，xattr 里的 cacheID 也会错配。
+//
+// 修法：out 保持不动（缓存查找、清缓存、目录镜像结构都依赖它），只让**中间产物**
+// 带上 cacheID 短哈希，两路各写各的 temp，最后原子 rename 到同一个 out。
+// 兼容性：xattr/.key 回退逻辑完全不变；旧的 `.tmp`/`.gen.jpg` 残留不会被当成成品
+// （缓存查找只认正式文件名），清一次缓存即回收。
+func thumbTmpSuffix(cacheID string) string {
+	if len(cacheID) > 8 {
+		return cacheID[:8]
 	}
+	return cacheID
+}
+
+func generateThumb(ctx context.Context, path, kind string, size int, info os.FileInfo, key, cacheID string) (string, error) {
+	// 取槽已在 ensureThumbInternal 完成（前台的 sem / 大图的预留槽 / 后台由 worker 持有），
+	// 这里只负责生成本身 —— 本函数由 singleflight 合并执行，可能代表多个调用方。
 	// 计数必须在拿到槽之后：否则「排队等槽」的请求也会被算成正在解码，
 	// 峰值看起来仍然叠加（实测会被这条误导）。
 	trackThumbGenStart()
@@ -980,7 +1130,11 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 	}
 	// 显式 chmod 目录（umask 可能是 0777 导致权限 000，影响后续清除和系统缩略图读取）
 	_ = os.Chmod(filepath.Dir(out), 0o755)
-	tmp := out + ".tmp"
+	// 中间产物带 cacheID 短哈希：不同画质（不同 cacheID）的并发任务各有各的 temp，
+	// 不会互相 os.Remove 掉对方写到一半的文件（见 thumbTmpSuffix 说明）。
+	sfx := thumbTmpSuffix(cacheID)
+	tmp := out + ".tmp." + sfx
+	ftmp := out + ".gen-" + sfx + ".jpg"
 
 	if kind == "image" {
 
@@ -1000,7 +1154,6 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 		//                             1920 档 vips 2247ms > ffmpeg 1775ms（ffmpeg 快 26%）
 		// 所以按类型分流，两边各取所长。
 		if thumbUseFFmpegForImage(path) && ffmpegPath != "" && info != nil && info.Size() > 1024*1024 {
-			ftmp := out + ".gen.jpg"
 			_ = os.Remove(ftmp)
 			// L1-E：ffmpeg 返回 0 不代表产物可用（磁盘满、被信号 kill 但 Run 未报错、
 			// 文件系统错误都可能留下空文件）。补一次 stat + 非空校验，避免坏图进缓存后永久命中。
@@ -1039,7 +1192,6 @@ func generateThumb(ctx context.Context, path, kind string, size int, info os.Fil
 
 	// video 或 Go/vips 都解不了的图片格式：交给 ffmpeg
 	if ffmpegPath != "" {
-		ftmp := out + ".gen.jpg"
 		_ = os.Remove(ftmp)
 		var ferr error
 		var preMeta *Meta
@@ -1227,7 +1379,10 @@ var (
 	probeCache = make(map[string]fileProbe)
 )
 
-const probeCacheMax = 1024
+// probeCacheMax 探测缓存条目上限。2.4.50（二次审查 P3-17）：1024 → 2048。
+// 满了整体清空的代价是"一次全量重探测"，在十万级目录里这正好是最贵的那一瞬；
+// 提高上限只是把频率降低（彻底方案是 LRU，留待后续版本），同时补一行日志便于定位。
+const probeCacheMax = 2048
 
 func probeKey(path string, info os.FileInfo) string {
 	return path + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + strconv.FormatInt(info.Size(), 10)
@@ -1250,6 +1405,7 @@ func imageDimCached(p string) (int, int) {
 	probeMu.Lock()
 	if len(probeCache) >= probeCacheMax {
 		// 探测很便宜，命中率比精确 LRU 更重要，满了就整体清空
+		log.Printf("mediaview: probe cache reset (%d entries)", len(probeCache))
 		probeCache = make(map[string]fileProbe)
 	}
 	pr.w, pr.h = w, h
@@ -1274,6 +1430,7 @@ func jpegIsProgressiveCached(p string) bool {
 	v := jpegIsProgressive(p)
 	probeMu.Lock()
 	if len(probeCache) >= probeCacheMax {
+		log.Printf("mediaview: probe cache reset (%d entries)", len(probeCache))
 		probeCache = make(map[string]fileProbe)
 	}
 	pr.progressive = v
@@ -1545,9 +1702,17 @@ func tryVipsImageThumb(ctx context.Context, path string, size int, out string) b
 	tmp := out + ".tmp"
 	// -s：长边缩放到 size；--crop：裁成正方形（与 ffmpeg 路径的 increase,crop 语义对齐）；
 	// [Q=<设置值>,strip]：去掉元数据并控制体积（画质跟随设置，见 vipsQualitySuffix）。
-	cmd := exec.CommandContext(ctx, bin, path, "-s", itoa(size), "--crop",
+	//
+	// 2.4.50（二次审查 P2-7）：vipsthumbnail 是唯一"裸奔"的引擎 —— 传进来的 ctx
+	// 在前台/系统路径下恒为无 deadline 的 ctx，损坏文件、网络挂载 IO hang、磁盘满
+	// 都会让它永久卡住，占着一个 goroutine + 一个解码槽（占满 2~3 个后全站排队且不自愈）。
+	// 这里与 ffmpeg 的 30s 对齐：超时就返回 false，走既有回退路径（Go 解码 / ffmpeg）。
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, bin, path, "-s", itoa(size), "--crop",
 		"-o", tmp+vipsQualitySuffix())
-	if err := cmd.Run(); err != nil {
+	// 走 runCmd 而不是 cmd.Run：登记进在途子进程表，SIGTERM 时能被 kill（见 ffmpeg.go）。
+	if err := runCmd(cmd); err != nil {
 		os.Remove(tmp)
 		return false
 	}
@@ -1660,6 +1825,17 @@ func handleThumb(w http.ResponseWriter, r *http.Request) {
 	kind := classify(filepath.Ext(path))
 	if kind == "" {
 		http.Error(w, "unsupported type", http.StatusBadRequest)
+		return
+	}
+	// 普通文件闸门（二次审查 P1-5）：与 handleRaw（media.go）完全同口径。
+	// FIFO / 设备节点 / socket 上 os.Open 会永久阻塞，而服务端 Read/WriteTimeout 都是 0：
+	// 白名单目录里 `mkfifo evil.jpg` + 一次 /api/thumb 就能永久占住一个 goroutine、
+	// 一个 fd 和一个解码槽（默认 4 个），构造几次整个缩略图服务就再无响应。
+	if src, serr := os.Stat(path); serr != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else if !src.Mode().IsRegular() {
+		http.Error(w, "not a regular file", http.StatusForbidden)
 		return
 	}
 	// 大图浏览期间不生成：命中缓存的照常返回，未命中的立刻回一张占位图，
@@ -1831,9 +2007,29 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 				log.Printf("clear: refuse %s (escapes root %s)", dir, root)
 				continue
 			}
-			info, e := os.Stat(dir)
+			// 2.4.50（二次审查 P1-3）：只做 underRoot 的**词法**判断是不够的。
+			// 缩略图目录是用户可配的（dirUsable 只验证可写），只要对缓存根有写权限，
+			// 就能在 `<root>/<size>/` 下建中间层符号链接（例如把 `<root>/320/vol1`
+			// 指向 `/`），再 POST /api/thumb/clear?path=/vol1/etc —— 词法前缀判断通过，
+			// 而后面的 filepath.Walk（递归 chmod）与 os.RemoveAll **都会跟随中间层链接**，
+			// 实际作用到 /etc 这类真实系统目录。本进程 run-as=root，等于批量改系统权限
+			// 并递归删除任意目录。
+			//
+			// 修法：先 resolveRealPath，要求解析成功且解析后的**真实路径**仍在 root 内，
+			// 之后一律用 realDir 做 stat/Walk/RemoveAll。解析失败（跳数超限、读链失败）
+			// 一律拒绝 —— "解析不出来就跳过校验"正是这类洞的根源。
+			realDir, ok := resolveRealPath(dir)
+			if !ok {
+				log.Printf("clear: refuse %s (symlink resolution failed)", dir)
+				continue
+			}
+			if !underRoot(realDir, root) {
+				log.Printf("clear: refuse %s (real path %s escapes root %s)", dir, realDir, root)
+				continue
+			}
+			info, e := os.Stat(realDir)
 			if e != nil {
-				log.Printf("clear: skip %s (stat failed: %v)", dir, e)
+				log.Printf("clear: skip %s (stat failed: %v)", realDir, e)
 				continue
 			}
 			if !info.IsDir() {
@@ -1841,20 +2037,20 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 			}
 			if shallow {
 				// 非递归：只删当前层的缩略图文件，子目录（下层内容）原样保留
-				n := clearShallowThumbFiles(dir)
+				n := clearShallowThumbFiles(realDir)
 				deleted += int64(n)
-				log.Printf("clear(shallow): removed %d files under %s", n, dir)
+				log.Printf("clear(shallow): removed %d files under %s", n, realDir)
 				continue
 			}
 			// 统计文件数
-			filepath.Walk(dir, func(_ string, fi os.FileInfo, err error) error {
+			filepath.Walk(realDir, func(_ string, fi os.FileInfo, err error) error {
 				if err == nil && !fi.IsDir() {
 					deleted++
 				}
 				return nil
 			})
 			// 先递归 chmod 所有目录和文件（缩略图目录权限可能是 000），确保 RemoveAll 能成功
-			filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+			filepath.Walk(realDir, func(p string, fi os.FileInfo, err error) error {
 				if err != nil {
 					return nil
 				}
@@ -1869,10 +2065,10 @@ func handleClearThumbCache(w http.ResponseWriter, r *http.Request) {
 				}
 				return nil
 			})
-			if err := os.RemoveAll(dir); err != nil {
-				log.Printf("clear: RemoveAll(%s) FAILED: %v", dir, err)
+			if err := os.RemoveAll(realDir); err != nil {
+				log.Printf("clear: RemoveAll(%s) FAILED: %v", realDir, err)
 			} else {
-				log.Printf("clear: removed %s", dir)
+				log.Printf("clear: removed %s", realDir)
 			}
 		}
 		log.Printf("clear: done, deleted %d files for %s", deleted, absPath)

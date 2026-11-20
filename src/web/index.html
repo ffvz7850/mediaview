@@ -433,11 +433,12 @@
 
         <!-- 缓存 -->
         <div class="set-block">
-          <div class="set-name">缩略图缓存</div>
+          <div class="set-name">缩略图与封面缓存</div>
           <div class="set-desc" id="cacheInfo">统计中…</div>
           <div class="dir-pick">
-            <button class="btn ghost" id="btnPurge">清空缓存</button>
-            <button class="btn danger" id="btnFactoryReset" style="margin-left:8px;">清除所有数据</button>
+            <button class="btn ghost" id="btnPurgeThumb">清空缩略图</button>
+            <button class="btn ghost" id="btnPurgeCover">清空封面缩略图</button>
+            <button class="btn danger" id="btnFactoryReset">清除所有数据</button>
           </div>
           <div class="dir-hint" id="cfgPath"></div>
         </div>
@@ -489,6 +490,27 @@
       <div class="save-hint" id="saveHint"></div>
       <button class="btn ghost" id="settingsCancel">取消</button>
       <button class="btn primary" id="settingsSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 通用确认弹层（2.4.50，二次审查 P2-15）
+     自绘而不是 window.confirm：全应用入口都是 iframe 型，宿主 WebView/sandbox 下
+     原生 confirm 可能被静默拦截（点了完全没反应）。结构/样式与设置弹层同源
+     （.modal / .modal-mask / .modal-box），只把盒子收窄 -->
+<div id="askConfirm" class="modal hidden">
+  <div class="modal-mask" id="askConfirmMask"></div>
+  <div class="modal-box ask-box">
+    <div class="modal-head">
+      <div class="modal-title">请确认</div>
+    </div>
+    <div class="modal-body">
+      <div class="ask-text" id="askConfirmText"></div>
+    </div>
+    <div class="modal-foot">
+      <div class="save-hint"></div>
+      <button class="btn ghost" id="askConfirmCancel">取消</button>
+      <button class="btn primary" id="askConfirmOk">确定</button>
     </div>
   </div>
 </div>

@@ -41,11 +41,30 @@ var (
 	metaMem   = map[string]*Meta{}
 )
 
+// metaMemMax 元数据内存缓存的条目上限（2.4.50，二次审查 P2-9）。
+//
+// 三个内存缓存里只有它原来**完全无界**（probeCache / thumbFailMap 都有上限），
+// 而键里含 mtime：文件被反复编辑就会不断产生新键，旧键永不回收 ——
+// NAS 常开数月 + 十万级媒体库可以累积出数百 MB，挤压大图解码内存
+// （单张 Go 原生解码峰值 200~300MB，这类挤压会直接表现为 OOM / 明显卡顿）。
+//
+// 取值 8192：一条 Meta 只有几个 int/float/短字符串（约 100B 量级），
+// 8192 条约 1MB，对一个 NAS 应用是可接受的上界。
+// 满了的淘汰策略与 probeCache 一致（整体清空）：代价只是"下一轮重新 probe 一次"，
+// 视频约 30~80ms/个，且只在缓存真的撞上上限时发生一次。
+const metaMemMax = 8192
+
 func saveMeta(key string, path string, size int, m *Meta) {
 	if m == nil {
 		return
 	}
 	metaMemMu.Lock()
+	if len(metaMem) >= metaMemMax {
+		// 与 probeCache 同款：命中率比精确 LRU 更重要，满了整体重来一次。
+		// 这个包不引入 log 依赖（cache.go 只做纯缓存），因此不打日志；
+		// 需要观测时看 /api/health 的 thumb_active/内存曲线即可。
+		metaMem = map[string]*Meta{}
+	}
 	metaMem[key] = m
 	metaMemMu.Unlock()
 

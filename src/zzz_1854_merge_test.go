@@ -101,9 +101,17 @@ func Test1854MergeFnOsPreviewTriggerKept(t *testing.T) {
 	}
 
 	// ② 大图预览（big）必须停后台。删掉它，用户就得「先跑完一页缩略图才出大图」。
+	//
+	// 2.4.50（P2-12）：暂停已挪到 parseSystemThumbPath 之后，不可解析的路径不再触发
+	// 暂停（那正是要堵的 DoS）。所以这里先确认"非法路径不暂停"，再用
+	// maybePauseForBigPreview 验证 big 的语义仍然停后台（接线由源码顺序断言守）。
 	w := httptest.NewRecorder()
 	handleSystemThumbGetIcon(w, httptest.NewRequest("GET",
 		"/thumb/getIcon?path=vol3/1000/photos/x.JPG&size=big", nil))
+	if pausedNow() {
+		t.Error("★ 非法/不可解析路径的 size=big 请求触发了暂停 —— 低成本 DoS（P2-12）")
+	}
+	maybePauseForBigPreview("big")
 	if !pausedNow() {
 		t.Error("size=big 没有让后台停摆 —— 用户打开大图预览时后台预生成仍在抢 CPU，" +
 			"表现为「必须先等一页缩略图」")

@@ -33,7 +33,7 @@ func jsFunc(js, sig string) string {
 // closeViewer 必须「先停机、再销毁」，否则关掉查看器后视频会在后台继续出声。
 func Test1962VideosStoppedBeforeViewerDiscard(t *testing.T) {
 	js := stripLineComments(readSourceOrSkip(t, "web/app.js"))
-	body := jsFunc(js, "function closeViewer()")
+	body := jsFunc(js, "function closeViewer(")
 	if body == "" {
 		t.Fatal("找不到 closeViewer()")
 	}

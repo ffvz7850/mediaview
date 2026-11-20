@@ -1,156 +1,87 @@
-# mediaview 版本迭代总览（v1.8.137 → v1.8.149）
+# mediaview 2.4.51 发布说明
 
 > 极速媒体浏览 —— 飞牛 fnOS 图片/视频极速浏览 FPK 应用
 > 仓库：https://github.com/ffvz7850/mediaview
+> 版本：2.4.51（x86 / ARM 双架构）
 
 ---
 
-## 核心目标
+## 一句话
 
-替代飞牛网页版图片/视频浏览，极致加载速度。解决网页版浏览媒体时加载慢、卡顿的问题。
-
----
-
-## 版本迭代总览
-
-### v1.8.149 — 大图切换跟手化
-
-**问题根因**：切换时 `doIt`（位移动作）一直在等 `decode()` 完成，导致点击后画面纹丝不动 1.5 秒——这不是"加载慢"，而是"根本没开始动"。
-
-**改动**：
-- 位移立即发生，不等 decode（点击即有反馈）
-- 每个媒体盒都带转圈指示（原来只有当前图有，切换目标图没有转圈导致空白）
-- 删除 3 个纯重复的预取函数 + `preloadCache`，换成 `warmTrackBoxes()`（−45 行）
-- `anim-none` 立即收尾，干掉 400ms 死窗
-- 修复 `ensureMediaVisible` 被 `if` 误吞的 bug
-
-**效果**：点击切换 → 索引/计数/标题立即更新 → 画面立即朝目标方向动 → 目标位置显示转圈 → 位图就绪后转圈消失、图片出现。既不空白也不闪。
+修复一个历史一直存在、用户可感知的封面问题：**文件夹封面已全部预生成，但"一键生成后立刻进入路径"仍会重新合成一份**；等十几秒再进就正常。
+2.4.51 从根因上修掉这个时序 bug，并补上行为级回归测试把它钉死。
 
 ---
 
-### v1.8.148 — 缓存目录精简
+## 问题与修复
 
-**改动**：
-- 缩略图内容标识从 `.key` sidecar 文件改存 xattr（`user.mediaview.key`），缓存目录变纯镜像
-- `.meta.json` 不再落盘，只留内存 `metaMem`
-- 三级回退：xattr → 旧 `.key` sidecar（只读，升级兼容）→ 产物存在即命中
-- 修复缓存统计 bug（原来只跳过 `.key` 没跳过 `.meta.json`，统计虚高一倍）
+### 现象
 
----
+封面明明都生成好了，进入目录时却又重新生成一份；等一小会儿再进就正常。
 
-### v1.8.147 — 换目录清待办
+### 根因
 
-**改动**：进入新目录时非阻塞清空上个目录遗留的缩略图待办队列，只丢未取走的任务，正在生成的不打断。
+系统会把"这张封面有效/无效"的结论在内存里缓存 8 秒（`coverValidTTL`）。
+以前浏览时若某目录暂时没封面，就记下一条"无效"。等"一键生成"把封面写好、新元数据也落盘后，
+**写入端没有清掉这条旧的"无效"结论**——你紧接着进目录，读到的还是 8 秒内的旧判断，
+于是把刚生成的封面判为失效、重新合成一份。等 8 秒缓存过期再进就恢复正常。
 
----
+这正好解释了"仅刚生成后短时间会重做、等一会就好"的时序特征。
 
-### v1.8.146 — 设置规格统一 + 预生成开关
+### 修法（`dircov.go` `saveCoverPick`）
 
-**改动**：
-- 设置界面规格统一（所有下拉/开关对齐）
-- 后台预生成改成开关 + 手动执行按钮（原来默认开 2 个 worker）
-- 大图清晰度默认从 4096 改为 2048
+写入端每次写完封面元数据，立即作废这条 jpg 对应的旧有效性结论：
 
----
+```go
+coverValidCache.Delete(coverJPGOf(metaPath))
+```
 
-### v1.8.145 — 修复读取设置失败
-
-**改动**：修复配置文件读取失败时回退默认值的逻辑。
+- 放在函数出口统一删，xattr 成功分支与 `.json` 回退分支都覆盖；
+- key 用 `coverJPGOf(metaPath)`，与读取端 `loadCoverPick → coverStillValidCached` 完全同口径，不会清错；
+- 不改封面元数据结构、不改挑选规则，因此**不需要重建已有封面缓存**（不 bump `coverCacheVersion`，避免十万目录级全量重抽的 IO 峰值）。
 
 ---
 
-### v1.8.142~1.8.144 — 1:1 一次算到位 + 大图设置项
+## 回归测试
 
-**改动**：
-- 1:1 直接取原图（不经过 4096 中间档，换源次数最少=最不闪）
-- `ensureItemSize` 预取尺寸 + `_actualScaleLocked` 锁死，不再二次放大
-- 新增大图预览设置项：画质（ViewerQuality）、清晰度上限（ViewerMaxdim）、lowres 档位（ViewerLowres）
+新增 `src/zzz_2451_cover_regen_test.go`（3 条）：
 
----
+| 测试 | 作用 |
+|---|---|
+| `SaveCoverPickInvalidatesStaleValidity` | 端到端：塞 stale=false → 写 meta → 断言旧结论被清 + 立刻读取命中 |
+| `StaleFalseWouldBreakBrowseWithoutInvalidation` | 反向语义：证明 stale=false 确实会误判失效（bug 真实存在） |
+| `DeleteCoversBothWritePaths` | 静态闸门：确认 Delete 覆盖 xattr 分支、key 同口径 |
 
-### v1.8.138 — 大图 lowres 提速 + 预取节制
+**变异验证**：把修复（那行 `Delete`）去掉后，端到端测试与静态闸门精确变红，证明测试真能抓住回归、不是死断言。
 
-**改动**：
-- 大图 lowres 加 `minRatio=0.9`（允许缩到目标的 90%，3072 档快 39%，只缩 5%）
-- 预取节制：`PREFETCH_MAX=2`、延后 250ms、去掉第 3 个预取
-- 1:1 三跳修复
+原有的 `Test2424ValidityTTLCachesResult`（TTL 函数语义）与 `zzz_2428`（refresh 清缓存）测的是正确行为，保留不动。
 
 ---
 
-### v1.8.137 — 迁移修复 + auto 统一走 ffmpeg
+## 验证
 
-**改动**：
-- 修复 ThumbLowres 迁移缺陷（normalize 漏字段 + schema 4 补迁移）
-- auto 引擎在 lowres 开启时统一走 ffmpeg（实测 baseline 快 2.2×）
-- 大图质量区间 [88,92] → [82,86]（稳定 -q:v 4）
-- `scaledSem` 容量 2 → 3
-- 双向预加载
-
----
-
-## 核心架构
-
-### 缩略图引擎（三路径分流）
-
-| 引擎 | 适用场景 | 特点 |
-|---|---|---|
-| **ffmpeg** | auto 模式（lowres 开启时统一走） | 支持 -lowres 快速解码，渐进式 JPEG 快 26% |
-| **libvips** | auto 模式（lowres 关闭时普通图） | shrink-on-load，普通图快 34% |
-| **Go 原生** | 兜底 | 不依赖外部二进制 |
-
-- 视频抽帧走 VAAPI 硬件解码（H.264/HEVC），熔断机制：连续失败 5 次后关闭硬解 10 分钟
-- lowres 动态档位：`N = clamp(floor(log2(长边/目标)), 0, 3)`，保证 `长边/2^N ≥ 目标×0.9`
-
-### 大图浏览
-
-- 默认清晰度 2048px，可设置 2048/3072/4096/5120/6144
-- lowres 自动档位（可关闭或固定 1/2/3）
-- 画质：自动(88) / 跟随缩略图 / 固定 84/88/95
-- 翻页动画：slide / fade / zoom / none
-- 预加载：默认 2 张（可设置 0~5）
-
-### 系统缩略图接管
-
-- 监听 `/var/run/auto_thumbnailer.socket`，实现飞牛相同 API
-- size=list(320) / medium(归一化为 list) / big(1920)
-- size=big 触发 `noteForegroundPreview()`：暂停后台 + kill 在跑 ffmpeg
-- 大图浏览期间 list/medium 立即返回透明 GIF（不生成），把浏览器连接让给大图
-
-### 前后台资源让路
-
-- 大图浏览时：暂停后台预生成 + kill 在跑 ffmpeg
-- 前台请求挂起上限 2.5s
-- 预留槽 `thumbImmediateSem` 给大图专用
-- 关闭大图 1.5 秒后继续缩略图生成
-
-### 缓存
-
-- 缩略图缓存：用户自定义目录下的 `.mediaview-thumbs/`
-- 内容标识：xattr `user.mediaview.key`（含 path+mtime+size）
-- 大图缩放缓存：`/tmp/mediaview-scaled/`，每 20 次生成清理一次超过 1 小时的旧文件
-- 失败负缓存：10 分钟 TTL，避免 svg/heic/损坏文件反复重跑
-
----
-
-## 性能数据
-
-| 场景 | 优化前 | 优化后 | 提升 |
-|---|---|---|---|
-| 普通图 →320 缩略图（lowres） | 387ms | 173ms | 快 55% |
-| 渐进式 102MP →320（lowres） | 1452ms | 1035ms | 快 29% |
-| 渐进式 102MP →1920（lowres） | 1582ms | 1169ms | 快 26% |
-| 大图 3072 档（minRatio=0.9） | 1937ms | 1196ms | 快 39% |
-| auto 引擎统一走 ffmpeg | baseline | 2.2× 快 | — |
+| 项 | 结果 |
+|---|---|
+| `gofmt -l *.go` | 无差异 |
+| `go build ./...` | 通过 |
+| `go vet ./...` | 通过 |
+| `go test`（全量，含 3 条新测试） | 全部通过（11 项环境相关用例按基线跳过：无 ffmpeg、无符号链接权限、Z 盘实拍） |
+| 变异验证（去掉修复） | 新测试变红，确认有效 |
+| `node --check web/app.js` | 通过 |
+| 二进制 | x86 / ARM 均按 `-trimpath -ldflags "-s -w"` 重新构建，版本串为 2.4.51 |
 
 ---
 
 ## 安装
 
-从 [Releases](https://github.com/ffvz7850/mediaview/releases) 下载对应架构的 `.fpk` 文件，在飞牛应用中心手动安装。
+从 [Releases](https://github.com/ffvz7850/mediaview/releases) 下载对应架构的 `.fpk` 文件，
+在飞牛应用中心手动安装（覆盖安装即可，设置与已有缓存保留；本次修复无需清缓存）。
 
-- x86 架构：`mediaview_x.x.x_x86.fpk`
-- ARM 架构：`mediaview_x.x.x_arm.fpk`
+- x86 架构：`mediaview_2.4.51_x86.fpk`
+- ARM 架构：`mediaview_2.4.51_arm.fpk`
+
+升级后验收：对已生成封面的目录，点"一键生成"后立刻进去，应不再重做封面。
 
 ---
 
-*最后更新：v1.8.149*
+*本说明对应 v2.4.51；完整版本历史见 `CHANGELOG.md`。上一版 2.4.50 的 22 项审查修复已全部包含在内。*

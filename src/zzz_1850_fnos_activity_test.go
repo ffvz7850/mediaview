@@ -21,6 +21,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,7 +153,24 @@ func TestAudit1850Fnos_SysThumbPausesOnlyOnBigPreview(t *testing.T) {
 	//    飞牛 ImagePlayer-*.js 就是 `{size:B.Big,path:e[t]}`，index-*.js 是
 	//    `gX({size:dX.Big,path:e})`。删掉它 = 打开大图时后台预生成照旧抢 CPU 与信号量槽，
 	//    用户看到的就是「必须先跑完一页缩略图，大图才出来」。
-	get("big")
+	// 2.4.50（P2-12）：暂停已移到 parseSystemThumbPath **之后**，所以"发一个请求就暂停"
+	// 不能再拿不可解析的路径来验证（那正是要堵掉的行为）。这里分两层断言：
+	//   a) 语义层：maybePauseForBigPreview("big") 必须暂停、("list") 不许暂停；
+	//   b) 接线层：note 必须出现在 parseSystemThumbPath 之后（源码顺序）。
+	// 另外补一条新契约：**非法路径的 big 请求不许暂停**（原来的 DoS 面）。
+	resumeViaHTTP1850(t)
+	get("乱写")
+	if on, _ := isPaused(); on {
+		t.Error("★ 非法路径的 size=big 请求触发了后台暂停 —— " +
+			"任意本地进程都能用一串无效请求让后台预生成永久停摆（二次审查 P2-12）")
+	}
+	resumeViaHTTP1850(t)
+	maybePauseForBigPreview("list")
+	if on, _ := isPaused(); on {
+		t.Error("maybePauseForBigPreview(\"list\") 停掉了后台 —— 网格/卡片视图不该停后台")
+	}
+	resumeViaHTTP1850(t)
+	maybePauseForBigPreview("big")
 	if on, until := isPaused(); !on {
 		t.Error("size=big（文件管理器大图预览）没有让后台停摆 —— " +
 			"用户打开大图时后台预生成仍在抢 CPU，表现为「要先跑完一页缩略图」")
@@ -159,6 +178,19 @@ func TestAudit1850Fnos_SysThumbPausesOnlyOnBigPreview(t *testing.T) {
 		t.Errorf("big 触发的暂停只剩 %v，期望约 %v（滑动续期）", d, thumbPreviewPauseTTL)
 	} else {
 		t.Logf("size=big → 后台暂停（滑动 %v）：打开大图预览时后台预生成停摆", thumbPreviewPauseTTL)
+	}
+	// b) 接线层：暂停必须发生在路径校验之后
+	if sys, err := os.ReadFile("systemthumb.go"); err == nil {
+		src := string(sys)
+		iParse := strings.Index(src, "origPath, _, err := parseSystemThumbPath(")
+		iNote := strings.Index(src, "maybePauseForBigPreview(size)")
+		if iParse < 0 || iNote < 0 {
+			t.Error("找不到 parseSystemThumbPath / maybePauseForBigPreview 的调用点 —— 结构变了，这条闸门失效")
+		} else if iNote < iParse {
+			t.Error("★ 暂停发生在 parseSystemThumbPath **之前**：非法路径也能暂停后台（P2-12 回归）")
+		}
+	} else {
+		t.Logf("读不到 systemthumb.go（%v）：跳过源码顺序断言", err)
 	}
 	// 复位，别让暂停态影响后续断言
 	thumbPauseMu.Lock()
@@ -202,6 +234,13 @@ func TestAudit1850Fnos_SysThumbPausesOnlyOnBigPreview(t *testing.T) {
 	// 收尾：恢复，别把暂停态留给后面的用例
 	w2 := httptest.NewRecorder()
 	handleResumeThumb(w2, httptest.NewRequest("POST", "/api/thumb/resume", nil))
+}
+
+// resumeViaHTTP1850 调 /api/thumb/resume 复位暂停态（测试内部用）。
+func resumeViaHTTP1850(t *testing.T) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	handleResumeThumb(w, httptest.NewRequest("POST", "/api/thumb/resume", nil))
 }
 
 // 飞牛 list/medium/big 三档各自独立缓存，且与 mediaview 网格档位不重合。

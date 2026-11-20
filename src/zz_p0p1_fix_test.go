@@ -116,8 +116,14 @@ func TestFrontendAuditFixPieces(t *testing.T) {
 	if strings.Contains(js, "for (var i = 1; i <= 10; i++)") {
 		t.Error("首页又硬编码 /vol1..10 了 —— 盘位超过 10 的机器会看不到后面的存储空间")
 	}
-	if n := strings.Count(js, "bumpThumbCacheBust();"); n < 3 {
-		t.Errorf("bumpThumbCacheBust() 只调用 %d 次：保存设置 / 清空缓存 / 清除数据后都要换 URL", n)
+	// 2.4.50（二次审查 P3-23）：重建按钮改成按 doCover/doThumb 分流 bump 之后，
+	// "数无参调用次数"这个断言会误报（重建只清缩略图时走的是 keepCover=true）。
+	// 改成按**语义**断言三种形态都必须存在：保存设置（无参=连封面记忆一起重置）、
+	// 只清缩略图（true=保留封面记忆）、封面（覆盖 + 重置封面记忆）。
+	for _, want := range []string{"bumpThumbCacheBust();", "bumpThumbCacheBust(true)", "bumpCoverCacheBust();"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js 缺少 %q：缓存计数器分流不完整（清谁只让谁的 URL 失效）", want)
+		}
 	}
 	// 缩略图 URL 必须带画质，否则改完画质浏览器仍用 immutable 一年的旧图
 	if !strings.Contains(js, "'&q=' + (cfg.thumbQuality") {

@@ -236,7 +236,11 @@ func scanRecursive(root string, max int) ([]FileItem, error) {
 		}
 		item := FileItem{
 			Name: d.Name(), Path: path, Size: info.Size(),
-			Mtime: info.ModTime().UnixMilli(), Kind: kind, Ext: ext,
+			// 2.4.50（二次审查 P3-20）：**秒级口径**，与 listDir / 飞牛文件管理器一致。
+			// 原来用 UnixMilli()：同一秒内拍摄/批量导入的文件会被亚秒差排开，
+			// 而网格与文件管理器认为它们相等（按目录物理顺序），于是"递归扫描"和
+			// "进目录"两条路给出的时间线顺序对不上 —— 大图左右切换会跳。
+			Mtime: info.ModTime().Unix() * 1000, Kind: kind, Ext: ext,
 		}
 		if kind == "image" && ext != ".heic" && ext != ".heif" && ext != ".avif" && ext != ".svg" {
 			item.W, item.H = imageDimCached(path)
@@ -254,8 +258,9 @@ func scanRecursive(root string, max int) ([]FileItem, error) {
 	if err != nil && err != errStop {
 		return out, err
 	}
-	// newest first
-	sort.Slice(out, func(i, j int) bool { return out[i].Mtime > out[j].Mtime })
+	// newest first（2.4.50：SliceStable —— 同一秒的项保持遍历原始顺序，
+	// 与 listDir 的 sort.SliceStable 及文件管理器的稳定排序对齐；见上一条注释）
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Mtime > out[j].Mtime })
 	return out, nil
 }
 

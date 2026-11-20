@@ -608,6 +608,19 @@ func coverStillValid(p *coverPick, dir string) bool {
 		if err != nil || st.IsDir() {
 			return false
 		}
+		// 2.4.50（二次审查 P2-11）：**必须比较 mtime**。
+		//
+		// 原来这里只校验"文件还在、不是目录"：原地覆盖选中的那张图（用修图软件另存、
+		// 用同名新图替换）时，文件名与目录项数都不变 ⇒ 目录 mtime 也不变 ⇒
+		// 上面那段 Checks 全部通过 ⇒ 封面永久陈旧，只能手动"重建封面"。
+		// 字段 Items[].Mtime 从 2.4.2x 起就已经在写了，只是从来没人比较 —— 纯漏实现。
+		//
+		// 兼容：老 meta 可能缺这个字段（Mtime==0），此时**跳过**比较，
+		// 否则升级后所有存量封面会被判失效、全量重抽一次（封面重抽要读 4 张缩略图，
+		// 十万目录级别是一次明显的 IO 峰值）。
+		if it.Mtime != 0 && st.ModTime().UnixMilli() != it.Mtime {
+			return false
+		}
 	}
 	return true
 }
@@ -647,10 +660,24 @@ func saveCoverPick(metaPath string, p *coverPick) {
 	if err != nil {
 		return
 	}
+	jpgPath := coverJPGOf(metaPath)
+
+	// 2.4.51（封面重复生成根因修复）：写入端一有封面产物落盘，就作废旧的有效性结论。
+	//
+	// coverStillValidCached 会把"无效"结论按 jpgPath 在 TTL(8s) 内缓存；而旧版
+	// saveCoverPick 写完新 meta 却不清它 —— 于是"一键生成 → 立刻进目录"这条链
+	// 会命中 8 秒内那条 stale=false，把刚生成的封面判死、重新合成一份。等 8 秒
+	// TTL 到期又恢复正常，正是用户描述的"仅刚生成后短时间重做"时序现象。
+	//
+	// 放在函数出口统一删：xattr 成功分支与 .json 回退分支都会覆盖；即使写入
+	// 失败，删掉也只会让下次重新校验（此刻磁盘上本就是旧 meta / 无 meta，
+	// 重算结论更准确），无害。key 与 loadCoverPick→coverStillValidCached 完全一致
+	// （都取 coverJPGOf(metaPath)），不会出现"清错 key"。
+	coverValidCache.Delete(jpgPath)
+
 	// 首选：写进封面图自己的扩展属性 —— 目录里就只剩一张 jpg
 	// （用户诉求原话："封面上会生成一张 .json，能取消掉吗"）。
 	// 前提是 jpg 已落盘，所以 buildCover 特意把这次保存挪到了写图之后。
-	jpgPath := coverJPGOf(metaPath)
 	if len(raw) <= coverMetaXattrLimit && fileExists(jpgPath) {
 		if err := coverMetaSet(jpgPath, raw); err == nil {
 			_ = os.Remove(metaPath) // 上一版留下的 sidecar，顺手清掉
@@ -1498,6 +1525,13 @@ func pregenStartDirs(raw string) ([]string, int) {
 // 截断又是静默的，界面显示"已完成：新生成 N 个"，实际只做完了前 3000 个目录，
 // 用户完全看不出来（这就是"一键生成最多只有 3000 个"的来源）。
 //
+// 2.4.50（二次审查 P2-13）：max 从"只约束有媒体的目录数"扩展为**同时约束已展开的
+// 目录数**。原来只在 `hasMedia` 时检查 `len(out)>=max`，于是**海量空目录**
+// （几十万层子目录但没有一张图片）时队列与 seen 会一路增长直到走完整棵树：
+// 注释里宣称"防止病态目录树撑爆内存"的安全阀形同虚设，长时间遍历 + seen 暴涨
+// 是真的可以 OOM 的。现在展开数一到 max 就带着 truncated=true 返回，
+// 前端会提示"再点一次继续"（见 coverPregenDoneText）。
+//
 // startDirs 是**多个**起点：首页（聚合根）一键生成时对应"每个存储空间用户目录"，
 // 开启「只显示已添加的文件夹」时对应那几个文件夹。
 // 早期版本在聚合根传的是字面量 "/"，那会把整个文件系统（/usr、/proc…）走一遍 ——
@@ -1518,20 +1552,39 @@ func collectDirsWithMedia(startDirs []string, max int, cancel chan struct{}) ([]
 		seen[key] = true
 		queue = append(queue, d)
 	}
+	// expanded = 已经 ReadDir 过的目录数（含起点）。它是 max 的第二重约束，
+	// 保证"空目录树"也被安全阀挡住（见函数注释）。
+	expanded := 0
 	for len(queue) > 0 {
 		select {
 		case <-cancel:
 			return out, false
 		default:
 		}
+		// 开一个新目录之前就判：超限 ⇒ 队列里剩下的都没展开，必须报 truncated。
+		// 用 `>`（不是 `>=`）是为了不误伤"恰好收满最后一个"的场景 ——
+		// 那时 len(out)==max 且队列为空，属于完整走完，不该报截断。
+		if max > 0 && expanded > max {
+			return out, true
+		}
 		cur := queue[0]
 		queue = queue[1:]
+		expanded++
 		ents, err := os.ReadDir(cur)
 		if err != nil {
 			continue
 		}
 		hasMedia := false
-		for _, e := range ents {
+		for i, e := range ents {
+			// 超大目录（几万条目）里 ReadDir 已返回、但下面的循环仍要跑一会儿：
+			// 每 64 条检查一次取消，让"取消一键生成"能及时生效。
+			if i%64 == 0 {
+				select {
+				case <-cancel:
+					return out, false
+				default:
+				}
+			}
 			if e.IsDir() {
 				full := filepath.Join(cur, e.Name())
 				if !shouldSkipCoverDir(e.Name(), full, skipRoots) {

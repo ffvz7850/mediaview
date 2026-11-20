@@ -1,6 +1,10 @@
 package main
 
-// 2.4.40：端到端证明「进目录 / 返回 / 前进」在真页面导航下**不闪**。
+// 2.4.46：端到端证明「进目录 / 返回 / 前进」在**单文档 SPA** 下**不闪、也不重载**。
+//
+// 2.4.40 时这里钉的是"必须换文档"；2.4.46 把契约反过来了 —— 换文档恰恰是"每次返回都重载"
+// 的根源（WebView 要重新拉 HTML/JS、重建全部状态），也是"返回突然退出/跳层"的温床。
+// 现在的判据：**文档不变（doc 相同）、历史 +1（能逐层退）、内容不闪、返回靠快照秒出**。
 //
 // 单元测试证明不了这件事 —— 它只证明"代码是这么写的"。真正的判据是**帧**：
 // 内容出现之后还有没有出现过"0 个格子"的帧（那就是用户看到的空白闪），
@@ -32,6 +36,8 @@ type realnavDoc struct {
 	BlankAfter int    `json:"blankAfter"`
 	MaxCells   int    `json:"maxCells"`
 	Href       string `json:"href"`
+	HL         int    `json:"hl"`    // history.length
+	Cells      int    `json:"cells"` // 采样时的格子数
 }
 
 func Test2440BackForwardNoFlashRealBrowser(t *testing.T) {
@@ -77,17 +83,28 @@ func Test2440BackForwardNoFlashRealBrowser(t *testing.T) {
 		t.Fatalf("探针输出不是 JSON：%v\n%s", err, out)
 	}
 
-	// ① 换目录真的是"换文档"（不是内部切换）—— 否则后面几项验的就不是真导航
-	if res.Sub.Doc <= res.Root.Doc {
-		t.Fatalf("★★ 点文件夹没有产生新文档（doc %d → %d）：说明又变成内部切换了 —— "+
-			"那正是「返回就退出应用」的根源", res.Root.Doc, res.Sub.Doc)
+	// ① 2.4.46 契约：**同一个文档**里换目录（SPA），但历史必须真的多一条。
+	if res.Sub.Doc != res.Root.Doc {
+		t.Fatalf("★★ 点文件夹换了文档（doc %d → %d）：又退回整页导航了 —— "+
+			"每次返回都会重载页面，正是「返回卡一下/突然退出」的根源", res.Root.Doc, res.Sub.Doc)
 	}
-	if res.Back.Doc <= res.Sub.Doc {
-		t.Errorf("★★ 返回没有重建文档（doc %d → %d）—— 探针要求 MV_NO_BFCACHE 下的最坏路径",
-			res.Sub.Doc, res.Back.Doc)
+	if res.Back.Doc != res.Root.Doc || res.Forward.Doc != res.Root.Doc {
+		t.Errorf("★★ 返回/前进换了文档（doc 根=%d 子=%d 返=%d 进=%d）：必须是同文档就地渲染",
+			res.Root.Doc, res.Sub.Doc, res.Back.Doc, res.Forward.Doc)
+	}
+	if res.Sub.HL <= res.Root.HL {
+		t.Fatalf("★★ 进目录没有新增历史条目（history.length %d → %d）：返回就无处可退",
+			res.Root.HL, res.Sub.HL)
+	}
+	if res.Back.HL != res.Sub.HL {
+		t.Errorf("★ 返回改变了历史长度（%d → %d）：返回只应移动位置，不该增删条目",
+			res.Sub.HL, res.Back.HL)
 	}
 	if !strings.Contains(res.Back.Href, "?dir=/") {
 		t.Errorf("★ 返回后 URL 应是根层（?dir=/），实际 %s", res.Back.Href)
+	}
+	if !strings.Contains(res.Forward.Href, "dir=%2Fvol1%2F1000") {
+		t.Errorf("★ 前进后 URL 应回到那个文件夹，实际 %s", res.Forward.Href)
 	}
 
 	// ② 任何一处都不许"内容出现后又变回空白"

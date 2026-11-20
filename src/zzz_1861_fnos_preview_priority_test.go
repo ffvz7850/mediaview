@@ -195,8 +195,16 @@ func Test1861SystemThumbBigIsWiredToPreviewPriority(t *testing.T) {
 		t.Error("systemthumb.go 里没有 noteForegroundPreview() —— " +
 			"打开大图预览时后台预生成不再停摆")
 	}
-	if !strings.Contains(s, `if size == "big" {`) {
-		t.Error(`systemthumb.go 不再按 size == "big" 触发大图预览语义 —— ` +
+	// 2.4.50（P2-12）：暂停的触发点移到了 parseSystemThumbPath **之后**，并抽成
+	// maybePauseForBigPreview（handler 成功路径在 Windows/无 /vol 的测试机跑不通，
+	// 语义必须能被单独驱动）。所以这里按新结构断言：
+	//   handler 调用 maybePauseForBigPreview(size)，且该函数只对 "big" 生效。
+	if !strings.Contains(s, "maybePauseForBigPreview(size)") {
+		t.Error(`systemthumb.go 不再调用 maybePauseForBigPreview(size) —— ` +
+			`大图预览不再触发后台让路，用户又要"先跑完一页缩略图才出大图"`)
+	}
+	if !strings.Contains(s, `if size != "big" {`) {
+		t.Error(`maybePauseForBigPreview 不再按 size == "big" 判定 —— ` +
 			`网格 list 与大图 big 又重新混为一谈`)
 	}
 	if !strings.Contains(s, `ensureSystemThumb(origPath, px, size == "big")`) {

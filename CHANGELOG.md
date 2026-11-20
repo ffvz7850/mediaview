@@ -2,7 +2,7 @@
 
 > 极速媒体浏览 —— 飞牛 fnOS 图片/视频极速浏览 FPK 应用
 > 仓库：https://github.com/ffvz7850/mediaview
-> 版本范围：v1.8.4 → v2.4.45
+> 版本范围：v1.8.4 → v2.4.51
 
 ---
 
@@ -1423,6 +1423,275 @@ jsdom 交互探针补：首页渲染 3 个格子且两个子文件夹有封面�
 
 ---
 
+### v2.4.46 — 手机手势返回改为单文档 SPA（对齐 piGallery2）
+
+**症状**：手机上用手势返回时，有时突然退出应用，有时不按目录层级一层层退。
+
+**根因（三条，都在"返回"这条链上）**：
+1. 2.4.40 把换目录改成了 `location.href` 整页导航 —— 每按一次返回都是一次**文档重载**：
+   WebView 要重新拉 HTML/JS、重新鉴权、重建全部状态，慢、会闪，"返回落到哪一层"完全交给宿主去猜。
+2. `popstate` 只看"查看器是否可见"：查看器没开时它**什么都不做**。SPA 下切目录不重载文档，
+   于是这一下返回被静默吃掉 —— 表现就是"第一次滑动没反应、第二次突然跳层或退出"。
+3. 应用内"向上箭头"走的是 `navigateTo(上级)`（新压一条历史）而不是回退，历史成了锯齿：
+   按过箭头之后再用手势返回，会**退回刚离开的子目录**。
+
+**改法（与 piGallery2 同构：目录在 URL 里、切换只 pushState、内容就地渲染）**：
+- 进一层目录 = `pushState({mvDir, from})` + `loadDir()` 就地渲染；回聚合根 = `pushState({mvRoot})` + `buildRoot()`。
+  **全程一个文档**，不再有整页重载。
+- `popstate` 改为按 `event.state` 决定落点（`mvDir` / `mvRoot` / 入口层），并且天然幂等：
+  `closeViewer` 那次补偿性 `history.back()` 落回同一层时是 no-op（不会重渲染、不会吃层）。
+- 入口条目用 `replaceState` 同时**补上 state**，让整条历史口径统一。
+- 箭头回上一层时若"这一层就是从上一层点进来的"（`state.from === 上级`），改用 `history.back()`，不再压新条目。
+- 查看器条目两个档位都压（桌面浏览器后退键同样适用），补偿回收也统一。
+- 返回/前进时先 `rememberScroll()` 记住**正要离开的那一层**看到第几屏 —— 前进回来能停回原处。
+
+**验证**：
+- 真浏览器端到端（`tools/realnav_probe.js`，假后端 /api/list 故意延迟 600ms）：
+  同一文档内 进目录 → 返回 → 前进，**文档重载 0 次**、`history.length` 进目录 +1、
+  首帧内容 4~15ms（快照兜住）、`blankAfter = 0`（内容出现后不再变回空白）、前进回来滚动位置仍是 300。
+- 触屏档逐步实测（390×844）：启动 → 进 alpha → 进 beta → 开大图 → 返回#1（只关大图）→
+  返回#2（回 alpha）→ 返回#3（回聚合根）→ 主动关闭大图 → 返回（正好退一层）。
+- 全量 `go test` 通过（含改写后的 3 条历史契约测试）；两架构 fpk 均校验 ELF 架构与嵌入的新前端。
+
+---
+
+### v2.4.47 — 返回机制改成「URL 即状态」（对齐 piGallery2），去掉内部状态机
+
+**症状**：手机上用手势返回时，一滑动就像触发了两次返回 —— 有时一下退两层，有时直接退出应用。
+
+**根因（这次在代码里定位到了，并且能解释"piGallery2 为什么正常"）**：
+
+1. **查看器那条历史在 URL 上不可见**。2.4.46 打开大图压的是
+   `pushState({mvViewer:1}, '')` —— URL 一个字符都没变，两条历史条目**地址完全相同**，
+   只能靠 `history.state` 区分。这等于又回到"靠内部记账"：只要有一次 pop 的落点与预期不符，
+   URL 上完全看不出来，界面和 URL 从此差一层。
+2. **popstate 里做了一次状态判断**：`if (查看器没有 hidden) { closeViewer(); return; }`。
+   这条分支把 `event.state`（真实落点）**丢掉**了 —— URL 已经退到上一层，界面却只关了个遮罩，
+   于是"界面比 URL 多一层"。下一次返回就按 URL 再退一层，体感是"一次滑动退两层 / 再滑就退出"。
+3. **补偿用的 `history.back()` 是第二笔历史账**：主动关闭时补一次 back 收回查看器条目，
+   如果这一次和用户手势的那一次挨得很近，就会叠成两次返回。
+
+**piGallery2 的做法（源码 + 现网实测）**：它没有一行"处理返回"的代码 ——
+目录在路由路径、大图在 `?p=`，界面是 URL 的函数，popstate 由 Angular router 代听。
+返回得对不是写得巧，而是**没有任何状态机需要和历史对账**。
+
+**改法**：
+
+- 大图写进 URL：`?dir=<目录>&p=<文件名>`。返回时 URL 自己变回"无 p"，界面跟着就关了。
+- `popstate` 只剩一行：`applyUrl()` —— 读 URL、渲染，**绝不写历史**；天然幂等。
+- 大图内换张（竖图流滚动 / 左右切图）用 `replaceState` 改 `p`：不涨历史，且"关掉→前进"
+  能回到你离开时那张（piGallery2 没做这步，实测会跳回最初打开的那张）。
+- 主动关闭才 `history.back()`，且判据换成"URL 里有没有 p"（不再用 `mvViewerFromPop` 这类内部标记）；
+  `fromUrl` 路径（返回/前进触发的关闭）一个字都不动历史。
+- 新增 400ms 同 URL 去重闸：宿主一次手势若发来两个落点相同的 pop，第二个直接忽略。
+- 切目录时**先把目标写进 state 再加载**：上一层的 `loadDir` 是异步的，这期间若又来一次 pop，
+  `curPath()` 必须已是新目标，否则会被判成"原地不动"而整段吞掉（滚动位置就是这么丢的）。
+
+**验证**：
+- 真浏览器逐步（390×844，触屏档）：
+  进 beta → 开大图（URL 变 `&p=img24.png`）→ 一次返回 ⇒ pops=1、大图关、目录不动；
+  Esc 主动关闭 ⇒ 恰好 1 次 back、URL 回到无 p；再返回 ⇒ 回上一层（**不会重开大图**）；
+  前进 ⇒ 回到 beta 且无大图；流内滚动 ⇒ 只 replace、历史长度不变。
+- 滚动还原：beta 滚到 300 → 返回 → 前进，仍是 300（快照 top 生效）。
+- 全量 `go test`：历史纪律/导航契约/查看器压栈/无闪烁端到端全部通过（旧契约断言已按新机制改写）。
+  顺带修掉 3 条历史遗留的 CRLF 断言（与本版功能无关，之前一直是红的）。
+
+---
+
+
+### v2.4.48 — 清缓存拆成「清空缩略图」与「清空封面缩略图」两个按钮
+
+**症状**：设置里只有一个「清空缓存」，一点就把封面和缩略图一起清掉。
+
+**为什么要分开**：这两类的重建代价差一个数量级 ——
+缩略图是每张图一个文件、重建要逐张重新解码；封面是一个目录一张拼图、重建只要扫文件名。
+混着清，用户"只想换缩略图尺寸"也会把所有封面重合成一遍。
+
+**改动**：
+
+- 后端 `purgeCache()` 拆出 `purgeCacheKind(kind)`：`thumb` / `cover` / `all`。
+  `POST /api/settings/purge?what=thumb|cover|all`（不带参数仍按 `all`，老调用不变；未知值 400、GET 405）。
+  白名单（纯数字尺寸档 / `dircov`）之外的目录任何情况下都不碰。
+- 统计也拆开：`cacheStatsSplit()` 分别算缩略图与封面，设置响应新增
+  `cacheThumbFiles/Bytes`、`cacheCoverFiles/Bytes`（`cacheFiles/Bytes` 保留为合计）。
+- 设置页：两个按钮「清空缩略图」「清空封面缩略图」，下方分别显示各自的文件数与占用。
+- 封面有了**独立的 cache bust 计数器**（`mediaview_cover_bust`）：以前封面 URL 跟着
+  `thumbCacheBust` 走，清缩略图会把所有封面 URL 一起换掉、白白重下一遍。
+- toast 文案修正：`removed` 是删掉的**缓存目录数**，以前报成"缓存文件"。
+
+**顺带修复（本版测试中发现）**：快速「返回→前进」时偶尔跳回顶部（端到端探针约 50% 复现）。
+根因：快照先行恢复滚动位置后，列表 `/api/list` 的 `.then` 里用当时的 `scroller.scrollTop`
+算 `keepTop` 再 `saveSnap`，而那个值可能已被虚拟滚动 clamp 成 0 —— 把快照里正确的 top 冲掉。
+改法：`snapApplied` 时直接沿用快照记录的 `snap.top`，不读易变的 DOM 值。端到端连跑 12 次全绿。
+
+**验证**：新增 7 条测试（只清缩略图不动封面 / 只清封面不动缩略图 / all 两类都清 /
+白名单外绝不删 / what 参数解析 / 接口 405·400·200 / 设置页两个按钮与独立 bust），
+无闪烁端到端连跑 12/12，全量 `go test` 通过（105s）。
+
+---
+
+
+### v2.4.49 — 2.4.48 审计修复版（两个真 bug + 精简 + 清死断言）
+
+2.4.48 交付后做了一轮代码审计，发现两处真问题，另做精简与测试清理。
+
+**修复的两个 bug**：
+
+1. **「清除所有数据」后封面仍可能显示旧图**：后端把缩略图和封面一起清了，
+   但前端 factory reset 只 bump 了缩略图的 URL 计数器（`thumbCacheBust`），
+   封面的 `coverCacheBust` 没变 → 浏览器继续用一年 immutable 的旧封面。
+   现在两个计数器都 bump。
+2. **「清空缩略图」会让封面白闪一下**：清缩略图时封面原样留着，
+   但旧的 `bumpThumbCacheBust` 会连封面的「已加载记忆」（`coverSeen`）一起清掉，
+   导致下一帧封面重新走淡入。现在给 bump 加 `keepCover` 参数，只清缩略图时保留封面记忆。
+
+**精简**：两个 bump 里重复的封面记忆重置抽成 `resetCoverMem()`，消除三行重复；
+两个计数器声明合并到一处，注释统一说明「各自独立、各自持久化」。
+
+**测试断言清理**：
+- 删掉一条恒不命中的死断言（用 `strings.Contains(js, "'&_v=' + thumbCacheBust;")` 检查
+  coverURL，但该串在源码里根本不存在，断言永远通过）；改为验证两个计数器各自声明+持久化。
+  「coverURL 用 coverCacheBust 且清缩略图不改它」由 zzz_2414 的真实 JS 行为探针覆盖，更强。
+- `parsePurgeKind` 补测 `thumbnail`/`thumbnails` 两个此前漏掉的别名。
+- 新增 `Test2448BustCountersFollowWhatWasCleared` 钉住两个计数器的失效范围，
+  并做变异测试验证（删掉 factory reset 的 bumpCover 后测试确实变红）。
+- `zzz_2420_cover_tone_test.go` 里写死 `function bumpThumbCacheBust()` 空参数签名的断言，
+  改为检查抽取后的 `resetCoverMem()`（避免签名变化造成假失败）。
+
+**验证**：全量 `go test` 通过（88.7s）；真浏览器实测：清缩略图后 thumb 0→1、cover 保持 0、
+封面记忆保留；factory reset 后两个计数器都 +1。
+
+---
+
+### v2.4.51 — 封面"预生成后又重做"根因修复
+
+2.4.50 交付后用户反馈：文件夹封面已全部预生成，但"一键生成后立刻进入路径"
+仍会重新合成一份；等十几秒再进就正常。历史一直如此（非 2.4.50 引入）。
+
+**根因**：`coverStillValidCached` 把封面"无效"结论按 jpgPath 缓存在内存 TTL（8 秒，
+`coverValidTTL`）内。旧版写入端 `saveCoverPick` 写完新封面 meta 后**不清这条缓存**——
+于是"一键生成 → 立刻进目录"这条链命中 8 秒内那条 stale=`false`，把刚生成的封面
+判失效、重新合成一份；等 TTL 到期又恢复正常。表现正是"仅刚生成后短时间重做"的
+时序窗口。
+
+**修复**（`dircov.go` `saveCoverPick`）：函数出口统一 `coverValidCache.Delete(coverJPGOf(metaPath))`，
+在 xattr 成功分支与 `.json` 回退分支之前，两条写路径都覆盖；key 与读取端
+`loadCoverPick → coverStillValidCached` 完全同口径。不改 meta 结构、不改挑选规则，
+故**不 bump `coverCacheVersion`**（避免十万目录级全量重抽的 IO 峰值）。
+
+**测试**：新增 `zzz_2451_cover_regen_test.go` 三条——① 端到端"写 meta 后 stale 结论被清 +
+立刻读取命中"；② 反向语义确认"stale=false 确实会误判失效（证明 bug 真实存在）"；
+③ 静态闸门确认 Delete 覆盖 xattr 分支且 key 同口径。变异验证：删掉修复后①②闸门精确变红。
+原有 `Test2424ValidityTTLCachesResult`（TTL 函数语义）与 `zzz_2428`（refresh 清缓存）为
+正确行为，保留不动。
+
+### v2.4.50 — 二次审查修复（P1×6 / P2×8 / P3×5）
+
+2.4.49 交付后做了第二轮代码审查（架构 + 后端 + 前端与测试盲区三个视角，
+逐文件静态审查 + 变异测试 + 基线 `go test`），共 23 项发现。
+本次修复其中的 P1/P2 全部与 P3 的明确 bug，并把审查点名的「测试盲区」补上行为级探针。
+
+**P1（阻断/高危）**
+
+1. **暂停 TTL 到点无法唤醒已阻塞 worker → 后台预生成永久停摆**（`thumb.go` `waitWhilePaused`）。
+   原来 worker 阻塞在 `select{<-wctx.Done(); <-resumeCh}`，TTL 到点只把 `thumbPaused/thumbPauseUntil`
+   改成「未暂停」，**不产生任何唤醒信号**，只能重启应用或改一次设置。
+   而「收不到 resume」正是核心场景：飞牛文件管理器关闭大图预览时不发任何请求。
+   修法：每轮在锁内取 `remaining := time.Until(thumbPauseUntil)`，select 增加
+   `case <-time.After(remaining + 100ms)`，超时回到循环顶重新判断（滑动续期天然生效）；
+   `resumeCh` 仍是优先唤醒源。
+2. **关闭后台预生成时「立即生成 / 清缓存重建」没有消费者**（`thumb.go`）。
+   `PreloadConcurrency=0` 时 `spawnThumbWorkers` 内部 `n=0`，而 `ensureManualWorkers` 正是调它
+   → 一个 worker 都起不来，接口返回 `enqueued=N` 但任务永远没人跑。
+   修法：把「worker 数量」与「后台常驻开关」解耦，新增 `spawnThumbWorkersWith(n)`；
+   `ensureManualWorkers` 传固定 2（`manualWorkerCount`），`restartThumbWorkers` 等调用点
+   保留按配置取值的无参语义。保留原「用局部 q/ctx 闭包再赋全局」的写法（避免 data race 与 worker 泄漏）。
+3. **清指定目录缩略图：缓存根内符号链接可让 root 进程越权删除**（`thumb.go`）。
+   原来只做 `underRoot(dir, root)` 纯词法校验，随后 `filepath.Walk`（递归 chmod）与 `os.RemoveAll`
+   **都会跟随中间层符号链接**。修法：删除前对 dir 调 `resolveRealPath`，要求解析成功且
+   `underRoot(realDir, root)`，之后一律用 `realDir` 做 stat/Walk/RemoveAll，拒绝时打日志。
+   只收紧删除路径，正常缓存目录不受影响。
+4. **`/api/pregen` 接受任意绝对路径（绕过 OnlyRoots 白名单）+ body 无上限**（`media.go`）。
+   修法：对每个路径调 `resolveMediaPathReq`，`sc != 0` 的条目记日志并跳过；用解析后的真实路径
+   重取 Ext/Kind；body 用 `io.LimitReader(1MB)` 解码；paths 条数上限 1024（超出截断）。
+   「顺序原样保留」语义不变。
+5. **`/api/meta` 与 `/api/thumb` 缺「普通文件」闸门，FIFO 可永久占槽**（`media.go` / `thumb.go`）。
+   加 `info.Mode().IsRegular()` 闸门并回 403（与 `handleRaw` 完全同口径），`ensureThumbInternal`
+   入口再做一次兜底（新增哨兵 `errThumbNotRegular`，且不记负缓存）。
+6. **SIGTERM 退出不恢复 auto_thumbnailer**（`main.go` / `systemthumb.go`）。
+   接管 server 的 `*http.Server` 提升为包级变量，新增 `stopSystemThumbServer`；退出流程改为
+   ① Shutdown 该 server + 移除 socket → ② 若接管开启则 `enableSystemThumbnailer()` +
+   `invalidateSysThumbState()`（抽成可测的 `restoreSystemThumbnailerOnExit`，幂等）→ ③ 再 `srv.Shutdown`。
+
+**P2（功能错误/明显退化）**
+
+7. **vipsthumbnail 子进程无超时**（`thumb.go` `tryVipsImageThumb`）：加 `context.WithTimeout(ctx, 30s)`
+   传给 `CommandContext`，超时返回 false 走既有回退（与 ffmpeg 的 30s 一致）。
+8. **singleflight 闭包捕获首个调用者 ctx**（`thumb.go`）：生成改用应用级 ctx + 固定超时
+   （`newThumbGenCtx`，45s），singleflight 只执行生成、调用方只等结果；`foreground/immediate`
+   的取槽策略移到 singleflight 之外的 `acquireThumbSlotFor`。HTTP 层接口不变。
+9. **`metaMem` 元数据缓存无上限**（`cache.go`）：加 8192 条目上限，满则整体清空（与 `probeCache` 同款），
+   对调用方透明。
+10. **不同 cacheID 并发写同一 out/.tmp**（`thumb.go`）：中间产物名带 cacheID 短哈希
+    （`<out>.tmp.<key8>` / `<out>.gen-<key8>.jpg`），两路各写各的 temp、原子 rename；
+    `out` 本身与 xattr/`.key` 回退逻辑完全兼容，旧文件靠 miss 自然重建。
+11. **`coverStillValid` 存了 Items[].Mtime 却从不比较**（`dircov.go`）：加
+    `st.ModTime().UnixMilli() != it.Mtime → false`；老 meta 缺字段（`Mtime==0`）跳过比较，
+    避免升级后全量重抽封面。
+12. **「暂停后台」发生在校验之前**（`media.go` / `systemthumb.go`）：`handleRaw` 的
+    `noteForegroundPreview()` 移到路径/类型/普通文件三道闸门之后；系统缩略图移到
+    `parseSystemThumbPath` 成功之后（触发点抽成 `maybePauseForBigPreview` 以便行为可测）。
+    非法请求不再能反复 kill ffmpeg。
+13. **一键生成 max 安全阀只约束「有媒体目录数」**（`dircov.go`）：max 同时约束已展开目录数，
+    超限返回 `truncated=true`（前端提示「再点一次继续」）；ReadDir 大目录循环里每 64 条检查一次 cancel。
+15. **iframe 下仍用原生 `confirm()`**（`web/app.js`）：新增轻量自绘确认弹层 `askConfirm(message, onOk)`
+    （DOM 结构 + 与设置弹层同源的 `.modal` 样式 + JS，纯 DOM、不依赖宿主），
+    替换「重建当前目录」「清除所有数据」两处原生 `confirm`。
+
+**P3（明确 bug / 泄漏 / 一致性）**
+
+16. **优雅退出留下孤儿 ffmpeg**（`ffmpeg.go` / `main.go`）：新增在途子进程注册表，
+    `runCmd/outputCmd/combinedOutputCmd` 统一登记，退出时 `killLiveCommands` 遍历 kill
+    并等注册表清空（不重复 Wait）。
+19. **parseSort 下划线别名全部失效**（`sortkey.go`）：改为「先整体匹配别名表
+    （含 `file_name`/`modify_time`/`file_size`/`create_time`/`birth_time`），匹配不到再按
+    `:` 或**最后**一个 `_` 拆方向」。
+20. **递归扫描 mtime 口径不一致**（`scanner.go`）：改 `ModTime().Unix()*1000` 与 `sort.SliceStable`，
+    对齐 listDir 的秒级口径。
+21. **statx btime 为 0 不兜底**（`birthtime_linux.go`）：采纳条件加 `stx.Btime.Sec > 0`，否则走 ctime 兜底。
+22. **cleanRoots 用 ToLower 去重会吞目录**（`config.go`）：改用 `pathKey()`（Linux 不折叠大小写，
+    仅 Windows 折叠），并同步了浏览候选根的去重口径。
+23. **「重建当前目录」重建了封面却只 bump 缩略图计数器**（`web/app.js`）：按 `doCover/doThumb` 分流 ——
+    重建封面走 `bumpCoverCacheBust()`，只清缩略图走 `bumpThumbCacheBust(true)`。
+
+**顺带（P3 可选，改动小）**
+
+17. 内存缓存整体清空的抖动：`thumbFailMap` 阈值 4096→8192、`probeCacheMax` 1024→2048，
+    并在清空时打日志（彻底方案 LRU 留待后续版本）。
+
+**延后**：18. 缩略图磁盘缓存容量治理（软配额 + atime 淘汰）改动面较大，本版不做，留到单独版本。
+
+**测试**
+
+- 新增 `src/zzz_2450_second_audit_test.go`（11 条正向探针）：TTL 唤醒、`PreloadConcurrency=0`
+  时队列确有消费者、`/api/pregen` 白名单与 body 上限、`/api/thumb`+`/api/meta` 拒绝非普通文件、
+  中间产物名按 cacheID 区分、`coverStillValid` 比较 Items mtime（含老 meta 兼容）、
+  `parseSort` 下划线别名、空目录树被 max 挡住、清缓存用 `resolveRealPath`、`killLiveCommands` 幂等。
+- 修正因**修复本身**改变了预期的既有断言（均为源码修复正确、旧断言固化了缺陷）：
+  `zzz_2000`（pregen 现在要过白名单，改用真实工作目录下的路径）、`zzz_1850`/`zzz_1854`/`zzz_1861`
+  （暂停触发点移到 parse 之后，改为「非法路径不暂停 + 语义函数 + 源码顺序」三层断言）、
+  `zzz_2426` 与 `zz_p0p1_fix`（重建封面改为按 doCover/doThumb 分流 bump）、
+  `zz_regression_1841`（`generateThumb` 签名回到 key/cacheID 两个参数）、
+  `dircov_test` / `zzz_2423`（fixture 改用文件真实 mtime —— 旧写法用 `time.Now()` 近似，
+  正好掩盖了「不比较 mtime 也能过」）。
+
+**验证**：`gofmt -w *.go` 无差异；`go build ./...` 通过；`go test` 全量 **351 项通过 /
+11 项跳过（环境相关：无 ffmpeg、无符号链接权限、Z 盘实拍）**；`node --check web/app.js` 通过。
+两架构二进制按 `-trimpath -ldflags "-s -w"` 重新构建并覆盖 `fpk-x86/app/mediaview`、
+`fpk-arm/app/mediaview`。
+
+---
+
 ## 安装
 
 从 [Releases](https://github.com/ffvz7850/mediaview/releases) 下载对应架构的 `.fpk` 文件，在飞牛应用中心手动安装。
@@ -1432,4 +1701,4 @@ jsdom 交互探针补：首页渲染 3 个格子且两个子文件夹有封面�
 
 ---
 
-*最后更新：v2.4.37*
+*最后更新：v2.4.50*

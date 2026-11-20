@@ -342,7 +342,7 @@ console.log('OK');
 // ---------------------------------------------------------------------------
 // ③ 查看器历史条目：触屏档压、桌面档不压
 // ---------------------------------------------------------------------------
-func Test2230ViewerPushesHistoryOnTouchOnly(t *testing.T) {
+func Test2230ViewerPushesHistoryOnce(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skipf("node 不可用：%v", err)
@@ -382,13 +382,20 @@ function makeEnv(profile) {
   var state = { items: [{ kind: 'file', path: '/vol1/a.jpg', name: 'a.jpg' }] };
   var vWrap = { querySelector: function () { return null; }, appendChild: function () {} };
   var cfg = {};
+  // 2.4.47：查看器压栈收敛到 pushNav（唯一出口），所以按同样的契约提供桩，
+  //   同时把 path/photo 一并记下来 —— 才能钉住"URL 上必须看得见 &p="。
+  var pushNav = function (st, path, photo) { env.pushed.push({ state: st, path: path, photo: photo }); return true; };
+  var curPath = function () { return '/vol1'; };
+  var syncExitTips = function () {};
   var api = new Function(
-    'PROFILE', 'history', 'v', 'viewer', 'state', 'vWrap', 'cfg',
+    'PROFILE', 'history', 'v', 'viewer', 'state', 'vWrap', 'cfg', 'singleMode',
     'stopAllMediaIn', 'applyViewerAnimation', 'suspendGridRequests', 'showCurrent', 'pauseThumbGen',
+    'pushNav', 'curPath', 'syncExitTips',
     code
   )(
-    profile, env.history, v, viewer, state, vWrap, cfg,
-    function () {}, function () {}, function () {}, function () {}, function () {}
+    profile, env.history, v, viewer, state, vWrap, cfg, false,
+    function () {}, function () {}, function () {}, function () {}, function () {},
+    pushNav, curPath, syncExitTips
   );
   env.api = api;
   return env;
@@ -400,11 +407,14 @@ e1.api.open({ kind: 'file', path: '/vol1/a.jpg', name: 'a.jpg' });
 eq(e1.pushed.length, 1, '★ 触屏档打开查看器必须压**恰好一条**历史 —— ' +
   '查看器没有自己的历史层级时，返回会退掉上一层目录页（真导航重载），closeViewer 根本没机会跑');
 eq(e1.pushed[0].state && e1.pushed[0].state.mvViewer, 1, '查看器条目必须带 mvViewer 标记（供 closeViewer 识别）');
+eq(e1.pushed[0].photo, '/vol1/a.jpg', '★★ 查看器条目必须把 &p= 写进 URL —— ' +
+  'URL 上看不出"在看哪张"，就还是靠 history.state 记账，落点一偏界面就会和 URL 脱节');
 
-// 桌面档：**不许**压（桌面查看器是独立窗口，语义不同）
+// 桌面档：**同样压一条**（2.4.46 起目录层也是 pushState，桌面浏览器后退键如果不接管，
+// 在查看器里按后退会直接退掉一层目录，而不是关大图）
 var e2 = makeEnv('mouse');
 e2.api.open({ kind: 'file', path: '/vol1/a.jpg', name: 'a.jpg' });
-eq(e2.pushed.length, 0, '桌面档不得压查看器历史（桌面用独立窗口，不该被手机的问题牵连）');
+eq(e2.pushed.length, 1, '★ 桌面档打开查看器同样要压一条历史（SPA 下目录层也是 pushState）');
 
 console.log('OK');
 `

@@ -58,7 +58,9 @@ func TestThumbSourceKeysNotMixed(t *testing.T) {
 
 	// generateThumb 必须同时收到「元数据 key」与「产物标识 cacheID」
 	// （1.8.61 起签名末尾多了 immediate：大小图预览走预留槽，见 zzz_1861_*_test.go）
-	if !strings.Contains(s, "key, cacheID string, foreground, immediate bool") {
+	// 2.4.50（P2-8）：foreground/immediate 的取槽策略移出 generateThumb
+	// （singleflight 闭包里的生成不再捕获调用方 ctx），签名退回 key/cacheID 两个。
+	if !strings.Contains(s, "key, cacheID string) (string, error)") {
 		t.Error("generateThumb 的签名里 key/cacheID 不再是并列的两个参数 —— " +
 			"元数据 key 与产物标识被混用，会导致内存元数据缓存失效（每个视频每次列目录都读盘）")
 	}

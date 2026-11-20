@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -103,6 +105,20 @@ func ensureSystemThumb(origPath string, px int, immediate bool) (string, error) 
 	return ensureThumbSys(origPath, kind, px, immediate)
 }
 
+// maybePauseForBigPreview 在「大图预览（size=big）」请求上触发后台让路。
+//
+// 抽成函数（而不是在 handler 里内联）的原因只有一个：**这段语义必须可测**。
+// handleSystemThumbGetIcon 的完整成功路径依赖真实的 /vol{n} 目录（测试机、Windows
+// 开发机都跑不通），而"big 必须停后台、list/medium 不许停后台"是用户可感知的核心
+// 行为。现在行为测试可以直接驱动本函数，接线是否还在则由源码顺序断言守（见
+// zzz_1850 / zzz_1854：note 必须出现在 parseSystemThumbPath 之后）。
+func maybePauseForBigPreview(size string) {
+	if size != "big" {
+		return
+	}
+	noteForegroundPreview()
+}
+
 // handleSystemThumbGetIcon 处理飞牛文件管理器的缩略图请求
 // GET /thumb/getIcon?path=vol3/1000/...&size=list&token=...
 func handleSystemThumbGetIcon(w http.ResponseWriter, r *http.Request) {
@@ -144,9 +160,6 @@ func handleSystemThumbGetIcon(w http.ResponseWriter, r *http.Request) {
 	//   ② immediate=true：这一张自己不让路（否则触发暂停后自己再等一轮让路），
 	//      并且走预留槽，不排整页 list 请求已经占住的 thumbGenSem FIFO。
 	// 注意归一化后的 list（含原 medium 卡片视图）**不**触发：卡片视图一次会来很多张，触发就成了自己挡自己。
-	if size == "big" {
-		noteForegroundPreview()
-	}
 	if sysThumbDebug {
 		started := time.Now()
 		defer func() {
@@ -159,6 +172,13 @@ func handleSystemThumbGetIcon(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
+	// 2.4.50（二次审查 P2-12）：暂停必须发生在**路径校验通过之后**。
+	//
+	// 原实现在 parseSystemThumbPath 之前调用 noteForegroundPreview()，而接管 socket 是
+	// 0666、任何本地进程都能连 —— 一串 `?size=big&path=乱写` 就能反复暂停后台 20 秒
+	// 并 cancelBackgroundCtx（kill 在跑的 ffmpeg）；在滑动续期下，低成本请求即可让
+	// 后台预生成永久停摆。现在非法请求在上面的 parse 就 400 返回，根本走不到暂停。
+	maybePauseForBigPreview(size)
 
 	px := sizeToPixels(size)
 
@@ -208,6 +228,43 @@ func handleSystemThumbMeta(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// 接管 server 的句柄（2.4.50，二次审查 P1-6）。
+//
+// 原来是 startSystemThumbServer 里的**局部变量**，进程退出时只 Shutdown 了主 server，
+// 接管 socket 的 server 既没关、socket 文件也没删。飞牛卸载/升级退出后：
+// 系统 auto_thumbnailer 已被 disable，接管 socket 随进程消失 → 两套缩略图服务都没有，
+// 文件管理器缩略图全空。提升为包级变量后，退出流程才能按序 Shutdown 它。
+// 每次 start 都覆盖写入；stop 时取走并置 nil（幂等：未启动/已停止时直接返回）。
+var (
+	sysThumbSrvMu sync.Mutex
+	sysThumbSrv   *http.Server
+)
+
+// stopSystemThumbServer 关闭接管 server 并移除 socket 文件（幂等）。
+//
+// 顺序：先 Shutdown（等待在处理的请求，最多 timeout）→ 再删 socket 文件。
+// 先删文件会让正在处理的连接以诡异方式断开，且 Serve 返回后 systemd 侧可能误判。
+func stopSystemThumbServer(timeout time.Duration) {
+	sysThumbSrvMu.Lock()
+	srv := sysThumbSrv
+	sysThumbSrv = nil
+	sysThumbSrvMu.Unlock()
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("mediaview: system thumb server shutdown: %v", err)
+	} else {
+		log.Printf("mediaview: system thumb server stopped")
+	}
+	sysThumbListening.Store(false)
+	// Shutdown 不会删除 listener 上的 unix socket 文件，必须自己删 ——
+	// 否则下次启动时残留的 socket 会让文件管理器连到一个死地址。
+	_ = os.Remove(systemThumbSocket)
+}
+
 // startSystemThumbServer 启动系统缩略图接管服务，监听 /var/run/auto_thumbnailer.socket
 func startSystemThumbServer() error {
 	// 移除旧 socket（如果存在）
@@ -234,6 +291,10 @@ func startSystemThumbServer() error {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
+	// 保存句柄供退出流程 Shutdown（见 stopSystemThumbServer）。
+	sysThumbSrvMu.Lock()
+	sysThumbSrv = srv
+	sysThumbSrvMu.Unlock()
 
 	sysThumbListening.Store(true) // 1.8.164：接管 socket 已开始服务（供 /api/health 观测）
 	go func() {

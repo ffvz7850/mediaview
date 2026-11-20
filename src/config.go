@@ -171,11 +171,14 @@ var (
 	// thumbRootNote 目录回退原因，供设置页提示用户
 	thumbRootNote string
 
-	// cacheStats* 缩略图缓存统计的 TTL 缓存（见 cacheStats 注释）
-	cacheStatsMu   sync.Mutex
-	cacheStatsAt   time.Time
-	cacheStatsN    int
-	cacheStatsSize int64
+	// cacheStats* 缓存统计的 TTL 缓存（见 cacheStats 注释）。
+	// 2.4.48：缩略图与封面分别记账 —— 设置页要分别显示、分别清。
+	cacheStatsMu        sync.Mutex
+	cacheStatsAt        time.Time
+	cacheStatsThumbN    int
+	cacheStatsThumbSize int64
+	cacheStatsCoverN    int
+	cacheStatsCoverSize int64
 )
 
 const cacheStatsTTL = 60 * time.Second
@@ -393,7 +396,11 @@ func cleanRoots(in []string) []string {
 		if !filepath.IsAbs(r) {
 			continue // 相对路径无法作为范围依据
 		}
-		key := strings.ToLower(r)
+		// 2.4.50（二次审查 P3-22）：用 pathKey 而不是 ToLower。
+		// Linux（飞牛本体）上 /vol1/1000/Photos 与 /vol1/1000/photos 是**两个不同目录**，
+		// 无条件 ToLower 会把后一个当成"重复项"直接吞掉，用户加了第二个文件夹却看不见 ——
+		// 与 pathKey 注释里 2.4.28 修过的 collectDirsWithMedia 是同一类错误。
+		key := pathKey(r)
 		if seen[key] {
 			continue
 		}
@@ -548,23 +555,35 @@ func currentThumbNote() string {
 
 // ---- 目录容量统计（缩略图缓存占用） ----
 
-// cacheStats 扫描整个缩略图缓存，统计文件数与占用。
+// cacheStats 扫描整个缓存，返回文件总数与总占用（缩略图 + 封面）。
+//
+// 保留这个"合计"签名是给老调用方（测试、安全审计）用的；设置页要分开显示，
+// 用 cacheStatsSplit。
+func cacheStats() (files int, bytes int64) {
+	tf, tb, cf, cb := cacheStatsSplit()
+	return tf + cf, tb + cb
+}
+
+// cacheStatsSplit 分别统计缩略图与封面。
 //
 // 这个扫描很重（缓存几万个文件就是几万次 stat），而它被 buildSettingsView 调用，
 // 后者在**每次页面加载**时都会跑（boot 里就调 loadSettings，包括每一个独立看图窗口）。
 // 所以结果缓存一会儿：用户看到「已缓存 N 个文件」晚 60 秒毫无影响，
 // 但服务端省掉了每次开窗/开设置面板的全量遍历。
-func cacheStats() (files int, bytes int64) {
+//
+// 分类口径与 purgeCacheKind 严格一致：顶层目录名是 dircov 的算封面，纯数字的算缩略图。
+func cacheStatsSplit() (thumbFiles int, thumbBytes int64, coverFiles int, coverBytes int64) {
 	cacheStatsMu.Lock()
 	if !cacheStatsAt.IsZero() && time.Since(cacheStatsAt) < cacheStatsTTL {
-		n, b := cacheStatsN, cacheStatsSize
+		tf, tb := cacheStatsThumbN, cacheStatsThumbSize
+		cf, cb := cacheStatsCoverN, cacheStatsCoverSize
 		cacheStatsMu.Unlock()
-		return n, b
+		return tf, tb, cf, cb
 	}
 	cacheStatsMu.Unlock()
 
 	root := currentThumbRoot()
-	count := func(p string, d os.DirEntry) {
+	count := func(isCover bool, d os.DirEntry) {
 		if d.IsDir() {
 			return
 		}
@@ -574,20 +593,26 @@ func cacheStats() (files int, bytes int64) {
 		if strings.HasSuffix(d.Name(), thumbKeySuffix) || strings.HasSuffix(d.Name(), ".json") {
 			return
 		}
-		if info, err := d.Info(); err == nil {
-			files++
-			bytes += info.Size()
+		info, err := d.Info()
+		if err != nil {
+			return
+		}
+		if isCover {
+			coverFiles++
+			coverBytes += info.Size()
+		} else {
+			thumbFiles++
+			thumbBytes += info.Size()
 		}
 	}
 
-	// 只统计**本应用创建的目录**（尺寸档 + dircov），与 purgeCache 的白名单保持同一口径：
+	// 只统计**本应用创建的目录**（尺寸档 + dircov），与 purgeCacheKind 的白名单同一口径：
 	// 缓存根可以由用户指到任意目录，里面可能有别人的东西 —— 那些不是"已缓存"。
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 	for _, e := range entries {
-		full := filepath.Join(root, e.Name())
 		if !e.IsDir() {
 			// 根下直接躺着的文件一律不算缓存（也不是我们会清理的东西）
 			continue
@@ -595,19 +620,22 @@ func cacheStats() (files int, bytes int64) {
 		if !isCacheOwnedDir(e.Name()) {
 			continue
 		}
-		_ = filepath.WalkDir(full, func(p string, d os.DirEntry, err error) error {
+		isCover := e.Name() == coverCacheDirName
+		_ = filepath.WalkDir(filepath.Join(root, e.Name()), func(p string, d os.DirEntry, err error) error {
 			if err != nil {
 				return nil
 			}
-			count(p, d)
+			count(isCover, d)
 			return nil
 		})
 	}
 
 	cacheStatsMu.Lock()
-	cacheStatsN, cacheStatsSize, cacheStatsAt = files, bytes, time.Now()
+	cacheStatsThumbN, cacheStatsThumbSize = thumbFiles, thumbBytes
+	cacheStatsCoverN, cacheStatsCoverSize = coverFiles, coverBytes
+	cacheStatsAt = time.Now()
 	cacheStatsMu.Unlock()
-	return files, bytes
+	return thumbFiles, thumbBytes, coverFiles, coverBytes
 }
 
 // invalidateCacheStats 让下一次统计重新扫描（清缓存、改缩略图目录后调用）。
@@ -617,30 +645,60 @@ func invalidateCacheStats() {
 	cacheStatsMu.Unlock()
 }
 
-// purgeCache 清空缩略图缓存（递归删除 size 子目录与封面目录 dircov）
-func purgeCache() (int, error) {
+// purgeKind 指定清哪一类缓存。
+//
+// 2.4.48：以前只有一个「清空缓存」，把缩略图和封面一起清掉 —— 但这两类东西的
+// 重建代价完全不同：缩略图是每张图一个文件、重建要重新解码；封面是一个目录一张拼图、
+// 重建只要扫一遍文件名。用户经常只想清一边（比如换了缩略图尺寸要清缩略图，
+// 但不想让整个网格的封面重新合成）。所以拆成两类，各自独立。
+type purgeKind string
+
+const (
+	purgeAll    purgeKind = "all"
+	purgeThumbs purgeKind = "thumb"
+	purgeCovers purgeKind = "cover"
+)
+
+// purgeCache 清空全部缓存（缩略图 + 封面）。给「清除所有数据」与老调用方用。
+func purgeCache() (int, error) { return purgeCacheKind(purgeAll) }
+
+// purgeCacheKind 只清指定类别，白名单之外的一律不碰
+// （缓存根可以由用户指到任意目录，里面可能还有别的东西）。
+func purgeCacheKind(kind purgeKind) (int, error) {
 	root := currentThumbRoot()
 	entries, err := os.ReadDir(root)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil // 缓存根还没建起来：本来就没什么可清
+		}
 		return 0, err
 	}
+	wantThumb := kind == purgeAll || kind == purgeThumbs
+	wantCover := kind == purgeAll || kind == purgeCovers
 	n := 0
 	for _, e := range entries {
 		name := e.Name()
-		full := filepath.Join(root, name)
 		if !e.IsDir() {
 			continue // 根下直接躺着的文件不是本应用的产物，不碰
 		}
-		// 只删我们自己创建的目录：纯数字尺寸档 + 封面目录 dircov。
-		// 任何其它目录一律不碰 —— 缓存根可能是用户指定的共享目录，误删代价太大。
-		//
-		// ⚠ 2.4.23 之前这里只放行"纯数字"，而封面目录叫 dircov ⇒ 被整段跳过，
-		//   于是「清空缓存」清掉了缩略图、却把封面（含 .json）原样留着：
-		//   用户点了按钮、数字也归零，磁盘上那堆封面还在。实测复现过，别改回去。
-		if !isCacheOwnedDir(name) {
-			continue
+		if name == coverCacheDirName {
+			if !wantCover {
+				continue
+			}
+		} else {
+			// 只删我们自己创建的尺寸档目录（纯数字）。
+			//
+			// ⚠ 2.4.23 之前这里只放行"纯数字"，而封面目录叫 dircov ⇒ 被整段跳过，
+			//   于是「清空缓存」清掉了缩略图、却把封面（含 .json）原样留着。
+			//   现在封面单独成类，但仍必须显式包含在 all 里 —— 别再漏。
+			if !wantThumb {
+				continue
+			}
+			if _, err := strconv.Atoi(name); err != nil {
+				continue
+			}
 		}
-		if err := os.RemoveAll(full); err == nil {
+		if err := os.RemoveAll(filepath.Join(root, name)); err == nil {
 			n++
 		}
 	}
@@ -1203,16 +1261,21 @@ type rootInfo struct {
 
 type settingsView struct {
 	Settings
-	RootsInfo         []rootInfo `json:"rootsInfo"`
-	DefaultThumbDir   string     `json:"defaultThumbDir"`
-	ActiveThumbDir    string     `json:"activeThumbDir"`
-	Note              string     `json:"note,omitempty"`
-	CacheFiles        int        `json:"cacheFiles"`
-	CacheBytes        int64      `json:"cacheBytes"`
-	SettingsFile      string     `json:"settingsFile"`
-	FFmpeg            bool       `json:"ffmpeg"`
-	SystemThumbAvail  bool       `json:"systemThumbAvail"`
-	SystemThumbActive bool       `json:"systemThumbActive"`
+	RootsInfo       []rootInfo `json:"rootsInfo"`
+	DefaultThumbDir string     `json:"defaultThumbDir"`
+	ActiveThumbDir  string     `json:"activeThumbDir"`
+	Note            string     `json:"note,omitempty"`
+	CacheFiles      int        `json:"cacheFiles"`
+	CacheBytes      int64      `json:"cacheBytes"`
+	// 2.4.48：分类统计 —— 设置页两个按钮各自显示自己的占用
+	CacheThumbFiles   int    `json:"cacheThumbFiles"`
+	CacheThumbBytes   int64  `json:"cacheThumbBytes"`
+	CacheCoverFiles   int    `json:"cacheCoverFiles"`
+	CacheCoverBytes   int64  `json:"cacheCoverBytes"`
+	SettingsFile      string `json:"settingsFile"`
+	FFmpeg            bool   `json:"ffmpeg"`
+	SystemThumbAvail  bool   `json:"systemThumbAvail"`
+	SystemThumbActive bool   `json:"systemThumbActive"`
 }
 
 func handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -1228,7 +1291,7 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 
 func buildSettingsView() settingsView {
 	s := getSettings()
-	files, bytes := cacheStats()
+	tf, tb, cf, cb := cacheStatsSplit()
 	sysAvail, sysActive := systemThumbnailerState()
 	return settingsView{
 		Settings:          s,
@@ -1236,8 +1299,12 @@ func buildSettingsView() settingsView {
 		DefaultThumbDir:   filepath.Join(workDir, thumbSubdir),
 		ActiveThumbDir:    currentThumbRoot(),
 		Note:              currentThumbNote(),
-		CacheFiles:        files,
-		CacheBytes:        bytes,
+		CacheFiles:        tf + cf,
+		CacheBytes:        tb + cb,
+		CacheThumbFiles:   tf,
+		CacheThumbBytes:   tb,
+		CacheCoverFiles:   cf,
+		CacheCoverBytes:   cb,
 		SettingsFile:      settingsFile,
 		FFmpeg:            ffmpegPath != "",
 		SystemThumbAvail:  sysAvail,
@@ -1391,7 +1458,8 @@ func validateCustomRoots(roots []string) ([]string, string) {
 		if sc != 0 {
 			return nil, "该文件夹不在允许访问范围内（仅支持存储空间等已授权路径）：" + abs
 		}
-		key := strings.ToLower(real)
+		// 2.4.50（二次审查 P3-22）：同上，用 pathKey（仅 Windows 折叠大小写）。
+		key := pathKey(real)
 		if seen[key] {
 			continue // 同一目录用不同写法加了两次：静默去重（这就是用户意图，不算错）
 		}
@@ -1406,7 +1474,23 @@ func dirExists(p string) bool {
 	return err == nil && st.IsDir()
 }
 
-// handleSettingsPurge 清空缩略图缓存（同时清掉内存元数据缓存）
+// parsePurgeKind 解析 `?what=`。空参数按 all 处理（向后兼容只发 POST 的老调用）。
+func parsePurgeKind(s string) (purgeKind, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "all", "both":
+		return purgeAll, true
+	case "thumb", "thumbs", "thumbnail", "thumbnails":
+		return purgeThumbs, true
+	case "cover", "covers", "dircov":
+		return purgeCovers, true
+	}
+	return "", false
+}
+
+// handleSettingsPurge 清空缓存。`?what=thumb|cover|all`（默认 all）。
+//
+// 两个类别必须能分开清：缩略图重建要重新解码每一张，封面只是把目录里的文件名拼成一张图。
+// 用户换缩略图尺寸时只该清缩略图，不该连带把所有封面重合成一遍。
 func handleSettingsPurge(w http.ResponseWriter, r *http.Request) {
 	// 破坏性操作只接受 POST：否则 <img src=".../api/settings/purge"> 这类
 	// 跨站请求就能把别人的缓存清空。
@@ -1414,14 +1498,19 @@ func handleSettingsPurge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	n, err := purgeCache()
+	kind, ok := parsePurgeKind(r.URL.Query().Get("what"))
+	if !ok {
+		http.Error(w, "unknown 'what' (expect all|thumb|cover)", http.StatusBadRequest)
+		return
+	}
+	n, err := purgeCacheKind(kind)
 	dropMetaMem()
 	invalidateCacheStats()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, r, map[string]any{"ok": true, "removed": n})
+	writeJSON(w, r, map[string]any{"ok": true, "removed": n, "what": string(kind)})
 }
 
 // handleFactoryReset 清除所有数据：缩略图缓存 + 设置文件，恢复出厂默认
@@ -1534,7 +1623,9 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 			if root == "" {
 				continue
 			}
-			key := strings.ToLower(filepath.Clean(root))
+			// 2.4.50（二次审查 P3-22）：pathKey（仅 Windows 折叠大小写）——
+			// 与 cleanRoots 同一口径，否则浏览/选择器会把仅大小写不同的真实目录当成重复。
+			key := pathKey(root)
 			if seen[key] {
 				continue
 			}
@@ -1545,8 +1636,8 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 			// 各存储空间的用户目录（/vol{n}/1000）优先：那才是用户的照片所在
 			if sub, err := defaultUserDir(root); err == nil {
 				e := entry{Name: filepath.Base(root) + "/1000", Path: sub}
-				if !seen["@"+strings.ToLower(sub)] {
-					seen["@"+strings.ToLower(sub)] = true
+				if !seen["@"+pathKey(sub)] {
+					seen["@"+pathKey(sub)] = true
 					out.Dirs = append(out.Dirs, e)
 				}
 				continue

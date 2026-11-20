@@ -31,7 +31,7 @@ func Test1879ResumeBeforeReload(t *testing.T) {
 			"顺序反了会拿到占位图，缩略图永远停在白图")
 	}
 	// closeViewer 里不能再出现"同步重发"或"末尾延迟恢复"
-	i := strings.Index(s, "function closeViewer()")
+	i := strings.Index(s, "function closeViewer(")
 	if i < 0 {
 		t.Fatal("找不到 closeViewer")
 	}

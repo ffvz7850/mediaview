@@ -27,9 +27,17 @@ import (
 func Test2000HandlePregenPreservesOrderExec(t *testing.T) {
 	q := installThumbQueueSpy(t, 64)
 	withPreload(t, 2, true) // 自动通道开（PreloadConcurrency=2）
+	// 2.4.50（P1-4）：/api/pregen 现在对每个路径做白名单校验（原实现接受任意绝对
+	// 路径，等于让 root 进程替调用者解码白名单外的文件）。所以这里必须用
+	// **真实工作目录下的路径** —— 把 workDir 指到临时目录即可（workDir 是白名单根之一）。
+	base := withPregenRoot(t)
 
 	// 故意用**非有序**输入：若实现偷排或空转，这里会暴露。
-	paths := []string{"/d/m.jpg", "/d/b.jpg", "/d/x.txt", "/d/a.png", "/d/v.mp4"}
+	paths := []string{
+		filepath.Join(base, "m.jpg"), filepath.Join(base, "b.jpg"),
+		filepath.Join(base, "x.txt"), filepath.Join(base, "a.png"),
+		filepath.Join(base, "v.mp4"),
+	}
 	body, _ := json.Marshal(map[string]any{"paths": paths, "manual": false})
 	rec := httptest.NewRecorder()
 	handlePregen(rec, httptest.NewRequest("POST", "/api/pregen", bytes.NewReader(body)))
@@ -53,20 +61,33 @@ func Test2000HandlePregenPreservesOrderExec(t *testing.T) {
 func Test2000HandlePregenManualBypassesSwitch(t *testing.T) {
 	installThumbQueueSpy(t, 8)
 	withPreload(t, 0, true) // 后台预生成关闭，但缩略图总开关开
+	base := withPregenRoot(t)
+	img := filepath.Join(base, "a.jpg")
 
 	autoRec := httptest.NewRecorder()
-	autoBody, _ := json.Marshal(map[string]any{"paths": []string{"/d/a.jpg"}, "manual": false})
+	autoBody, _ := json.Marshal(map[string]any{"paths": []string{img}, "manual": false})
 	handlePregen(autoRec, httptest.NewRequest("POST", "/api/pregen", bytes.NewReader(autoBody)))
 	if n := pregenEnqueued(t, autoRec); n != 0 {
 		t.Fatalf("PreloadConcurrency=0 时自动通道不该入队，实际 enqueued=%d", n)
 	}
 
 	manRec := httptest.NewRecorder()
-	manBody, _ := json.Marshal(map[string]any{"paths": []string{"/d/a.jpg"}, "manual": true})
+	manBody, _ := json.Marshal(map[string]any{"paths": []string{img}, "manual": true})
 	handlePregen(manRec, httptest.NewRequest("POST", "/api/pregen", bytes.NewReader(manBody)))
 	if n := pregenEnqueued(t, manRec); n != 1 {
 		t.Fatalf("manual=true 应绕过后台预生成开关，实际 enqueued=%d", n)
 	}
+}
+
+// withPregenRoot 把 workDir 指到一个临时目录（workDir 是 allowedRoots 的一员），
+// 供 /api/pregen 的白名单校验通过。返回该目录，结束自动还原。
+func withPregenRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	old := workDir
+	workDir = dir
+	t.Cleanup(func() { workDir = old })
+	return dir
 }
 
 func pregenEnqueued(t *testing.T, rec *httptest.ResponseRecorder) int {

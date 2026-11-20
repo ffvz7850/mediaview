@@ -173,21 +173,33 @@ async function main() {
   await send('Runtime.enable');
   await send('Page.enable');
 
+  // 2.4.46：改成**同文档内分段采样**。
+  //   旧版靠 Page.addScriptToEvaluateOnNewDocument 每次换文档重新注一份探针 —— SPA 下
+  //   换目录不再换文档，那份探针只会停在首帧，读到的全是第一页的数字（假绿）。
+  //   现在只注一次，用 __mvMark() 在每个动作前把计数器归零，动作后按帧读。
   const probe = `(function(){
-    var P = { doc: 0, t0: performance.now(), frames: 0, firstCells: null, blankAfter: 0, maxCells: 0 };
+    var P = { doc: 0, t0: 0, frames: 0, firstCells: null, blankAfter: 0, maxCells: 0, gen: 0 };
     try { P.doc = (+sessionStorage.getItem('__mvpDoc') || 0) + 1; sessionStorage.setItem('__mvpDoc', P.doc); } catch (e) {}
     P.href = location.href;
     window.__mvProbe = P;
-    function tick() {
+    function tick(gen) {
+      if (gen !== P.gen) return;
       var c = document.getElementById('gridContent');
       var n = c ? c.children.length : 0;
       if (n > 0 && P.firstCells === null) P.firstCells = Math.round(performance.now() - P.t0);
       if (P.firstCells !== null && n === 0) P.blankAfter++;
       if (n > P.maxCells) P.maxCells = n;
       P.frames++;
-      if (P.frames < 400) requestAnimationFrame(tick);
+      if (P.frames < 400) requestAnimationFrame(function () { tick(gen); });
     }
-    requestAnimationFrame(tick);
+    window.__mvMark = function () {
+      P.gen++;
+      P.t0 = performance.now(); P.frames = 0; P.firstCells = null; P.blankAfter = 0; P.maxCells = 0;
+      P.href = location.href;
+      requestAnimationFrame(function () { tick(P.gen); });
+      return true;
+    };
+    window.__mvMark();
   })();`;
   await send('Page.addScriptToEvaluateOnNewDocument', { source: probe });
 
@@ -228,6 +240,30 @@ async function main() {
     throw new Error('等 ' + n + ' 个格子超时');
   };
 
+  // 打点后等"目标 URL 到位 + 格子够了 + 至少采到 20 帧"，再把探针连同 history.length 一起取回
+  const mark = () => evalJS('window.__mvMark(); true');
+  const waitMarked = async (part, minCells) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12000) {
+      try {
+        const s2 = await evalJS('({href:location.href, frames:window.__mvProbe.frames,' +
+          ' cells:(document.querySelectorAll("#gridContent > *").length), hl:history.length})');
+        if (s2 && s2.href.indexOf(part) >= 0 && s2.cells >= minCells && s2.frames >= 20) {
+          // 再给一帧余量：loadDir 的快照渲染里 scrollTop 是同步设的，但"列表回来后再校正
+          // 一次滚动"发生在微任务里 —— 太早读会把"刚要恢复的位置"读成 0（假失败）。
+          await sleep(220);
+          return await evalJS('({doc:window.__mvProbe.doc, t0:window.__mvProbe.t0,' +
+            ' frames:window.__mvProbe.frames, firstCells:window.__mvProbe.firstCells,' +
+            ' blankAfter:window.__mvProbe.blankAfter, maxCells:window.__mvProbe.maxCells,' +
+            ' href:location.href, hl:history.length,' +
+            ' cells:(document.querySelectorAll("#gridContent > *").length)})');
+        }
+      } catch (e) { /* 切换瞬时上下文可能短暂不可用 */ }
+      await sleep(80);
+    }
+    throw new Error('打点等待超时：' + part);
+  };
+
   const out = { root: null, sub: null, back: null, forward: null, scrolledAt: 0, forwardScroll: -1 };
 
   // 首访（没有任何快照）要等慢接口，这是正常的 —— 所以先等格子出来再读一次，
@@ -235,13 +271,13 @@ async function main() {
   await send('Page.navigate', { url: base + '?dir=/' });
   await waitReady('?dir=/');
   await waitCells(3);
-  out.root = await evalJS('window.__mvProbe');
+  await mark();
+  out.root = await waitMarked('?dir=/', 3);
 
-  // 点第一个文件夹（真的换文档）
+  // 点第一个文件夹：SPA 下**同一个文档**，但必须多一条历史
+  await mark();
   await evalJS("document.querySelector('#gridContent .cell-inner').click(); true");
-  await waitReady('dir=%2Fvol1%2F1000');
-  await waitCells(10);
-  out.sub = await evalJS('window.__mvProbe');
+  out.sub = await waitMarked('dir=%2Fvol1%2F1000', 10);
 
   // 记一个"看到第几屏"：返回/前进之后必须回到这里（否则永远跳回顶部）
   const SCROLL = 300;
@@ -250,12 +286,14 @@ async function main() {
   out.scrolledAt = await evalJS('document.getElementById("gridScroller").scrollTop');
 
   // 返回：应当是"退到上一个页面"，且页面靠快照立刻有内容（不等接口）
+  await mark();
   await evalJS('history.back(); true');
-  out.back = await waitReady('?dir=/');
+  out.back = await waitMarked('?dir=/', 3);
 
-  // 前进：同样是真文档 + 快照
+  // 前进：同样靠快照立刻有内容
+  await mark();
   await evalJS('history.forward(); true');
-  out.forward = await waitReady('dir=%2Fvol1%2F1000');
+  out.forward = await waitMarked('dir=%2Fvol1%2F1000', 10);
   out.forwardScroll = await evalJS('document.getElementById("gridScroller").scrollTop');
 
   console.log(JSON.stringify(out, null, 0));

@@ -18,7 +18,7 @@ import (
 
 const (
 	appName  = "mediaview"
-	version  = "2.4.45"
+	version  = "2.4.51"
 	gwPrefix = "/app/mediaview"
 )
 
@@ -149,10 +149,28 @@ func main() {
 	sig := <-sigCh
 	log.Printf("mediaview: received signal %v, shutting down gracefully...", sig)
 
-	// 1. 停止后台缩略图 worker（cancel 会通过 thumbCtx 通知所有 worker 退出）
+	// 0. 先停「接管系统缩略图」的那个 server 并删掉 socket 文件。
+	//    它和主 server 是两个独立监听：原来只 Shutdown 主 server，接管 socket 会随
+	//    进程消失而留下一个死地址文件，且文件管理器在退出瞬间仍可能连上来。
+	stopSystemThumbServer(3 * time.Second)
+
+	// 1. 若之前接管了系统缩略图（启动时 disable 了 auto_thumbnailer），退出前恢复它。
+	//    这一步是 P1：不恢复的话，卸载/升级/崩溃退出后**两套缩略图服务都没有**
+	//    （系统服务仍 disabled、接管 socket 随进程消失）→ 文件管理器缩略图全空，
+	//    用户只能手动 systemctl enable --now auto_thumbnailer。
+	//    幂等：没接管 / 系统没这个服务时直接返回；升级场景下"旧进程恢复→新进程再接管"
+	//    的短窗口由这层幂等掩盖（新进程启动会重新 disable 并接管）。
+	restoreSystemThumbnailerOnExit()
+
+	// 2. 停止后台缩略图 worker（cancel 会通过 thumbCtx 通知所有 worker 退出）
 	cancel()
 
-	// 2. 优雅关闭 HTTP server：等待正在处理的请求完成（最多 10 秒，超时后强制关闭）
+	// 3. 杀掉在途的 ffmpeg/ffprobe/vipsthumbnail 子进程并等它们退出。
+	//    cancel() 只取消 thumbCtx；实际在跑的转码用的是 bgctx（由 Background 派生）
+	//    或前台 Background —— 不 kill 就会变成孤儿进程继续吃 CPU/IO（二次审查 P3-16）。
+	killLiveCommands(3 * time.Second)
+
+	// 4. 优雅关闭 HTTP server：等待正在处理的请求完成（最多 10 秒，超时后强制关闭）
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -160,6 +178,26 @@ func main() {
 	} else {
 		log.Printf("mediaview: graceful shutdown complete")
 	}
+}
+
+// restoreSystemThumbnailerOnExit 退出时把系统 auto_thumbnailer 恢复回去（幂等）。
+//
+// 抽成独立函数而不是塞在 main 的行内流程里：退出路径此前**零测试覆盖**，
+// 而"启动入口的 disable 有测试、退出入口的 enable 没有"正是 P1-6 长期漏检的根因。
+// 现在它对同一份 settings 判断，行为可被单元测试直接驱动。
+func restoreSystemThumbnailerOnExit() {
+	if !getSettings().TakeoverSystemThumb {
+		return // 没接管过：系统服务本来就在跑，不需要动
+	}
+	if !systemThumbnailerAvailable() {
+		return // 系统没有这个服务（非飞牛环境 / 容器内）：调 systemctl 只会白打日志
+	}
+	if err := enableSystemThumbnailer(); err != nil {
+		log.Printf("mediaview: restore %s on exit failed: %v", systemThumbService, err)
+		return
+	}
+	invalidateSysThumbState() // 状态刚变过，别让缓存返回旧值
+	log.Printf("mediaview: %s restored on exit", systemThumbService)
 }
 
 func registerRoutes(mux *http.ServeMux) {

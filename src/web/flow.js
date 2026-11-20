@@ -426,7 +426,19 @@
       if (Math.abs(y - st.pinY) <= 2) cur = st.pinIdx;
       else st.pin = false;
     }
-    if (cur !== st.idx) st.idx = cur;
+    if (cur !== st.idx) {
+      st.idx = cur;
+      // 2.4.47：当前张变了就告诉宿主（app.js 会把它 replaceState 进 URL 的 `&p=`）。
+      //   为什么要同步：URL 是"我在看哪张"的唯一真相 —— 关掉大图后按"前进"要能回到
+      //   你离开时那张，而不是最初打开的那张（piGallery2 就是没做这一步，实测会跳回第一张）。
+      //   replace：换张不该涨历史（否则退出一张大图要按 N 次返回）。
+      if (HOST && typeof HOST.onIndex === 'function') {
+        try {
+          var it = st.list[cur];
+          if (it) HOST.onIndex(it.path);
+        } catch (e) { /* 回调失败不影响浏览 */ }
+      }
+    }
     updateHud();
     schedulePrefetch(st.idx);
   }
@@ -640,6 +652,8 @@
     available: function () { return !!(HOST || window.__mvFlowHost); },
     isOpen: function () { return !!st; },
     index: function () { return st ? st.idx : -1; },
+    // 2.4.47：当前这张的路径（app.js 用它写 URL）
+    path: function () { return st && st.list && st.list[st.idx] ? st.list[st.idx].path : ''; },
     open: open,
     close: close,
     // 只给单测/探针用：纯函数，不产生任何副作用

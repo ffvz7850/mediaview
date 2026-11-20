@@ -57,7 +57,9 @@ func samplePick(t *testing.T, media string) *coverPick {
 	return &coverPick{
 		V: coverCacheVersion, Dir: media, PickAt: 1762345678901,
 		Source: "direct", Depth: 0, Walked: 2,
-		Items:  []coverItem{{Path: img, Mtime: 1, Kind: "image"}},
+		// 2.4.50：coverStillValid 会比较 Items[].Mtime（P2-11），fixture 用真实值。
+		// （Mtime:1 会被判成"文件已被原地修改"，整个 samplePick 立刻失效。）
+		Items:  []coverItem{{Path: img, Mtime: imgMtime(t, img), Kind: "image"}},
 		Checks: []coverCheck{{Path: media, Mtime: st.ModTime().UnixMilli()}},
 	}
 }

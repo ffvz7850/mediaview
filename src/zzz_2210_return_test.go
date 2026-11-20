@@ -123,22 +123,28 @@ func Test2210HistoryDiscipline(t *testing.T) {
 		return ""
 	}
 
-	// ① 导航只用 location.href：每层目录 = 一条真实历史 ⇒ 宿主怎么数都能退。
+	// ① 2.4.46 契约：导航 = pushState + 就地渲染（**同一个文档**，不整页跳）。
+	//    每层目录仍然是一条历史（返回能逐层退），但返回不再触发文档重载。
 	for _, fn := range []string{"function navigateTo(", "function navigateRoot("} {
 		body := jsBody(fn)
 		if body == "" {
 			t.Fatalf("找不到 %s", fn)
 		}
-		if !strings.Contains(body, "location.href") || !strings.Contains(body, "?dir=") {
-			t.Errorf("★★ %s 必须用 location.href 真导航到 ?dir=（每层一条历史；"+
-				"replace/内部切换都会让会话只有一条历史 ⇒ 返回就退出应用）", fn)
+		if !strings.Contains(body, "pushNav(") {
+			t.Errorf("★★ %s 必须用 pushNav()（pushState）压一条历史 —— 返回要靠它逐层退", fn)
 		}
-		if strings.Contains(body, "loadDir(") || strings.Contains(body, "buildRoot(") {
-			t.Errorf("%s 不许再走内部切换 —— 那正是「返回就退出」那类问题的来源", fn)
+		if !strings.Contains(body, "rememberScroll();") {
+			t.Errorf("★ %s 必须调 rememberScroll()：离开前把\"看到第几屏\"写进快照", fn)
 		}
-		if strings.Contains(body, "history.") {
-			t.Errorf("%s 不许碰 history —— 真导航下历史由浏览器自己写", fn)
+		if strings.Contains(body, "history.replaceState(") {
+			t.Errorf("%s 不许用 replaceState：它只改当前条目，历史里不会多出一层", fn)
 		}
+	}
+	if !strings.Contains(jsBody("function navigateTo("), "loadDir(") {
+		t.Error("★★ navigateTo 必须就地 loadDir()：整页导航会让每次返回都重载文档")
+	}
+	if !strings.Contains(jsBody("function navigateRoot("), "buildRoot()") {
+		t.Error("★★ navigateRoot 必须就地 buildRoot()")
 	}
 	// 逐层返回必须复用同一条导航路径（进目录真导航、回上级内部切换 = 两套语义）。
 	upBody := jsBody("function goUpLevel(")
@@ -146,48 +152,71 @@ func Test2210HistoryDiscipline(t *testing.T) {
 		t.Error("goUpLevel 必须走 navigateTo / navigateRoot（与进目录同一条路径）")
 	}
 
-	// ② 唯一的一处压栈：查看器
+	// ② 压栈点只有一处出口：pushNav（目录层和查看器共用）
 	if n := strings.Count(app, "history.pushState("); n != 1 {
-		t.Errorf("★★ history.pushState( 应恰好 1 处（查看器那一条），实际 %d 处 —— "+
-			"网格层与层之间由真导航负责，再压就是重复记账（返回要按两次）", n)
+		t.Errorf("★★ history.pushState( 应恰好 1 处（都在 pushNav 里），实际 %d 处 —— "+
+			"多出来就是重复记账（返回要按两次）", n)
 	}
+	if !strings.Contains(jsBody("function pushNav("), "history.pushState(") {
+		t.Error("★★ pushNav() 必须是唯一的 pushState 出口")
+	}
+	// 2.4.47：查看器必须把「看哪张」写进 URL（&p=），否则又回到"靠 state 记账"，
+	//   一旦 pop 落点与预期不符，URL 上看不出差别，界面就会和 URL 脱节。
 	viewerBody := jsBody("function openViewerOverlay(")
-	if !strings.Contains(viewerBody, "history.pushState(") || !strings.Contains(viewerBody, "mvViewer: 1") {
-		t.Error("openViewerOverlay() 里必须压一条带 mvViewer 标记的**查看器历史** —— " +
-			"否则在查看器里按返回会直接退到上一层目录页（真导航会整页重载）")
+	if !strings.Contains(viewerBody, "pushNav({ mvViewer: 1 }, curPath(), target.path)") {
+		t.Error("★★ openViewerOverlay() 必须用 pushNav 把 `&p=` 写进 URL —— " +
+			"URL 里看不见大图，就等于又回到靠内部状态记账")
 	}
-	if !strings.Contains(app,
-		"if (PROFILE === 'touch' && !singleMode) window.addEventListener('popstate', mvOnPop);") {
-		t.Error("popstate 接线必须是 `if (PROFILE === 'touch' && !singleMode) ...` —— " +
-			"① 只在触屏档（桌面没有返回手势）；② 单图窗口本身就是一层，挂上去会抢走「关窗」")
+	if !strings.Contains(jsBody("function navUrl("), "'&p='") {
+		t.Error("★★ navUrl() 必须支持 `&p=`：大图是 URL 的一层，不能只藏在 history.state 里")
+	}
+	if !strings.Contains(viewerBody, "opts.fromUrl") {
+		t.Error("★ openViewerOverlay() 必须认 fromUrl：从 URL 打开（前进/刷新/深链）时不能再压一条")
+	}
+	if !strings.Contains(app, "if (!singleMode) window.addEventListener('popstate', mvOnPop);") {
+		t.Error("popstate 接线必须是 `if (!singleMode) ...` —— " +
+			"SPA 下桌面浏览器的后退键同样会换 URL 而不重载，不接管就是一片空白状态；" +
+			"单图窗口本身就是一层，挂上去会抢走「关窗」")
 	}
 	if n := strings.Count(app, "'popstate'"); n != 1 {
 		t.Errorf("popstate 应恰好注册 1 处，实际 %d 处 —— 重复注册会让一次返回被处理多次", n)
 	}
 
-	// ③ back 只允许出现在 closeViewer 的主动关闭路径
-	if n := strings.Count(app, "history.back("); n > 1 {
-		t.Errorf("history.back( 最多 1 处（只允许 closeViewer 的主动关闭路径），实际 %d 处", n)
+	// ③ back 只允许两处：closeViewer 的主动关闭补偿 + goUpLevel 的"从上一层点进来"回退
+	if n := strings.Count(app, "history.back("); n != 2 {
+		t.Errorf("history.back( 应恰好 2 处（closeViewer 补偿 / goUpLevel 回退），实际 %d 处", n)
+	}
+	if !strings.Contains(jsBody("function goUpLevel("), "cur.from === up") {
+		t.Error("★★ goUpLevel 必须按 from 判定：从上一层点进来的话应 history.back()，" +
+			"而不是再压一条（否则历史成锯齿，返回会退回刚离开的子目录）")
 	}
 	closeBody := jsBody("function closeViewer(")
 	if !strings.Contains(closeBody, "history.back(") {
-		t.Error("closeViewer() 必须补一次 history.back() —— 打开查看器时压了一条 mvViewer 条目，" +
-			"点关闭按钮/背景/Esc 主动关闭时不收回，用户下一次返回会直接退掉一层目录（多退一层）")
+		t.Error("closeViewer() 必须补一次 history.back() —— 打开查看器时压了一条条目，" +
+			"主动关闭（✕/背景/Esc/流内下滑）不收回，用户下一次返回会直接退掉一层目录")
 	}
-	if !strings.Contains(closeBody, "mvViewerFromPop") {
-		t.Error("closeViewer() 必须按 mvViewerFromPop 分流 —— 返回触发时历史已经退了，" +
+	if !strings.Contains(closeBody, "urlState().photo") {
+		t.Error("★ closeViewer() 必须按 URL 里有没有 `p` 判断该不该退历史 —— URL 是唯一真相，" +
+			"不要再靠 mvViewerFromPop 这种内部标记（它会和真实落点脱节）")
+	}
+	if !strings.Contains(closeBody, "opts.fromUrl") {
+		t.Error("★★ closeViewer() 必须按 fromUrl 分流 —— 返回触发时 URL 已经退好了，" +
 			"此时再补一次 back 就是一次返回退两层")
 	}
-	if !strings.Contains(closeBody, "history.state") || !strings.Contains(closeBody, "mvViewer") {
-		t.Error("closeViewer() 必须先确认栈顶确实是我们的查看器条目（history.state.mvViewer），再退历史")
+	if strings.Contains(closeBody, "mvViewerFromPop") {
+		t.Error("★★ closeViewer() 不许再用 mvViewerFromPop：那套内部标记正是" +
+			"「一次滑动退两层」的来源，2.4.47 已改成「URL 有没有 p」")
 	}
 	if strings.Contains(jsBody("function mvOnPop("), "history.") {
 		t.Error("mvOnPop 里不许碰历史 —— 那时历史已经退了，再退一次会和宿主那一次叠加（一滑退两层）")
 	}
 
-	// ④ replaceState 只在 fixEntryURL（把首条条目改名成显式目录）
-	if n := strings.Count(app, "history.replaceState("); n != 1 {
-		t.Errorf("history.replaceState( 应恰好 1 处（fixEntryURL），实际 %d 处", n)
+	// ④ replaceState = replaceNav 一处（换张 / 收 p）+ fixEntryURL 两个分支
+	if n := strings.Count(app, "history.replaceState("); n != 3 {
+		t.Errorf("history.replaceState( 应恰好 3 处（replaceNav + fixEntryURL 两分支），实际 %d 处", n)
+	}
+	if !strings.Contains(jsBody("function replaceNav("), "history.replaceState(") {
+		t.Error("★★ replaceNav() 必须承担「同一层里换状态」——大图内换张不许涨历史")
 	}
 	fixBody := jsBody("function fixEntryURL(")
 	if !strings.Contains(fixBody, "history.replaceState(") {

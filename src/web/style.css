@@ -500,6 +500,22 @@ body {
    2.2.1 按用户要求把那个弹层连同 DOM 一起删掉了 —— 第一级返回改成**无响应**，
    不再需要任何确认框。别只删样式不删 DOM（会留下一坨看不见的死标记）。 */
 
+/* ================= 通用确认弹层（askConfirm，2.4.50）=================
+   结构复用 .modal / .modal-mask / .modal-box（见 index.html #askConfirm）。
+   z-index 必须高于设置弹层（150）："清除所有数据"这个按钮就在设置页里，
+   自绘层若被设置页盖住，等于又变回"点了没反应"。
+   toast 是 200，仍然在最上面。 */
+#askConfirm { z-index: 180; }
+.ask-box { width: min(460px, 100%); }
+.ask-text {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  /* 文案里带 \n 分段（与原来原生 confirm 的文案一致），必须保留换行 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .set-row {
   display: flex;
   align-items: center;

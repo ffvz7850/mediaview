@@ -23,7 +23,7 @@ func appJS1872(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(b)
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
 
 func Test1872SwipeDoesNotDropClicks(t *testing.T) {
