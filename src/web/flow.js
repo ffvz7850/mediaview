@@ -137,11 +137,18 @@
     }
   }
 
+  // spacer 高度缓存（2.4.53）：render() 每帧都会调本函数，而窗口在两次滑动之间
+  // 大多数帧是不变的 —— 无条件写 style.height 会让这两张 spacer 每帧都被标脏、
+  // 连带整条列表重算样式。只在真的变了的时候写。
+  var spTopH = '', spBotH = '';
+
   function updateSpacers() {
     if (!st) return;
     var n = st.list.length;
-    topSp.style.height = st.pre[st.start] + 'px';
-    botSp.style.height = Math.max(0, st.pre[n] - st.pre[st.end]) + 'px';
+    var a = st.pre[st.start] + 'px';
+    var b = Math.max(0, st.pre[n] - st.pre[st.end]) + 'px';
+    if (a !== spTopH) { topSp.style.height = a; spTopH = a; }
+    if (b !== spBotH) { botSp.style.height = b; spBotH = b; }
   }
 
   // clearItems 删掉两个 spacer 之间的所有条目（含断源），保留 spacer 本身
@@ -468,19 +475,37 @@
       var i = st.queue.shift();
       var it = st.list[i];
       if (!it || it.kind !== 'image' || st.warm[i]) continue;
-      var im = new Image();
-      im.fetchPriority = 'low';
-      // prefetch=1 是后端既有契约：不触发「用户在看大图」、不抢前台缩放槽
-      im.src = HOST.rawURL(it.path, HOST.pickMaxdim(), it.mtime) + '&prefetch=1';
-      st.warm[i] = im;
+      // 2.4.53：预取改用 fetch + 请求头，**URL 与 mount() 建的 <img> 逐字节一致**。
+      //
+      // 旧写法是 `new Image()` + `'&prefetch=1'` —— 多一个查询参数就是另一个缓存键，
+      // 于是同一张图被下两遍：预取一遍（带参数），滚到它时 <img> 再下一遍（干净 URL）。
+      // 手机上就是「往下滑一格，白走几百 KB」。而且 Image 解出的位图无法交给 <img> 复用，
+      // 那次 decode 纯属白做（实测每滚一屏 1.3 次多余解码）。
+      // 「这是预取」的信息走后端既有的 X-MediaView-Prefetch 请求头，URL 保持干净。
+      st.warm[i] = 1;
       st.inflight++;
-      var done = function () {
-        if (!st) return;
-        st.inflight--;
-        pump();
-      };
-      if (im.decode) im.decode().then(done, done);
-      else im.onload = done, im.onerror = done;
+      startWarm(i, HOST.rawURL(it.path, HOST.pickMaxdim(), it.mtime));
+    }
+  }
+
+  // startWarm 单独成一个函数：`i` 必须按次捕获（写成 var 会让所有回调共用同一个下标，
+  // 失败标记就会打到最后那一张上）。
+  function startWarm(i, url) {
+    var done = function (ok) {
+      if (!st) return;
+      st.inflight--;
+      if (!ok) st.warm[i] = 0;   // 预取失败就别记着"已热"，下次滚动再试
+      pump();
+    };
+    try {
+      fetch(url, { headers: { 'X-MediaView-Prefetch': '1' }, priority: 'low' })
+        .then(function (r) {
+          if (!r || !r.ok) { done(false); return; }
+          return r.blob().then(function () { done(true); }, function () { done(false); });
+        })
+        .catch(function () { done(false); });
+    } catch (e) {
+      done(false);   // 同步抛：把并发计数还回去，别把预取永久闸住
     }
   }
 
@@ -562,6 +587,9 @@
 
     // 清掉上一次的残留子元素（只保留上下两个 spacer）
     clearItems();
+    // 2.4.53：spacer 高度缓存也要清 —— close() 把 DOM 归零了，缓存若留着上一次的值，
+    // 下面的 updateSpacers 会以为"没变"而不写，spacer 停在 0px，滚动高度为 0。
+    spTopH = ''; spBotH = '';
 
     rebuildHeight();
     // 2.4.32：**必须先把 spacer 撑起来再设 scrollTop**。
@@ -636,6 +664,9 @@
       clearItems();
       if (topSp) topSp.style.height = '0px';
       if (botSp) botSp.style.height = '0px';
+      // 与上面两行同步：缓存不归零的话，下次 open 时"值和上次一样"会让 updateSpacers
+      // 以为不用写，spacer 就停在 0px —— 滚动高度为 0，打开任何一张都会被 clamp 到顶部。
+      spTopH = '0px'; spBotH = '0px';
     }
     if (scrollEl) scrollEl.scrollTop = 0;
     var vWrap = document.getElementById('vMediaWrap');

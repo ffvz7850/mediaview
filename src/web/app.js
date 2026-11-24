@@ -2745,17 +2745,50 @@
       var it = v.list[idx];
       if (!it || it.kind !== 'image' || !it.path) continue;
       if (inTrack[normPath(it.path)]) continue; // 轨道里已有 → 它会自己加载
-      var im = new Image();
-      im.fetchPriority = 'low';
-      // 1.8.153：带上后端的预取标记。
-      //
-      // 后端契约（media.go）明确把预取排除在"用户正在看大图"之外：
-      // 不带头会被当成真实请求 → 触发 noteForegroundPreview() → **kill 掉正在跑的后台预生成**
-      // （thumb.go 的 cancelBackgroundCtx），而且用阻塞方式抢 scaledSem 的槽，
-      // 把你正在等的那张往后推。
-      // 网格里的悬停预取一直是对的（fetch + X-MediaView-Prefetch 头），这里是同一条契约。
-      im.src = rawURL(it.path, pickMaxdim(), it.mtime) + '&prefetch=1';
-      if (im.decode) im.decode().catch(function () {});
+      warmFetch(rawURL(it.path, pickMaxdim(), it.mtime));
+    }
+  }
+
+  // ---------- 轨道预取（2.4.53 重写：同一张图不再下两遍）----------
+  //
+  // 旧写法：`new Image(); im.src = rawURL(...) + '&prefetch=1'`。问题在于**多一个查询参数
+  // 就是另一个缓存键** —— 预取把这张图下了一遍（带 &prefetch=1），切过去时轨道盒子建出来
+  // 又是干净 URL，于是**同一张图再下第二遍**。大图画质档下每张约几百 KB，手机上就是
+  // 「滑一下多走几百 KB」，实测一次切图的 /api/raw 请求数 1.67、每次还要真解码一遍
+  // （Image 解码出的位图无法交给 <img> 复用，纯浪费）。
+  //
+  // 现在改用 fetch + 请求头：**URL 与轨道盒子逐字节一致**，浏览器 HTTP 缓存直接命中，
+  // 盒子建出来时是 0 请求；而 fetch 不产生 <img>，也就不多解一次码。
+  // 「这是预取」的信息走后端已经支持的 X-MediaView-Prefetch（media.go 优先读请求头，
+  // ?prefetch=1 仅为兼容保留），语义与网格里的悬停预取是同一条契约。
+  var WARM_MAX = 2;              // 同时在飞的预取上限：预取是尽力而为，不跟主图抢连接
+  var warmInFlight = 0;
+  var warmDone = {};             // url -> 1：本次页面会话里已经预取成功过的
+  var warmDoneCount = 0;
+
+  function warmFetch(url) {
+    if (!url) return;
+    if (warmDone[url]) return;                 // 已预取过（缓存已热），不重复发
+    if (warmInFlight >= WARM_MAX) return;      // 忙就别添乱：切过去时再正常加载
+    if (typeof fetch !== 'function') return;   // 极老 WebView：放弃预取，不影响功能
+    warmInFlight++;
+    var fin = function (ok) {
+      if (warmInFlight > 0) warmInFlight--;
+      if (ok) {
+        warmDone[url] = 1;
+        if (++warmDoneCount > 300) { warmDone = {}; warmDoneCount = 0; }  // 别无限涨
+      }
+    };
+    try {
+      fetch(url, { headers: { 'X-MediaView-Prefetch': '1' }, priority: 'low' })
+        .then(function (r) {
+          if (!r || !r.ok) { fin(false); return null; }
+          // 必须读掉 body，浏览器才会把它写进 HTTP 缓存（否则连接被丢弃 = 白下）
+          return r.blob().then(function () { fin(true); }, function () { fin(false); });
+        })
+        .catch(function () { fin(false); });
+    } catch (e) {
+      fin(false);   // 同步抛（沙箱限制等）：把并发计数还回去，别把预取永久闸住
     }
   }
 
@@ -2811,21 +2844,49 @@
     return d;
   }
 
-  // 把轨道结构调整成「中间那张 = v.list[v.index]」，并**复用 DOM 里已有的那一盒**。
+  // 把轨道结构调整成「中间那张 = v.list[v.index]」，并**复用 DOM 里已有的每一盒**。
   // 为什么必须复用：重建会新建 <img> 元素，而新元素在 decode 完成前是 visibility:hidden，
   // 于是画面会「消失一下再出现」。复用同一个元素时位图还在内存里，重新插入后立即可绘制。
   // 用于「动画期间再次切换」这类需要立刻跳到目标图的场景。
+  //
+  // 2.4.53（手机"滑动有点卡"的主因之一）：原来只复用**当前那张**，prev / next 每次都
+  //   createMediaBox 新建。实测一次切图 = 新建 2 个 <img> + 7.8 次 decode() + 1.7 次
+  //   图片请求 + 21ms 主线程，而这些都落在动画收尾那一帧上。可刚滑走的那张**位图还在
+  //   内存里**，挪到 prev 位就够了 —— 零请求、零解码、零空窗。
+  //   现在按路径认领三个槽位：谁在就留谁，只补真正缺的那一格。
   function syncTrackToIndex(track) {
     var want = v.list[v.index];
     if (!want) return null;
-    var wantPath = normPath(want.path);
+    var pre = cfg.viewerPreload >= 1;
+    // 目标三槽：prev / cur / next（越界给 null）
+    var slots = [
+      (pre && v.index > 0) ? v.list[v.index - 1] : null,
+      want,
+      (pre && v.index < v.list.length - 1) ? v.list[v.index + 1] : null
+    ];
+    var slotPath = ['', '', ''];
+    for (var s = 0; s < 3; s++) {
+      if (slots[s] && slots[s].path) slotPath[s] = normPath(slots[s].path);
+    }
+    // 认领：现有子元素路径命中某槽位就留（同一路径只认第一个）
+    var keepBox = [null, null, null];
     var keep = null;
     for (var i = 0; i < track.children.length; i++) {
       var b = track.children[i];
-      if (b._itemPath && normPath(b._itemPath) === wantPath) { keep = b; break; }
+      if (!b._itemPath) continue;
+      var bp = normPath(b._itemPath);
+      for (var s2 = 0; s2 < 3; s2++) {
+        if (slotPath[s2] && slotPath[s2] === bp && !keepBox[s2]) {
+          keepBox[s2] = b;
+          if (s2 === 1) keep = b;
+          break;
+        }
+      }
     }
-    // 先把要复用的盒子摘出来，再清空轨道，否则它会被一起清掉
-    if (keep && keep.parentNode) keep.parentNode.removeChild(keep);
+    // 先把要复用的盒子都摘出来，再清空轨道，否则它们会被一起清掉
+    for (var s3 = 0; s3 < 3; s3++) {
+      if (keepBox[s3] && keepBox[s3].parentNode) keepBox[s3].parentNode.removeChild(keepBox[s3]);
+    }
     while (track.firstChild) {
       var old = track.firstChild;
       stopMedia(old._media);   // 统一出口（原来这里手写 pause，容易漏）
@@ -2833,23 +2894,27 @@
     }
     track.classList.remove('anim');
     track.style.transitionDuration = '';
-    var curBox = keep || createMediaBox(want, true);
-    var nextBox = emptyBox();
-    if (cfg.viewerPreload >= 1 && v.index < v.list.length - 1) {
-      nextBox = createMediaBox(v.list[v.index + 1], false);
+    // 逐槽取盒子：能认领就用认领到的，认不到的才新建。
+    // prev / next 新建是"位图不在内存"，代价与本项目 2.3.0 P1 的对称预载一致，
+    // 由 viewerPreload 控制（>=1 时才做）。
+    var boxes = [];
+    for (var s4 = 0; s4 < 3; s4++) {
+      var box = keepBox[s4];
+      if (!box && slots[s4]) box = createMediaBox(slots[s4], s4 === 1);
+      if (!box) box = emptyBox();
+      if (s4 === 1 && keep) box = keep;
+      if (keepBox[s4]) {
+        // 复用的盒子可能还带着手势缩放留下的 transform（它就是"刚滑走那张"）。
+        // 不清掉的话，它下次作为当前图被画出来时会被旧倍数放大。
+        var bm = box._media;
+        if (bm && bm.style && bm.style.transform) bm.style.transform = '';
+      }
+      boxes.push(box);
     }
-    // prev 也必须预建真实媒体。
-    // 一直用空占位时：向**后退**的目标格是空的，必须临时新建 <img> 并等它 decode，
-    // 这中间就是空窗 —— 用户看到「点倒退会闪图」。而**前进不闪**正是因为 next 格
-    // 一直是真实元素（位图已在内存，移进来即可立即绘制）。
-    // 代价是多预载一张相邻图；由 viewerPreload 控制（>=1 时才做）。
-    var prevBox = emptyBox();
-    if (cfg.viewerPreload >= 1 && v.index > 0) {
-      prevBox = createMediaBox(v.list[v.index - 1], false);
-    }
-    track.appendChild(prevBox);
+    var curBox = boxes[1];
+    track.appendChild(boxes[0]);
     track.appendChild(curBox);
-    track.appendChild(nextBox);
+    track.appendChild(boxes[2]);
     track.style.transform = 'translateX(-100%)';
     v.media = curBox._media;
     v.hiSrc = '';
@@ -2890,6 +2955,31 @@
     }
   }
 
+  // 切换动画**开始时**就把「再下一张」的盒子建好并挂进轨道（排在右侧看不见的位置）。
+  //
+  // 2.4.53（手机"滑动有点卡"）：这一步原来只发生在**收尾时**（syncTrackToIndex 现建）。
+  //   收尾那一刻正是动画刚结束、最容易卡一下的时刻 —— 在那里新建 <img>、发请求、
+  //   解码、上传纹理，用户看到的就是"滑到位之后停一下才出新图"，或者紧接着再滑
+  //   一张时看到转圈。提前 200ms 建好，动画期间它自己加载完；收尾时
+  //   syncTrackToIndex 直接认领它，**新建数是 0**。
+  //
+  // 为什么不靠 warmTrackBoxes 的预取顶上：那是个独立 Image/fetch，位图无法交给
+  //   <img> 复用，最后还是得再建一个元素、再解一次（实测就是这样白解了两遍）。
+  function prewarmNeighborBox(track, dir) {
+    if (!track || (dir !== 1 && dir !== -1)) return;
+    if (cfg.viewerPreload < 1) return;
+    var ni = v.index + dir;
+    if (ni < 0 || ni >= v.list.length) return;
+    var it = v.list[ni];
+    if (!it || !it.path) return;
+    var p = normPath(it.path);
+    for (var i = 0; i < track.children.length; i++) {
+      var b = track.children[i];
+      if (b._itemPath && normPath(b._itemPath) === p) return;   // 已在轨道里，别重复建
+    }
+    track.appendChild(createMediaBox(it, false));
+  }
+
   // 大图加载指示与「露面」时机（用法见 createMediaBox）
   var VIEWER_SPIN_DELAY = 150;      // 延时多久才显示转圈：缓存命中时它根本不出现
   var VIEWER_SPIN_MIN = 300;        // 一旦显示就至少停这么久，避免刚出现就消失地抖一下
@@ -2915,10 +3005,18 @@
   // 收敛成唯一一处的意义：现在有三个地方曾能改 visibility
   // （createMediaBox / img.onload / ensureMediaVisible），只要一处不看 decode，闪就会回来。
   function revealImage(img) {
-    if (!img || img._revealed) return;
+    // 2.4.53：`_revealing` = "已经有一次 decode() 在飞"。
+    //
+    // 为什么需要：revealImage 有三条入口（createMediaBox 的 complete 快检、img.onload、
+    // ensureMediaVisible 的收尾自检），它们在"缓存命中"时会在同一个任务里连着进来两次 ——
+    // 那时 _revealed 还没置上，于是**同一个元素被 decode() 了两次**。
+    // 大图一次解码就是几十毫秒 + 一次纹理上传，翻页动画期间白做一遍。
+    if (!img || img._revealed || img._revealing) return;
+    img._revealing = true;
     var show = function () {
       if (img._revealed) return;
       img._revealed = true;
+      img._revealing = false;
       var doReveal = function () {
         img.style.visibility = '';          // visibility 无过渡，这一步就是"露面"本身
         img.classList.add('loaded');
@@ -3548,11 +3646,16 @@
     if (dir === -1) {
       track.style.transform = 'translateX(0)';
       v.index--;
+      // 顺序要紧：先建「再前一张」的盒子（让它在动画期间就开始加载），
+      // 再 warm —— warm 的 inTrack 判定会看到它已在轨道里，于是只预取更远的那几张，
+      // 不会出现"预取一次 + 建盒子再一次"的重复下载。
+      prewarmNeighborBox(track, -1);
       warmTrackBoxes(typeof dir === 'number' ? dir : 1);
       settleAfterSwipe(track, -1);
     } else if (dir === 1) {
       track.style.transform = 'translateX(-200%)';
       v.index++;
+      prewarmNeighborBox(track, 1);
       warmTrackBoxes(typeof dir === 'number' ? dir : 1);
       settleAfterSwipe(track, 1);
     } else {
@@ -3795,6 +3898,9 @@
     if (dir < 0) { track.style.transform = 'translateX(0)'; }
     else { track.style.transform = 'translateX(-200%)'; }
     // 方案二：动画开始就预加载新 next，不等 transitionend
+    // 2.4.53：先把「再下一张」的盒子建好（动画期间它自己加载），再 warm。
+    //   warm 的 inTrack 判定会跳过它，只预取更远的那几张 —— 同一张图不再下两遍。
+    prewarmNeighborBox(track, dir);
     warmTrackBoxes(typeof dir === 'number' ? dir : 1);
     settleAfterSwipe(track, dir);
   }

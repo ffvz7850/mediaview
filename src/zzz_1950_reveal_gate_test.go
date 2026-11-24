@@ -184,8 +184,16 @@ func Test1951WarmIsDirectionalAndCounted(t *testing.T) {
 	if !strings.Contains(rest, "v.index + step * k") {
 		t.Error("warmTrackBoxes 没有按**序号**取后续张（应该 v.index + step*k）")
 	}
-	if !strings.Contains(rest, "new Image()") {
-		t.Error("轨道外的那几张必须新建 Image 才会真的发请求")
+	// 2.4.53：预取从 `new Image()` + `&prefetch=1` 改成 fetch + X-MediaView-Prefetch 请求头。
+	//   要求本身**没变**（轨道外那几张必须真的发请求、必须被后端当成预取），
+	//   但实现方式必须变：带查询参数的 URL 与轨道盒子的 URL 不是同一个缓存键
+	//   ⇒ 同一张图下两遍 ⇒ 手机上一次切图白走几百 KB。
+	if !strings.Contains(rest, "warmFetch(") && !strings.Contains(rest, "new Image()") {
+		t.Error("轨道外的那几张必须真的发请求（warmFetch / new Image）")
+	}
+	if strings.Contains(rest, "'&prefetch=1'") {
+		t.Error("★★ 预取不许再往 URL 上加 &prefetch=1：它与轨道盒子的 URL 不同，是另一个缓存键，" +
+			"同一张图会被下两遍。预取性质走 X-MediaView-Prefetch 请求头（后端 media.go 优先读它）")
 	}
 }
 

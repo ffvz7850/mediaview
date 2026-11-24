@@ -93,8 +93,11 @@ func Test2429SettingsWiring(t *testing.T) {
 	for _, needle := range []string{
 		"window.MVFlow", "vfItemHeight", "vfIndexAt", "vfWindow",
 		// ⚠️ 这几个必须用"代码字面量"而不是裸词：flow.js 的**块注释**里也写了
-		//    &prefetch=1 / decode() / maxdim，裸词断言会被注释骗过（实测假绿过一次）。
-		"'&prefetch=1'",                          // 预载必须带后端既有的预取标记（不抢前台槽）
+		//    prefetch / decode() / maxdim，裸词断言会被注释骗过（实测假绿过一次）。
+		// 2.4.53：预取标记从 URL 参数改成请求头。要求没变（预载必须被后端识别为预取、
+		//    不抢前台缩放槽），但**必须走请求头**：带查询参数的 URL 与 mount() 里 <img>
+		//    的 URL 不是同一个缓存键 ⇒ 同一张图下两遍（手机上下滑一格白走几百 KB）。
+		"X-MediaView-Prefetch",                   // 预载必须带后端既有的预取标记（不抢前台槽）
 		"HOST.rawURL(it.path, HOST.pickMaxdim()", // 画质沿用大图浏览那套设置
 		"img.decode()",                           // 解码完成再露面
 		"el.style.height = st.h[i]",              // 整数高度（无缝）
@@ -104,6 +107,10 @@ func Test2429SettingsWiring(t *testing.T) {
 		if !strings.Contains(flow, needle) {
 			t.Errorf("★ flow.js 缺关键实现 %q", needle)
 		}
+	}
+	if strings.Contains(flow, "'&prefetch=1'") {
+		t.Error("★★ 预取 URL 不许再带 &prefetch=1：它与 mount() 里 <img> 的 URL 不同，" +
+			"同一张图会被下两遍（预取一遍 + 盒子一遍）。预取性质走 X-MediaView-Prefetch 请求头")
 	}
 
 	// ---------- 2.4.30：图片分支不许再碰缩略图 ----------

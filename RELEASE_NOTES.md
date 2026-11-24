@@ -1,60 +1,76 @@
-# mediaview 2.4.51 发布说明
+# mediaview 2.4.53 发布说明
 
 > 极速媒体浏览 —— 飞牛 fnOS 图片/视频极速浏览 FPK 应用
 > 仓库：https://github.com/ffvz7850/mediaview
-> 版本：2.4.51（x86 / ARM 双架构）
+> 版本：2.4.53（x86 / ARM 双架构）
 
 ---
 
 ## 一句话
 
-修复一个历史一直存在、用户可感知的封面问题：**文件夹封面已全部预生成，但"一键生成后立刻进入路径"仍会重新合成一份**；等十几秒再进就正常。
-2.4.51 从根因上修掉这个时序 bug，并补上行为级回归测试把它钉死。
+手机上"大图浏览滑一下有点卡"这次不靠猜：先用真实后端 + 真实尺寸照片把**一次切图到底做了多少事**
+量出来，再按数字改 —— 新建 `<img>` 2→1、`decode()` 7.83→3、图片请求 1.67→0.5、
+主线程耗时约 21ms→约 9.5ms。
 
 ---
 
-## 问题与修复
+## 量到什么
 
-### 现象
+探针（`_work/probe/swipe_probe.js`）：headless Chromium + CDP + 本仓库真实 Go 后端 +
+12 张 4032×3024 实拍级 JPEG；钩住 `document.createElement('img')`、
+`HTMLImageElement.prototype.decode`、`/api/raw` 资源条目，同时读 CDP 的
+`TaskDuration` / `LayoutCount`。一次动作 = 点一次「下一张」。
 
-封面明明都生成好了，进入目录时却又重新生成一份；等一小会儿再进就正常。
+| 指标（每次切一张） | 改前 | 改后 |
+|---|---|---|
+| 新建 `<img>` 元素 | 2.0 | **1.0** |
+| `decode()` 调用次数 | 7.83 | **3.0** |
+| `/api/raw` 请求数 | 1.67 | **0.5** |
+| 主线程 TaskDuration | ~21ms | ~9.5ms |
 
-### 根因
-
-系统会把"这张封面有效/无效"的结论在内存里缓存 8 秒（`coverValidTTL`）。
-以前浏览时若某目录暂时没封面，就记下一条"无效"。等"一键生成"把封面写好、新元数据也落盘后，
-**写入端没有清掉这条旧的"无效"结论**——你紧接着进目录，读到的还是 8 秒内的旧判断，
-于是把刚生成的封面判为失效、重新合成一份。等 8 秒缓存过期再进就恢复正常。
-
-这正好解释了"仅刚生成后短时间会重做、等一会就好"的时序特征。
-
-### 修法（`dircov.go` `saveCoverPick`）
-
-写入端每次写完封面元数据，立即作废这条 jpg 对应的旧有效性结论：
-
-```go
-coverValidCache.Delete(coverJPGOf(metaPath))
-```
-
-- 放在函数出口统一删，xattr 成功分支与 `.json` 回退分支都覆盖；
-- key 用 `coverJPGOf(metaPath)`，与读取端 `loadCoverPick → coverStillValidCached` 完全同口径，不会清错；
-- 不改封面元数据结构、不改挑选规则，因此**不需要重建已有封面缓存**（不 bump `coverCacheVersion`，避免十万目录级全量重抽的 IO 峰值）。
+对照同一份代码的 A/B 各跑 4 轮，计数完全稳定（不是抽样噪声）；TaskDuration 有抖动，但两轮区间不重叠。
 
 ---
 
-## 回归测试
+## 四个根因
 
-新增 `src/zzz_2451_cover_regen_test.go`（3 条）：
+### ① 预取和轨道盒子是**两个不同 URL** → 同一张图下两遍
 
-| 测试 | 作用 |
-|---|---|
-| `SaveCoverPickInvalidatesStaleValidity` | 端到端：塞 stale=false → 写 meta → 断言旧结论被清 + 立刻读取命中 |
-| `StaleFalseWouldBreakBrowseWithoutInvalidation` | 反向语义：证明 stale=false 确实会误判失效（bug 真实存在） |
-| `DeleteCoversBothWritePaths` | 静态闸门：确认 Delete 覆盖 xattr 分支、key 同口径 |
+`warmTrackBoxes`（左右滑）与 `flow.js pump`（竖图流）都用 `new Image()` +
+`'&prefetch=1'`；而轨道盒子建出来用的是干净 URL。**多一个查询参数就是另一个缓存键**：
+预取把这张图下了一遍，切过去时盒子又下第二遍。大图画质档每张几百 KB，手机上就是
+"滑一下白走几百 KB"。而且 `Image` 解出的位图无法交给 `<img>` 复用，那次解码纯属白做。
 
-**变异验证**：把修复（那行 `Delete`）去掉后，端到端测试与静态闸门精确变红，证明测试真能抓住回归、不是死断言。
+**修法**：两处都改成 `fetch(url, { headers: { 'X-MediaView-Prefetch': '1' } })` 并读掉 body
+（浏览器才会写进 HTTP 缓存）。这与网格里的悬停预取是同一条既有契约 —— 后端 `media.go`
+本来就优先读这个请求头（`?prefetch=1` 只是为兼容保留），语义完全没变，只是 URL 干净了。
+于是盒子建出来时是 **0 请求**。
 
-原有的 `Test2424ValidityTTLCachesResult`（TTL 函数语义）与 `zzz_2428`（refresh 清缓存）测的是正确行为，保留不动。
+### ② 收尾时重建了 2 个相邻盒子
+
+`syncTrackToIndex` 原来只复用"当前那张"，prev / next 每次 `createMediaBox` 新建 ——
+而这两次新建正好落在**翻页动画刚结束那一帧**。刚滑走那张的位图其实还在内存里。
+
+**修法**：改成按路径认领三个槽位（谁在就留谁，只补真正缺的）；并在动画**开始时**
+就把"再下一张"的盒子建好挂进轨道（`prewarmNeighborBox`），让它在动画那 200ms 里
+自己加载完。收尾时新建数 **0**。副作用是顺带修好了"紧接着再滑一张会看到转圈"。
+
+### ③ 同一个元素被 `decode()` 两次
+
+`revealImage` 有三条入口（`createMediaBox` 的 complete 快检、`img.onload`、
+`ensureMediaVisible` 的收尾自检）。缓存命中时它们会在同一个任务里连着进来，
+而那时 `_revealed` 还没置上 —— 大图一次解码几十毫秒 + 一次纹理上传，翻页时白做一遍。
+
+**修法**：加 `_revealing` 在飞标记。
+
+### ④ 竖图流每帧无条件写两个 spacer 高度
+
+`render()` 每帧调 `updateSpacers()`，而滑动窗口大多数帧并没有变 —— 无条件写
+`style.height` 会让两张 spacer 每帧都被标脏。
+
+**修法**：只在高度真的变了时写。**注意**缓存必须在 `open()` / `close()` 里同步归零，
+否则"值和上次一样"会让它跳过写入、spacer 停在 0px、滚动高度归零 —— 那就退化成
+2.4.31 那个"打开哪张都在最顶上"的 bug 了。
 
 ---
 
@@ -62,26 +78,46 @@ coverValidCache.Delete(coverJPGOf(metaPath))
 
 | 项 | 结果 |
 |---|---|
-| `gofmt -l *.go` | 无差异 |
-| `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
-| `go test`（全量，含 3 条新测试） | 全部通过（11 项环境相关用例按基线跳过：无 ffmpeg、无符号链接权限、Z 盘实拍） |
-| 变异验证（去掉修复） | 新测试变红，确认有效 |
-| `node --check web/app.js` | 通过 |
-| 二进制 | x86 / ARM 均按 `-trimpath -ldflags "-s -w"` 重新构建，版本串为 2.4.51 |
+| `go build ./...` | 通过 |
+| `go test`（全量） | **356 通过 / 11 跳过 / 0 失败**（跳过项为环境相关：无 ffmpeg、无符号链接权限、Z 盘实拍） |
+| `node --check web/app.js`、`web/flow.js` | 通过 |
+| 真浏览器行为回归 | 连点 4 次「下一张」+ 4 次「上一张」，逐格断言"计数指向那张 == 轨道中间那格"、轨道恒 3 格、中间那张可见且 transform 归位 —— 9 个检查点全 OK |
+| 放大后切图 | 复用"刚滑走那张"时清掉它残留的 transform，已验 |
+
+两条闸门测试被**有意修改**（都注明原因）：
+
+- `zzz_1950`：原来断言 `warmTrackBoxes` 里必须有 `new Image()`。要求本身没变
+  （轨道外那几张必须真的发请求），但实现必须从 `new Image()` 换成 `fetch` —— 否则就是上面
+  第 ① 条的双重下载。新断言改成"必须有 `warmFetch(` 且**不许**出现 `'&prefetch=1'`"。
+- `zzz_2429`：同理，把 `'&prefetch=1'` 换成 `X-MediaView-Prefetch`，并新增一条
+  "URL 不许再带 `&prefetch=1`" 的反向断言。
+
+两处都是把"实现细节断言"改成"契约断言 + 反向禁令"，比原来更严。
+
+---
+
+## 本版刻意没做的
+
+- `.v-track` 的 `will-change: transform` 和每张图自己的 `translateZ(0)` 会让 3 张全屏图
+  常驻合成层。手机上是内存与合成压力的来源，但撤掉它可能影响放大后的重栅格化清晰度
+  （1.8.20 与后续版本花过力气专门修清晰度），**没有真机数据前不动**。
+- 大图清晰度档默认 2048。它仍是解码与纹理上传的主要成本项。若真机仍偏卡，
+  可把设置里「大图清晰度」先调到 1600 试一版。
 
 ---
 
 ## 安装
 
-从 [Releases](https://github.com/ffvz7850/mediaview/releases) 下载对应架构的 `.fpk` 文件，
-在飞牛应用中心手动安装（覆盖安装即可，设置与已有缓存保留；本次修复无需清缓存）。
+从 [Releases](https://github.com/ffvz7850/mediaview/releases) 下载对应架构的 `.fpk`，
+在飞牛应用中心手动安装（覆盖安装即可；设置、缩略图缓存、大图缩放缓存全部保留）。
 
-- x86 架构：`mediaview_2.4.51_x86.fpk`
-- ARM 架构：`mediaview_2.4.51_arm.fpk`
+- x86 架构：`mediaview_2.4.53_x86.fpk`
+- ARM 架构：`mediaview_2.4.53_arm.fpk`
 
-升级后验收：对已生成封面的目录，点"一键生成"后立刻进去，应不再重做封面。
+升级后验收：手机上连滑 10 张，中间不应出现"停一下才出新图"；紧接着反向滑回去应该是即时的
+（那张位图这次是真的留在内存里了）。
 
 ---
 
-*本说明对应 v2.4.51；完整版本历史见 `CHANGELOG.md`。上一版 2.4.50 的 22 项审查修复已全部包含在内。*
+*本说明对应 v2.4.53；完整版本历史见 `CHANGELOG.md`。*
